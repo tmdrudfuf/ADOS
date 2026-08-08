@@ -12,3 +12,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+
+# Python runtime/test artifacts
+__pycache__/
+*.pyc
