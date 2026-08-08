@@ -16,10 +16,10 @@
 12. Independent Review
 13. Fix/Re-review Loop
 14. Exact HEAD Gate
-15. Human Publication Gate
-16. Optional Push + Draft PR
-17. Human Ready/Merge Decision
-18. Archive + Cleanup after authorization
+15. Conditional Autonomous Merge Gate or Human Publication Gate
+16. Push + Draft PR when authorized
+17. Ready/Merge Decision
+18. Archive + Cleanup after authorization or proven-safe autonomous gate
 
 ## Preconditions
 
@@ -50,4 +50,5 @@ Stop when:
 - independent review is unavailable after configured recovery policy;
 - review findings require a human architecture decision;
 - Exact HEAD Gate mismatches;
-- a requested remote/destructive action lacks authorization.
+- a requested remote/destructive action lacks authorization;
+- any Conditional Autonomous Merge Authority condition is false or uncertain.

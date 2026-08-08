@@ -13,7 +13,7 @@ ADOS is split into layers:
 3. **Guardian specifications** — independent checks for repository, worktree, SHA, review, publication, and cleanup state.
 4. **Review policy** — independent reviewer contract and bounded fix/re-review loop.
 5. **Recovery policy** — later specs will formalize failure recovery.
-6. **Publication policy** — later specs will formalize push/PR/ready/merge/cleanup transitions.
+6. **Publication policy** — later specs will formalize push/PR/ready/merge/cleanup transitions and executable Conditional Autonomous Merge Authority gates.
 7. **Project configuration** — project-specific paths, commands, role adapters, and allowed local state.
 
 Spec 001 establishes the first four at governance level and supplies a configuration template. Executable tooling is deferred.
@@ -65,7 +65,7 @@ An approval is evidence for one exact candidate SHA only. Any subsequent commit 
 
 ### D4 — Publication is distinct from implementation completion
 
-Implementation/review completion does not imply authorization to push, mark ready, merge, or clean up.
+Implementation/review completion does not imply authorization to push, mark ready, merge, or clean up unless every Conditional Autonomous Merge Authority gate is satisfied.
 
 ### D5 — Safety stops are preferable to guesses
 

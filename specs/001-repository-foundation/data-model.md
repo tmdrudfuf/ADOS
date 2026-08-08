@@ -26,6 +26,7 @@ Spec 001 defines conceptual governance records rather than executable runtime ty
 - validationSha
 - approvedReviewSha
 - publicationState
+- autonomousMergeGateState
 
 ## Guardian Result
 
@@ -55,4 +56,31 @@ Spec 001 defines conceptual governance records rather than executable runtime ty
 - authorizedSha
 - grantedAt
 
-Authorization is operation-specific and SHA-scoped where relevant. Approval of implementation is not implicitly authorization to merge or delete.
+## Autonomous Merge Gate
+
+- featureId
+- independentReviewDecision
+- blockingFindingsState
+- validationSha
+- approvedReviewSha
+- localHeadSha
+- remoteBranchHeadSha
+- prHeadSha
+- exactHeadGateState
+- primaryRepositoryAuditState
+- featureWorktreeClean
+- intendedBaseBranch
+- intendedHeadBranch
+- prBaseBranch
+- prHeadBranch
+- mergeConflictState
+- unresolvedBlockingReviewState
+- postApprovalCommitState
+- safetyRecoveryState
+- specScopeState
+- mergeStrategy
+- forcePushOrHistoryRewriteRequired
+- decision: Permitted | HumanInterventionRequired
+- evidence[]
+
+Authorization is operation-specific and SHA-scoped where relevant. Approval of implementation is not implicitly authorization to merge or delete unless every Conditional Autonomous Merge Authority gate is satisfied. If any gate is false or uncertain, ADOS returns `HUMAN_INTERVENTION_REQUIRED` with exact evidence.
