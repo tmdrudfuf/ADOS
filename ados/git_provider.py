@@ -52,6 +52,8 @@ class GitRepositoryProvider:
         )
 
     def _git(self, path: Path, *args: str) -> str:
+        if not path.is_dir():
+            raise RepositoryProviderError("REPOSITORY_PATH_INVALID", f"repository path is not a directory: {path}")
         try:
             completed = subprocess.run(
                 ("git", *args),

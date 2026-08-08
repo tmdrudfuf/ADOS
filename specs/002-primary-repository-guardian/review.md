@@ -12,6 +12,12 @@ Decision: Changes Requested for `b7ef26902c7022146970ef97758a283480475101`.
 
 Blocking finding: nonexistent repository paths could raise an uncaught platform `OSError` instead of returning deterministic guardian evidence.
 
+## Claude review round 2
+
+Decision: Changes Requested for `aa54d509ff5d1eaa1136e8c9b42dd7220694b610`.
+
+Blocking finding: missing path classification still depended on platform-specific `OSError` subclasses instead of checking the repository path before invoking Git.
+
 ## Review scope
 
 Claude must review the exact validated SHA for:
