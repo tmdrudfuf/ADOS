@@ -37,6 +37,12 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual("RECOVERABLE", result.status)
         self.assertEqual("repeat_validation_and_independent_review", result.action)
 
+    def test_publication_gate_failure_requires_human(self):
+        result = RecoveryEngine().classify((self.issue("PR_NOT_MERGEABLE"),))
+
+        self.assertEqual("HUMAN_INTERVENTION_REQUIRED", result.status)
+        self.assertEqual("resolve_publication_blocker", result.action)
+
     def test_unknown_condition_requires_human(self):
         result = RecoveryEngine().classify((self.issue("UNKNOWN"),))
 
