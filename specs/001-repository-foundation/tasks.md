@@ -9,4 +9,4 @@
 - [x] T007 Cross-check core docs for AIverse-specific absolute paths and contradictory authority rules.
 - [x] T008 Review changed-file set against bootstrap base.
 - [x] T009 Record review outcome truthfully, including independent-review unavailability.
-- [x] T010 Open a Draft PR and stop before Ready/merge.
+- [x] T010 Open a Draft PR and stop before Ready/merge unless every Conditional Autonomous Merge Authority gate is satisfied.

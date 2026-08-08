@@ -19,7 +19,7 @@ Checks performed:
 - the empty-repository bootstrap exception is explicitly one-time and narrowly scoped;
 - primary-checkout protection and worktree-before-write rules are consistent across AGENTS, Constitution, Plan, Contract, Quickstart, and Workflow docs;
 - Exact HEAD review semantics are consistent;
-- human publication/destructive-operation boundaries are consistent;
+- publication/destructive-operation boundaries are consistent, including Conditional Autonomous Merge Authority and human fallback;
 - independent-review unavailability is required to be reported truthfully rather than replaced by implementer self-review.
 
 ### Independent reviewer status

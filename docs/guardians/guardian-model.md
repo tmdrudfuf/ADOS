@@ -28,8 +28,8 @@ Enforces `approvedReviewSha == validationSha == currentHeadSha` before publicati
 
 ## Publication Guardian
 
-Checks explicit authorization for each remote state transition and verifies target base/head before mutation.
+Checks explicit authorization for each remote state transition and verifies target base/head before mutation. Conditional autonomous merge requires every configured autonomous merge gate to pass; otherwise the publication guardian returns `HUMAN_INTERVENTION_REQUIRED` with evidence.
 
 ## Cleanup Guardian
 
-Requires review-artifact archival and explicit cleanup authorization before branch/worktree/remote deletion. Cleanup is narrow and evidence-backed.
+Requires review-artifact archival and explicit cleanup authorization before branch/worktree/remote deletion unless cleanup is proven safe, narrowly scoped, post-merge, and covered by the Conditional Autonomous Merge Authority. Cleanup is narrow and evidence-backed.

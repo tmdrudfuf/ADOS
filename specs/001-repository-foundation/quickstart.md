@@ -12,6 +12,6 @@
 10. Invoke the independent reviewer against the exact validated HEAD.
 11. If Changes Requested, fix valid findings, revalidate, recommit, and review the new exact HEAD.
 12. Require `approvedReviewSha == validationSha == currentHeadSha`.
-13. Stop at the human publication gate unless exact operations were explicitly authorized.
+13. Run the Conditional Autonomous Merge Gate. If every condition passes, Codex may complete the authorized PR merge and proven-safe post-merge cleanup. If any condition is false or uncertain, stop at the human publication gate with `HUMAN_INTERVENTION_REQUIRED` and exact evidence.
 
 Never create a feature Spec in the primary checkout before the feature worktree exists.

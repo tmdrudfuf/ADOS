@@ -17,14 +17,14 @@ A developer can use ADOS without risking accidental writes in the primary projec
 
 ## User Story 2 - Run a repeatable spec-to-review workflow (P1)
 
-A developer can follow one canonical sequence from preflight through independent review and a human publication gate.
+A developer can follow one canonical sequence from preflight through independent review and either a fully satisfied Conditional Autonomous Merge Gate or a human publication gate.
 
 ### Acceptance
 
-1. Workflow order is Preflight -> Worktree -> Spec -> Plan -> Tasks -> Implement -> Validate -> Commit -> Independent Review -> Fix/Re-review -> Exact HEAD Gate -> Human Gate.
+1. Workflow order is Preflight -> Worktree -> Spec -> Plan -> Tasks -> Implement -> Validate -> Commit -> Independent Review -> Fix/Re-review -> Exact HEAD Gate -> Conditional Autonomous Merge Gate or Human Gate.
 2. The default implementer/orchestrator and reviewer are distinct roles.
 3. A change after reviewer approval invalidates the approval until the new exact HEAD is revalidated and reviewed.
-4. Publication and destructive cleanup remain human-controlled unless the exact action is explicitly authorized.
+4. Publication and destructive cleanup remain human-controlled unless the exact action is explicitly authorized or every Conditional Autonomous Merge Authority gate is satisfied.
 
 ## User Story 3 - Reuse ADOS across projects (P1)
 
@@ -42,7 +42,7 @@ A project can adopt ADOS without embedding AIverse-specific paths, commands, or 
 - FR-002: Define primary-repository protection and worktree-only feature-write rules.
 - FR-003: Define a canonical feature lifecycle and stop conditions.
 - FR-004: Define Exact HEAD Gate semantics.
-- FR-005: Define human-only publication/destructive-operation boundaries.
+- FR-005: Define publication/destructive-operation boundaries, including Conditional Autonomous Merge Authority.
 - FR-006: Define narrow cleanup safety and prohibit broad destructive cleanup by default.
 - FR-007: Define independent-review output expectations and bounded fix/re-review behavior at the governance level.
 - FR-008: Provide a reusable project configuration template.
@@ -56,7 +56,7 @@ A project can adopt ADOS without embedding AIverse-specific paths, commands, or 
 - GitHub automation implementation.
 - Automatic worktree creation code.
 - Automatic validation runner.
-- Automatic merge or cleanup.
+- Automatic merge or cleanup outside the Conditional Autonomous Merge Authority.
 
 ## Success Criteria
 

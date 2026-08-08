@@ -19,16 +19,20 @@ validation:
     - <focused/full project command>
 
 publication:
-  push_requires_human: true
-  ready_requires_human: true
-  merge_requires_human: true
+  conditional_autonomous_merge:
+    enabled: true
+    standard_merge_strategy: <merge|squash|rebase>
+  push_requires_human_unless_autonomous_gate_passes: true
+  ready_requires_human_unless_autonomous_gate_passes: true
+  merge_requires_human_unless_autonomous_gate_passes: true
   deploy_requires_human: true
 
 cleanup:
   archive_review_artifacts: true
-  branch_deletion_requires_human: true
-  worktree_deletion_requires_human: true
-  remote_branch_deletion_requires_human: true
+  proven_safe_post_merge_cleanup_allowed: true
+  branch_deletion_requires_human_unless_proven_safe: true
+  worktree_deletion_requires_human_unless_proven_safe: true
+  remote_branch_deletion_requires_human_unless_proven_safe: true
 ```
 
 Project configuration supplies environment-specific facts. It must not weaken core truthfulness, worktree-first, independent-review, or Exact HEAD rules without an explicit documented constitutional amendment.

@@ -12,7 +12,7 @@ Because the repository was initially empty, this README is the one-time bootstra
 
 - Implementer / Orchestrator: Codex CLI
 - Independent Reviewer: Claude CLI
-- Human: publication and destructive-operation authority
+- Human: publication and destructive-operation authority, except when every Conditional Autonomous Merge Authority gate is satisfied
 
 ## Core principles
 
@@ -22,4 +22,5 @@ Because the repository was initially empty, this README is the one-time bootstra
 - Provider-neutral architecture
 - Independent review
 - Exact-HEAD validation and review gates
-- Human-controlled publication and cleanup
+- Conditional autonomous merge with human fallback
+- Proven-safe post-merge cleanup only
