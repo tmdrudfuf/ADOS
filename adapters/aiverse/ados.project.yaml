@@ -1,0 +1,50 @@
+version: 1
+project:
+  id: aiverse
+  name: AIverse
+  repository: tmdrudfuf/AIverse
+  primary_path: 'C:\Users\tmdru\Desktop\Ky-Project\AIverse'
+
+workspace:
+  branch_pattern: 'codex/{spec}-{slug}'
+  worktree_pattern: 'C:\Users\tmdru\Desktop\Ky-Project\AIverse-{slug}'
+  allowed_primary_untracked:
+    - '.claude/'
+  worktree_before_feature_writes: true
+
+roles:
+  implementer:
+    provider: codex-cli
+    role: Implementer
+  reviewer:
+    provider: claude-cli
+    role: Independent Reviewer
+    must_differ_from_implementer: true
+
+validation:
+  commands:
+    - 'npm test'
+    - 'npx tsc --noEmit'
+    - 'npm run build'
+    - 'git diff --check'
+    - 'git diff --cached --check'
+
+review:
+  max_rounds: 5
+  exact_head_required: true
+  append_only_evidence: true
+
+publication:
+  push: human_authorized
+  draft_pr: human_authorized
+  ready_for_review: human_authorized
+  merge: human_authorized
+  force_push: forbidden_by_default
+  auto_merge: forbidden_by_default
+
+cleanup:
+  archive_before_worktree_delete: true
+  archive_directory: 'AIverse-review-archives'
+  worktree_delete: human_authorized
+  local_branch_delete: human_authorized
+  remote_branch_delete: human_authorized
