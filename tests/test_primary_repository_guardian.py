@@ -1,9 +1,11 @@
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
 from ados.execution_policy import ExecutionPolicy
 from ados.primary_repository_guardian import PrimaryRepositoryGuardian
+from ados.git_provider import GitRepositoryProvider
 from ados.repository_provider import RepositoryProviderError, RepositoryStatus
 
 
@@ -149,6 +151,30 @@ class PrimaryRepositoryGuardianTests(unittest.TestCase):
 
         self.assertEqual("BLOCK", result.status)
         self.assertEqual("REPOSITORY_PATH_INVALID", result.violations[0].code)
+
+    def test_real_git_status_parser_preserves_porcelain_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self.git(repo, "init")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            self.git(repo, "config", "user.name", "Test User")
+            (repo / "aaa.txt").write_text("base\n", encoding="utf-8")
+            self.git(repo, "add", "aaa.txt")
+            self.git(repo, "commit", "-m", "initial")
+
+            (repo / "aaa.txt").write_text("dirty\n", encoding="utf-8")
+            (repo / "bbb.txt").write_text("untracked\n", encoding="utf-8")
+            (repo / "staged.txt").write_text("staged\n", encoding="utf-8")
+            self.git(repo, "add", "staged.txt")
+
+            status = GitRepositoryProvider().status(repo)
+
+        self.assertEqual(("staged.txt",), status.staged)
+        self.assertEqual(("aaa.txt",), status.dirty_tracked)
+        self.assertEqual(("bbb.txt",), status.untracked)
+
+    def git(self, repo, *args):
+        return subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,12 @@ Decision: Changes Requested for `aa54d509ff5d1eaa1136e8c9b42dd7220694b610`.
 
 Blocking finding: missing path classification still depended on platform-specific `OSError` subclasses instead of checking the repository path before invoking Git.
 
+## Claude review round 3
+
+Decision: Changes Requested for `5af363455a5728335ddab38096ab6530503552b5`.
+
+Blocking finding: `git status --porcelain` output was stripped before parsing, corrupting leading-space status columns for dirty unstaged files. The real Git status parser also lacked focused coverage.
+
 ## Review scope
 
 Claude must review the exact validated SHA for:

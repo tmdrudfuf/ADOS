@@ -28,7 +28,7 @@ class GitRepositoryProvider:
         dirty_tracked: list[str] = []
         untracked: list[str] = []
 
-        output = self._git(root, "status", "--porcelain=v1", "--untracked-files=all")
+        output = self._git(root, "status", "--porcelain=v1", "--untracked-files=all", strip_output=False)
         for line in output.splitlines():
             if not line:
                 continue
@@ -51,7 +51,7 @@ class GitRepositoryProvider:
             untracked=tuple(untracked),
         )
 
-    def _git(self, path: Path, *args: str) -> str:
+    def _git(self, path: Path, *args: str, strip_output: bool = True) -> str:
         if not path.is_dir():
             raise RepositoryProviderError("REPOSITORY_PATH_INVALID", f"repository path is not a directory: {path}")
         try:
@@ -69,4 +69,6 @@ class GitRepositoryProvider:
         except subprocess.CalledProcessError as exc:
             message = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RepositoryProviderError("NOT_GIT_REPOSITORY", message) from exc
-        return completed.stdout.strip()
+        if strip_output:
+            return completed.stdout.strip()
+        return completed.stdout.rstrip("\n")
