@@ -1,8 +1,3 @@
-# AIverse Integration Example
-
-This file demonstrates how one project can configure ADOS without changing ADOS core rules. The executable example lives at `tests/fixtures/aiverse-project-config.valid.json`.
-
-```json
 {
   "project": {
     "id": "aiverse",
@@ -39,6 +34,3 @@ This file demonstrates how one project can configure ADOS without changing ADOS 
     }
   }
 }
-```
-
-Local repository paths must be supplied by the adopting environment. ADOS core does not infer an AIverse path, branch, merge strategy, reviewer, validation command, or local metadata allowance.
