@@ -9,6 +9,7 @@ import sys
 
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .primary_repository_guardian import PrimaryRepositoryGuardian
+from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,6 +30,19 @@ def main(argv: list[str] | None = None) -> int:
     primary.add_argument("--expected-branch")
     primary.add_argument("--expected-head")
     primary.add_argument("--allowed-local-path", action="append", default=[])
+
+    worktree_parser = subparsers.add_parser("worktree")
+    worktree_subparsers = worktree_parser.add_subparsers(dest="action", required=True)
+    for action in ("create", "verify", "remove"):
+        command = worktree_subparsers.add_parser(action)
+        command.add_argument("--policy", required=True)
+        command.add_argument("--primary-repo", required=True)
+        command.add_argument("--worktree-path", required=True)
+        command.add_argument("--branch", required=True)
+        command.add_argument("--base-ref")
+        command.add_argument("--expected-primary-branch")
+        command.add_argument("--expected-primary-head")
+        command.add_argument("--allowed-primary-local-path", action="append", default=[])
 
     args = parser.parse_args(argv)
 
@@ -51,6 +65,28 @@ def main(argv: list[str] | None = None) -> int:
             expected_head=args.expected_head,
             allowed_local_paths=args.allowed_local_path,
         )
+        _print_json(result.to_dict())
+        return 0 if result.status == "PASS" else 3
+
+    if args.area == "worktree":
+        request = WorktreeRequest(
+            primary_repository_path=Path(args.primary_repo),
+            worktree_path=Path(args.worktree_path),
+            branch=args.branch,
+            base_ref=args.base_ref,
+            expected_primary_branch=args.expected_primary_branch,
+            expected_primary_head=args.expected_primary_head,
+            allowed_primary_local_paths=tuple(args.allowed_primary_local_path),
+        )
+        engine = WorktreeLifecycleEngine()
+        if args.action == "create":
+            result = engine.create(policy=policy, request=request)
+        elif args.action == "verify":
+            result = engine.verify(policy=policy, request=request)
+        elif args.action == "remove":
+            result = engine.remove(policy=policy, request=request)
+        else:
+            parser.error("unsupported worktree command")
         _print_json(result.to_dict())
         return 0 if result.status == "PASS" else 3
 

@@ -1,0 +1,15 @@
+{
+  "operation": "verify",
+  "status": "PASS",
+  "violations": [],
+  "evidence": [
+    {
+      "key": "worktree_path",
+      "value": "/repo/.worktrees/example"
+    },
+    {
+      "key": "branch",
+      "value": "feature/example"
+    }
+  ]
+}
