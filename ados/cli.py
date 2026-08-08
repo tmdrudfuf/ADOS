@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from .execution_policy import PolicyValidationError, load_execution_policy
+from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .review_engine import ReviewEngine, ReviewRequest
 from .validation_engine import ValidationEngine
@@ -32,6 +33,13 @@ def main(argv: list[str] | None = None) -> int:
     primary.add_argument("--expected-branch")
     primary.add_argument("--expected-head")
     primary.add_argument("--allowed-local-path", action="append", default=[])
+
+    gate_parser = subparsers.add_parser("gate")
+    gate_subparsers = gate_parser.add_subparsers(dest="action", required=True)
+    exact_gate = gate_subparsers.add_parser("exact")
+    exact_gate.add_argument("--repo", required=True)
+    exact_gate.add_argument("--approved-review-sha", required=True)
+    exact_gate.add_argument("--validated-sha", required=True)
 
     validation_parser = subparsers.add_parser("validation")
     validation_subparsers = validation_parser.add_subparsers(dest="action", required=True)
@@ -64,10 +72,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        policy = load_execution_policy(args.policy)
+        policy = load_execution_policy(args.policy) if hasattr(args, "policy") else None
     except PolicyValidationError as exc:
         _print_json({"status": "BLOCK", "violations": [exc.to_dict()]})
         return 2
+
+    if args.area == "gate" and args.action == "exact":
+        result = ExactHeadGate().verify(
+            repository_path=Path(args.repo),
+            approved_review_sha=args.approved_review_sha,
+            validated_sha=args.validated_sha,
+        )
+        _print_json(result.to_dict())
+        return 0 if result.status == "MATCH" else 3
 
     if args.area == "policy" and args.action == "validate":
         _print_json({"status": "PASS", "execution_policy": policy.to_dict()})

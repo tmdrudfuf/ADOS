@@ -1,0 +1,7 @@
+{
+  "status": "MATCH",
+  "approved_review_sha": "0123456789abcdef",
+  "validated_sha": "0123456789abcdef",
+  "current_head_sha": "0123456789abcdef",
+  "violations": []
+}
