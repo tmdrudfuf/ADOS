@@ -1,0 +1,30 @@
+{
+  "project": {
+    "id": "example-project",
+    "primary_repository_path": "/absolute/path",
+    "default_branch": "main",
+    "allowed_primary_local_paths": []
+  },
+  "execution_policy": {
+    "schema_version": "1",
+    "publication": {
+      "merge_strategy": "merge"
+    },
+    "review": {
+      "reviewer": "claude -p",
+      "max_rounds": 5
+    },
+    "cleanup": {
+      "autonomous": true
+    },
+    "guardian": {
+      "stop_on_uncertain": true
+    },
+    "validation": {
+      "commands": [
+        "python -m unittest discover",
+        "git diff --check"
+      ]
+    }
+  }
+}

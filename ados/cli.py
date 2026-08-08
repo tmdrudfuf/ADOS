@@ -10,6 +10,7 @@ import sys
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian
+from .project_config import ProjectConfigError, load_project_config
 from .review_engine import ReviewEngine, ReviewRequest
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
@@ -23,6 +24,11 @@ def main(argv: list[str] | None = None) -> int:
     policy_subparsers = policy_parser.add_subparsers(dest="action", required=True)
     policy_validate = policy_subparsers.add_parser("validate")
     policy_validate.add_argument("--policy", required=True)
+
+    config_parser = subparsers.add_parser("config")
+    config_subparsers = config_parser.add_subparsers(dest="action", required=True)
+    config_validate = config_subparsers.add_parser("validate")
+    config_validate.add_argument("--config", required=True)
 
     guardian_parser = subparsers.add_parser("guardian")
     guardian_subparsers = guardian_parser.add_subparsers(dest="action", required=True)
@@ -70,6 +76,15 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--allowed-primary-local-path", action="append", default=[])
 
     args = parser.parse_args(argv)
+
+    if args.area == "config" and args.action == "validate":
+        try:
+            config = load_project_config(args.config)
+        except ProjectConfigError as exc:
+            _print_json({"status": "BLOCK", "violations": [exc.to_dict()]})
+            return 2
+        _print_json({"status": "PASS", "project_config": config.to_dict()})
+        return 0
 
     try:
         policy = load_execution_policy(args.policy) if hasattr(args, "policy") else None
