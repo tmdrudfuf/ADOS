@@ -1,0 +1,14 @@
+{
+  "status": "PASS",
+  "head_before": "0123456789abcdef",
+  "head_after": "0123456789abcdef",
+  "commands": [
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "violations": []
+}

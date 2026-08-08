@@ -9,6 +9,7 @@ import sys
 
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .primary_repository_guardian import PrimaryRepositoryGuardian
+from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 
 
@@ -30,6 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     primary.add_argument("--expected-branch")
     primary.add_argument("--expected-head")
     primary.add_argument("--allowed-local-path", action="append", default=[])
+
+    validation_parser = subparsers.add_parser("validation")
+    validation_subparsers = validation_parser.add_subparsers(dest="action", required=True)
+    validation_run = validation_subparsers.add_parser("run")
+    validation_run.add_argument("--policy", required=True)
+    validation_run.add_argument("--repo", required=True)
 
     worktree_parser = subparsers.add_parser("worktree")
     worktree_subparsers = worktree_parser.add_subparsers(dest="action", required=True)
@@ -65,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
             expected_head=args.expected_head,
             allowed_local_paths=args.allowed_local_path,
         )
+        _print_json(result.to_dict())
+        return 0 if result.status == "PASS" else 3
+
+    if args.area == "validation" and args.action == "run":
+        result = ValidationEngine().run(policy=policy, repository_path=Path(args.repo))
         _print_json(result.to_dict())
         return 0 if result.status == "PASS" else 3
 
