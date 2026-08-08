@@ -1,0 +1,24 @@
+{
+  "execution_policy": {
+    "schema_version": "1",
+    "publication": {
+      "merge_strategy": "merge"
+    },
+    "review": {
+      "reviewer": "independent-reviewer",
+      "max_rounds": 5
+    },
+    "cleanup": {
+      "autonomous": true
+    },
+    "guardian": {
+      "stop_on_uncertain": true
+    },
+    "validation": {
+      "commands": [
+        "python -m unittest discover",
+        "git diff --check"
+      ]
+    }
+  }
+}

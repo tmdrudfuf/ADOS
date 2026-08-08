@@ -1,0 +1,15 @@
+{
+  "guardian": "primary_repository",
+  "status": "PASS",
+  "violations": [],
+  "evidence": [
+    {
+      "key": "branch",
+      "value": "feature/example"
+    },
+    {
+      "key": "head",
+      "value": "0123456789abcdef"
+    }
+  ]
+}
