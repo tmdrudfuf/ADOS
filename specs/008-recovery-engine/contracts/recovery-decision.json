@@ -1,0 +1,5 @@
+{
+  "status": "RECOVERABLE",
+  "action": "fix_valid_blocking_findings_then_revalidate",
+  "issues": []
+}
