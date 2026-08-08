@@ -9,6 +9,7 @@ import sys
 
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .primary_repository_guardian import PrimaryRepositoryGuardian
+from .review_engine import ReviewEngine, ReviewRequest
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 
@@ -37,6 +38,15 @@ def main(argv: list[str] | None = None) -> int:
     validation_run = validation_subparsers.add_parser("run")
     validation_run.add_argument("--policy", required=True)
     validation_run.add_argument("--repo", required=True)
+
+    review_parser = subparsers.add_parser("review")
+    review_subparsers = review_parser.add_subparsers(dest="action", required=True)
+    review_run = review_subparsers.add_parser("run")
+    review_run.add_argument("--policy", required=True)
+    review_run.add_argument("--candidate-sha", required=True)
+    review_run.add_argument("--base-sha", required=True)
+    review_run.add_argument("--scope", required=True)
+    review_run.add_argument("--diff", default="")
 
     worktree_parser = subparsers.add_parser("worktree")
     worktree_subparsers = worktree_parser.add_subparsers(dest="action", required=True)
@@ -77,6 +87,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.area == "validation" and args.action == "run":
         result = ValidationEngine().run(policy=policy, repository_path=Path(args.repo))
+        _print_json(result.to_dict())
+        return 0 if result.status == "PASS" else 3
+
+    if args.area == "review" and args.action == "run":
+        result = ReviewEngine().run(
+            policy=policy,
+            request=ReviewRequest(
+                candidate_sha=args.candidate_sha,
+                base_sha=args.base_sha,
+                scope=args.scope,
+                diff=args.diff,
+            ),
+        )
         _print_json(result.to_dict())
         return 0 if result.status == "PASS" else 3
 
