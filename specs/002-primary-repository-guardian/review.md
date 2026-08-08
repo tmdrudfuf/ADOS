@@ -1,8 +1,10 @@
 # Review: Primary Repository Guardian + Execution Policy Foundation
 
-## Local review status
+## Local validation status
 
-Pending validation and Claude independent review.
+Focused and full validation passed for candidate `c0447ea1fee1207b1fe527dd9f9f2a35c7a95b7d`.
+
+Claude independent review is pending.
 
 ## Review scope
 
