@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "decision": "Approved",
+  "reviewed_sha": "0123456789abcdef",
+  "exit_code": 0,
+  "stdout": "Approved\nReviewed SHA: 0123456789abcdef\n",
+  "stderr": "",
+  "violations": []
+}
