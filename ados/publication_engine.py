@@ -67,7 +67,19 @@ class PublicationEngine:
             evidence.remote_branch_head_sha,
             evidence.pr_head_sha,
         }
-        _require(violations, len(shas) == 1 and "" not in shas, "SHA_MISMATCH", "publication SHAs do not all match", {"sha_count": str(len(shas))})
+        _require(
+            violations,
+            len(shas) == 1 and "" not in shas,
+            "SHA_MISMATCH",
+            "publication SHAs do not all match",
+            {
+                "approved_review_sha": evidence.approved_review_sha,
+                "validated_sha": evidence.validated_sha,
+                "local_head_sha": evidence.local_head_sha,
+                "remote_branch_head_sha": evidence.remote_branch_head_sha,
+                "pr_head_sha": evidence.pr_head_sha,
+            },
+        )
         _require(violations, evidence.exact_head_gate == "MATCH", "EXACT_HEAD_GATE_NOT_MATCH", "Exact HEAD Gate is not MATCH", {"exact_head_gate": evidence.exact_head_gate})
         _require(violations, evidence.primary_repository_audit == "SAFE", "PRIMARY_REPOSITORY_NOT_SAFE", "primary repository audit is not SAFE", {"audit": evidence.primary_repository_audit})
         _require(violations, evidence.feature_worktree_clean, "FEATURE_WORKTREE_DIRTY", "feature worktree is not clean", {})

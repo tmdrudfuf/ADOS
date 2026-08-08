@@ -63,6 +63,8 @@ class PublicationEngineTests(unittest.TestCase):
 
         self.assertEqual("HUMAN_INTERVENTION_REQUIRED", result.status)
         self.assertEqual("SHA_MISMATCH", result.violations[0].code)
+        self.assertEqual("sha", result.violations[0].evidence["approved_review_sha"])
+        self.assertEqual("other", result.violations[0].evidence["pr_head_sha"])
 
     def test_merge_strategy_mismatch_requires_human(self):
         result = PublicationEngine().evaluate(
