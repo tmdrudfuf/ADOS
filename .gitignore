@@ -1,0 +1,14 @@
+# Local agent/runtime artifacts
+.agent-workflow/
+.claude/
+.codex/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.log
