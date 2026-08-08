@@ -140,6 +140,16 @@ class PrimaryRepositoryGuardianTests(unittest.TestCase):
         self.assertEqual("BLOCK", result.status)
         self.assertEqual("NOT_GIT_REPOSITORY", result.violations[0].code)
 
+    def test_real_missing_directory_blocks_deterministically(self):
+        missing_path = Path(tempfile.gettempdir()) / "ados-missing-repository-path"
+        result = PrimaryRepositoryGuardian().audit(
+            policy=self.policy(),
+            repository_path=missing_path,
+        )
+
+        self.assertEqual("BLOCK", result.status)
+        self.assertEqual("REPOSITORY_PATH_INVALID", result.violations[0].code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,6 +62,8 @@ class GitRepositoryProvider:
             )
         except FileNotFoundError as exc:
             raise RepositoryProviderError("GIT_UNAVAILABLE", "git executable is unavailable") from exc
+        except OSError as exc:
+            raise RepositoryProviderError("REPOSITORY_PATH_INVALID", str(exc)) from exc
         except subprocess.CalledProcessError as exc:
             message = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RepositoryProviderError("NOT_GIT_REPOSITORY", message) from exc
