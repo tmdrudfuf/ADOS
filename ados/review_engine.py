@@ -89,7 +89,7 @@ class ReviewEngine:
 
 def parse_review_decision(output: str) -> str:
     for line in output.splitlines():
-        normalized = re.sub(r"^[#>*_\\s-]+|[*_\\s:]+$", "", line).strip()
+        normalized = re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", line).strip()
         normalized = re.sub(r"^Decision:\s*", "", normalized).strip()
         if normalized == "Approved":
             return "Approved"

@@ -26,6 +26,9 @@ class ReviewEngineTests(unittest.TestCase):
     def test_parse_approved(self):
         self.assertEqual("Approved", parse_review_decision("**Approved**\nReviewed SHA: abc123"))
 
+    def test_parse_approved_with_markdown_and_whitespace(self):
+        self.assertEqual("Approved", parse_review_decision("  **Approved**  "))
+
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
