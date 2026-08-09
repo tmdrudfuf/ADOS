@@ -158,14 +158,22 @@ class CliDoctorTests(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_no_validation_reviewer_publication_or_worktree_mutation(self):
-        with self.project(validation_commands=["python -c \"open('validation-ran.txt','w').write('bad')\""], reviewer=f"{sys.executable} -c \"open('review-ran.txt','w').write('bad')\"") as fixture:
+        with self.project() as fixture:
+            validation_marker = fixture.root / "validation-ran.txt"
+            review_marker = fixture.root / "review-ran.txt"
+            mutation_config = self.write_config(
+                fixture.root / "mutation-config.json",
+                fixture.repo,
+                validation_commands=[f"{sys.executable} -c \"open(r'{validation_marker}','w').write('bad')\""],
+                reviewer=f"{sys.executable} -c \"open(r'{review_marker}','w').write('bad')\"",
+            )
             before_worktrees = self.git(fixture.repo, "worktree", "list", "--porcelain").stdout
-            result = DoctorService().run(DoctorRequest(fixture.repo, fixture.config))
+            result = DoctorService().run(DoctorRequest(fixture.repo, mutation_config))
             after_worktrees = self.git(fixture.repo, "worktree", "list", "--porcelain").stdout
 
             self.assertEqual("READY", result.status)
-            self.assertFalse((fixture.repo / "validation-ran.txt").exists())
-            self.assertFalse((fixture.repo / "review-ran.txt").exists())
+            self.assertFalse(validation_marker.exists())
+            self.assertFalse(review_marker.exists())
             self.assertEqual(before_worktrees, after_worktrees)
 
     def test_project_neutral_behavior(self):

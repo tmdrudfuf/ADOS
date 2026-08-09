@@ -33,6 +33,7 @@ An orchestrator can run `ados doctor --project <path>` or `ados doctor <path>` a
 - FR-003: Support `ados doctor --project <path>` and `ados doctor <path>`.
 - FR-004: Support `--config <path>` and a minimal conventional project-local config discovery path.
 - FR-005: Reuse Project Configuration, Execution Policy, and Primary Repository Guardian.
+- FR-005a: Read optional Project Configuration `roles.implementer` and `roles.reviewer` adapter fields when present; do not infer missing implementer adapters.
 - FR-006: Detect configured executable availability using safe non-workload probes only.
 - FR-007: Support `--json` output with no human prose in stdout.
 - FR-008: Map READY/BLOCKED/INVALID to exit codes 0/1/2.
