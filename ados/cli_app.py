@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from . import __version__
-from .doctor import DoctorRequest, DoctorService, exit_code as doctor_exit_code, format_human
+from .doctor import DoctorRequest, DoctorResult, DoctorService
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian
@@ -101,10 +101,10 @@ class CliApplication:
                 )
             )
             if args.json:
-                print(result.to_json())
+                print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
             else:
-                print(format_human(result))
-            return doctor_exit_code(result)
+                print(_format_doctor_human(result))
+            return _doctor_exit_code(result)
 
         if args.area == "config" and args.action == "validate":
             try:
@@ -192,3 +192,27 @@ class CliApplication:
 
 def _print_json(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _format_doctor_human(result: DoctorResult) -> str:
+    lines = ["ADOS Doctor", ""]
+    for check in result.checks:
+        mark = {"PASS": "[PASS]", "WARN": "[WARN]", "FAIL": "[FAIL]"}[check.status]
+        lines.append(f"{mark} {check.summary}")
+        for violation in check.violations:
+            lines.append(f"  {violation.code}:")
+            if violation.evidence:
+                for key, value in sorted(violation.evidence.items()):
+                    lines.append(f"  {key}: {value}")
+            else:
+                lines.append(f"  {violation.message}")
+    lines.extend(("", result.status))
+    return "\n".join(lines)
+
+
+def _doctor_exit_code(result: DoctorResult) -> int:
+    if result.status == "READY":
+        return 0
+    if result.status == "BLOCKED":
+        return 1
+    return 2

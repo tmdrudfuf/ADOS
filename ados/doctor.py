@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
 from pathlib import Path
 import shlex
 import shutil
@@ -39,6 +38,7 @@ class DoctorCheck:
     blocking: bool
     evidence: dict[str, str]
     violations: tuple[DoctorViolation, ...] = ()
+    result_status: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -58,10 +58,6 @@ class DoctorResult:
 
     def to_dict(self) -> dict[str, object]:
         return {"status": self.status, "checks": [check.to_dict() for check in self.checks]}
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), indent=2, sort_keys=True)
-
 
 @dataclass(frozen=True)
 class DoctorRequest:
@@ -207,33 +203,9 @@ def discover_project_config(project_path: Path) -> Path | None:
     return None
 
 
-def format_human(result: DoctorResult) -> str:
-    lines = ["ADOS Doctor", ""]
-    for check in result.checks:
-        mark = {"PASS": "[PASS]", "WARN": "[WARN]", "FAIL": "[FAIL]"}[check.status]
-        lines.append(f"{mark} {check.summary}")
-        for violation in check.violations:
-            lines.append(f"  {violation.code}:")
-            if violation.evidence:
-                for key, value in sorted(violation.evidence.items()):
-                    lines.append(f"  {key}: {value}")
-            else:
-                lines.append(f"  {violation.message}")
-    lines.extend(("", result.status))
-    return "\n".join(lines)
-
-
-def exit_code(result: DoctorResult) -> int:
-    if result.status == "READY":
-        return 0
-    if result.status == "BLOCKED":
-        return 1
-    return 2
-
-
 def _result(checks: Iterable[DoctorCheck]) -> DoctorResult:
     materialized = tuple(checks)
-    if any(check.status == "FAIL" and check.evidence.get("invalid") == "true" for check in materialized):
+    if any(check.status == "FAIL" and check.result_status == "INVALID" for check in materialized):
         status = "INVALID"
     elif any(check.status == "FAIL" and check.blocking for check in materialized):
         status = "BLOCKED"
@@ -243,7 +215,7 @@ def _result(checks: Iterable[DoctorCheck]) -> DoctorResult:
 
 
 def _pass(check_id: str, summary: str, evidence: dict[str, str]) -> DoctorCheck:
-    return DoctorCheck(check_id, "PASS", summary, True, evidence, ())
+    return DoctorCheck(check_id, "PASS", summary, False, evidence, ())
 
 
 def _warn(check_id: str, summary: str, code: str, message: str, evidence: dict[str, str]) -> DoctorCheck:
@@ -262,7 +234,7 @@ def _fail(
 ) -> DoctorCheck:
     enriched = dict(evidence)
     if invalid:
-        enriched["invalid"] = "true"
+        return DoctorCheck(check_id, "FAIL", summary, blocking, enriched, (DoctorViolation(code, message, evidence),), "INVALID")
     return DoctorCheck(check_id, "FAIL", summary, blocking, enriched, (DoctorViolation(code, message, evidence),))
 
 

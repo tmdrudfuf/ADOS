@@ -51,6 +51,7 @@ class CliDoctorTests(unittest.TestCase):
         self.assertEqual(2, code)
         result = json.loads(stdout)
         self.assertEqual("INVALID", result["status"])
+        self.assertNotIn("invalid", result["checks"][2]["evidence"])
 
     def test_missing_path_exits_two(self):
         with tempfile.TemporaryDirectory() as directory:
