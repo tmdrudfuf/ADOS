@@ -11,6 +11,7 @@ from typing import Any
 
 from .doctor import DoctorRequest, DoctorService, discover_project_config
 from .git_provider import GitRepositoryProvider
+from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, SAFE_TIMEOUT_MS
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
@@ -26,6 +27,7 @@ class RunRequest:
     spec_number: int | None = None
     config_path: Path | None = None
     dry_run: bool = False
+    implementer_timeout_ms: int = SAFE_TIMEOUT_MS
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class RunResult:
     plan: RunPlan | None = None
     run_record: WorkflowRunRecord | None = None
     worktree_result: WorktreeLifecycleResult | None = None
+    implementer_result: ImplementerRuntimeOutcome | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -116,6 +119,7 @@ class RunResult:
             "plan": self.plan.to_dict() if self.plan else None,
             "runRecord": self.run_record.to_dict() if self.run_record else None,
             "worktreeResult": self.worktree_result.to_dict() if self.worktree_result else None,
+            "implementerResult": self.implementer_result.to_dict() if self.implementer_result else None,
         }
 
 
@@ -129,6 +133,7 @@ class RunService:
         git: GitRepositoryProvider | None = None,
         worktrees: GitWorktreeProvider | None = None,
         lifecycle: WorktreeLifecycleEngine | None = None,
+        implementer: ImplementerRuntime | None = None,
     ) -> None:
         self.doctor = doctor or DoctorService()
         self.status = status or StatusService()
@@ -136,6 +141,7 @@ class RunService:
         self.git = git or GitRepositoryProvider()
         self.worktrees = worktrees or GitWorktreeProvider()
         self.lifecycle = lifecycle or WorktreeLifecycleEngine()
+        self.implementer = implementer or ImplementerRuntime()
 
     def run(self, request: RunRequest) -> RunResult:
         if not request.feature_description.strip():
@@ -180,7 +186,9 @@ class RunService:
         record_path = self._record_path(Path(plan.feature_worktree), plan.spec_number, plan.feature_slug)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-        return RunResult("READY_FOR_IMPLEMENTATION", eligibility, plan, record, created)
+        implementer_result = self.implementer.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
+        updated_record = _record_from_mapping(implementer_result.run_record) if implementer_result.run_record else record
+        return RunResult(implementer_result.status, eligibility, plan, updated_record, created, implementer_result)
 
     def _plan(self, project_path: Path, config: ProjectConfig, request: RunRequest) -> RunPlan:
         try:
@@ -278,6 +286,25 @@ class RunService:
 
 def _invalid(code: str, message: str, evidence: dict[str, str]) -> RunResult:
     return RunResult("INVALID", RunEligibility("INVALID", (RunViolation(code, message, evidence),)))
+
+
+def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
+    return WorkflowRunRecord(
+        run_id=str(raw["runId"]),
+        project_id=str(raw["projectId"]),
+        spec_number=str(raw["specNumber"]),
+        feature_slug=str(raw["featureSlug"]),
+        feature_description=str(raw["featureDescription"]),
+        authoritative_base_sha=str(raw["authoritativeBaseSha"]),
+        primary_repository=str(raw["primaryRepository"]),
+        feature_branch=str(raw["featureBranch"]),
+        feature_worktree=str(raw["featureWorktree"]),
+        implementer=str(raw["implementer"]),
+        reviewer=str(raw["reviewer"]),
+        execution_policy_version=str(raw["executionPolicyVersion"]),
+        status=str(raw["status"]),
+        next_stage=str(raw["nextStage"]),
+    )
 
 
 def _violation(code: str, message: str, evidence: dict[str, str]) -> RunViolation:

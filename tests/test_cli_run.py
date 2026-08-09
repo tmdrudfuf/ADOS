@@ -25,15 +25,16 @@ class CliRunTests(unittest.TestCase):
             payload = self.read_run_record(fixture.root / "project-add-run-command", "003-add-run-command")
 
         self.assertEqual(0, code)
-        self.assertIn("READY_FOR_IMPLEMENTATION", stdout)
+        self.assertIn("READY_FOR_VALIDATION", stdout)
         self.assertEqual("003", payload["specNumber"])
+        self.assertEqual("READY_FOR_VALIDATION", payload["status"])
         self.assertEqual("codex/003-add-run-command", payload["featureBranch"])
 
     def test_explicit_spec(self):
         with self.project(specs=[1]) as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Build status handoff", 7, fixture.config))
 
-        self.assertEqual("READY_FOR_IMPLEMENTATION", result.status)
+        self.assertEqual("READY_FOR_VALIDATION", result.status)
         self.assertEqual("007", result.plan.spec_number)
 
     def test_automatic_next_spec(self):
@@ -132,7 +133,7 @@ class CliRunTests(unittest.TestCase):
         with self.project() as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Ordering proof", None, fixture.config))
             record = next(Path(result.run_record.feature_worktree, ".agent-workflow", "runs").glob("*/ados-run.json"))
-            self.assertEqual("READY_FOR_IMPLEMENTATION", result.status)
+            self.assertEqual("READY_FOR_VALIDATION", result.status)
             self.assertTrue(record.is_file())
             self.assertTrue(Path(result.run_record.feature_worktree, ".git").exists())
 
@@ -153,7 +154,7 @@ class CliRunTests(unittest.TestCase):
             result = RunService().run(RunRequest(fixture.repo, "Status sees run", None, fixture.config))
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
 
-        self.assertEqual("READY_FOR_IMPLEMENTATION", result.run_record.status)
+        self.assertEqual("READY_FOR_VALIDATION", result.run_record.status)
         self.assertEqual(result.run_record.run_id, status.workflow.evidence["run_id"])
 
     def test_dry_run_has_zero_mutations(self):
@@ -179,7 +180,7 @@ class CliRunTests(unittest.TestCase):
             result = RunService().run(RunRequest(fixture.repo, "No later stages", None, fixture.config))
             output = self.git(fixture.repo, "log", "--oneline").stdout
 
-        self.assertEqual("READY_FOR_IMPLEMENTATION", result.status)
+        self.assertEqual("READY_FOR_VALIDATION", result.status)
         self.assertNotIn("validation", output.lower())
 
     def test_repeated_invocation_detects_existing_run(self):
@@ -187,7 +188,7 @@ class CliRunTests(unittest.TestCase):
             first = RunService().run(RunRequest(fixture.repo, "Repeatable", None, fixture.config))
             second = RunService().run(RunRequest(fixture.repo, "Repeatable", None, fixture.config))
 
-        self.assertEqual("READY_FOR_IMPLEMENTATION", first.status)
+        self.assertEqual("READY_FOR_VALIDATION", first.status)
         self.assertEqual("BLOCKED", second.status)
         self.assertIn("WORKTREE_PATH_EXISTS", self.codes(second))
 
@@ -226,7 +227,18 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=()):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None):
+        if implementer is None:
+            runner = path.parent / "implementer.py"
+            runner.write_text(
+                "from pathlib import Path\n"
+                "import os, sys\n"
+                "Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
+                "print(os.getcwd())\n"
+                "print(sys.stdin.read()[:200])\n",
+                encoding="utf-8",
+            )
+            implementer = f'"{sys.executable}" "{runner}"'
         config = {
             "project": {
                 "id": project_id,
@@ -234,7 +246,7 @@ class CliRunTests(unittest.TestCase):
                 "default_branch": "main",
                 "allowed_primary_local_paths": list(allowed_paths),
             },
-            "roles": {"implementer": "codex", "reviewer": "claude"},
+            "roles": {"implementer": implementer, "reviewer": "claude"},
             "execution_policy": {
                 "schema_version": "1",
                 "publication": {"merge_strategy": "merge"},
