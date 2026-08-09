@@ -32,4 +32,9 @@
 
 ## Independent Review
 
-Pending.
+### Round 1
+
+- Reviewed SHA: `a33ae1b494e24384dfe9184eab3c0f14dbd0f3ca`
+- Decision: Changes Requested
+- Blocking finding: `latest_merged_spec` could be reported from any archive evidence, even when the archive did not prove a merge.
+- Disposition: Valid. Status now reports `latest_merged_spec` only when archive evidence includes `merge_commit` equal to the current repository HEAD. Added regression coverage for an unmerged `Changes Requested` archive.

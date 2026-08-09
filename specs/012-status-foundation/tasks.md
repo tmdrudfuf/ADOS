@@ -7,4 +7,4 @@
 - [x] T005 Add focused tests.
 - [x] T006 Run AIverse read-only smoke test.
 - [x] T007 Run full validation.
-- [ ] T008 Run independent Claude review.
+- [x] T008 Run independent Claude review.

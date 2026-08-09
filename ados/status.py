@@ -129,9 +129,9 @@ class StatusService:
         repository = self._repository(project_path)
         guardian = self._guardian(project_path, config)
         worktrees = self._worktrees(project_path)
-        spec = _spec_status(project_path, worktrees)
         evidence = _latest_archive_evidence(project_path)
         current_head = repository.evidence.get("head", "")
+        spec = _spec_status(project_path, worktrees, current_head)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
         exact_head = _exact_head_status(evidence, current_head)
@@ -237,7 +237,7 @@ def _invalid_result(project: StatusSection, code: str, evidence: dict[str, str])
     )
 
 
-def _spec_status(project_path: Path, worktrees: tuple[WorktreeStatus, ...]) -> StatusSection:
+def _spec_status(project_path: Path, worktrees: tuple[WorktreeStatus, ...], current_head: str) -> StatusSection:
     numbers = sorted(_spec_number(path.name) for path in (project_path / "specs").glob("*") if path.is_dir())
     present = [number for number in numbers if number is not None]
     next_unused = _next_unused(present)
@@ -255,11 +255,11 @@ def _spec_status(project_path: Path, worktrees: tuple[WorktreeStatus, ...]) -> S
         "active_spec": ",".join(f"{number:03d}" for number in active_numbers) if active_numbers else "None",
         "next_unused_spec": f"{next_unused:03d}",
     }
-    archive = _latest_archive_evidence(project_path)
+    archive = _merged_archive_evidence(project_path, current_head)
     archive_spec = _archive_spec_number(archive)
     if archive_spec is not None:
         evidence["latest_merged_spec"] = f"{archive_spec:03d}"
-        evidence["latest_merged_spec_basis"] = "archive"
+        evidence["latest_merged_spec_basis"] = "merge_commit"
     return StatusSection("Resolved", evidence)
 
 
@@ -378,18 +378,40 @@ def _overall_status(guardian: StatusSection, workflow: StatusSection, recovery: 
 
 
 def _latest_archive_evidence(project_path: Path) -> dict[str, Any] | None:
+    candidates = _archive_evidence_records(project_path)
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        raw = _read_archive(candidate)
+        if raw is not None:
+            return raw
+    return None
+
+
+def _merged_archive_evidence(project_path: Path, current_head: str) -> dict[str, Any] | None:
+    if not current_head:
+        return None
+    for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
+        raw = _read_archive(candidate)
+        if raw is not None and str(raw.get("merge_commit", "")) == current_head:
+            return raw
+    return None
+
+
+def _archive_evidence_records(project_path: Path) -> list[Path]:
     runs = project_path / ".agent-workflow" / "runs"
     if not runs.is_dir():
+        return []
+    return list(runs.glob("*/ados-review-evidence.json"))
+
+
+def _read_archive(candidate: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
         return None
-    candidates = sorted(runs.glob("*/ados-review-evidence.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for candidate in candidates:
-        try:
-            raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(raw, dict):
-            raw["_evidence_path"] = str(candidate)
-            return raw
+    if isinstance(raw, dict):
+        raw["_evidence_path"] = str(candidate)
+        return raw
     return None
 
 

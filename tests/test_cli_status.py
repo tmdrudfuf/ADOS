@@ -95,6 +95,15 @@ class CliStatusTests(unittest.TestCase):
         self.assertEqual("None", result.spec.evidence["active_spec"])
         self.assertEqual("003", result.spec.evidence["next_unused_spec"])
 
+    def test_unmerged_archive_does_not_report_latest_merged_spec(self):
+        with self.project(specs=[12]) as fixture:
+            self.write_archive(fixture.repo, spec="012-status-foundation", decision="Changes Requested", approved_review_sha="1" * 40)
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("Unknown", result.spec.evidence["latest_merged_spec"])
+        self.assertEqual("Unavailable", result.spec.evidence["latest_merged_spec_basis"])
+        self.assertEqual("Unavailable", result.publication.state)
+
     def test_validation_evidence_current_stale_and_unavailable(self):
         with self.project() as current:
             self.write_archive(current.repo, validated_sha=self.head(current.repo))
