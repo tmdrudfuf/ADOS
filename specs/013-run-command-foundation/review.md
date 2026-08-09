@@ -40,3 +40,10 @@
 - Decision: Changes Requested
 - Blocking finding: Run eligibility ignored Status `HUMAN_INTERVENTION_REQUIRED`, allowing mutation with multiple active worktrees.
 - Disposition: Valid. Added run-start recovery classification that blocks non-historical Status recovery codes before mutation while keeping stale historical validation/review/publication evidence as warnings. Added regression coverage for multiple active worktrees with zero mutation.
+
+### Round 2
+
+- Reviewed SHA: `147a2de912b726617af4c69ac52b111c93452053`
+- Decision: Changes Requested
+- Blocking finding: Run recovery classification falsely blocked `CHANGES_REQUESTED`, even though Status recovery was `NotRequired`.
+- Disposition: Valid. Run now checks `status.recovery.state` before applying the non-historical recovery-code filter. Added regression coverage for current-head `Changes Requested` review evidence.

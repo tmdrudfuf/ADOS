@@ -9,4 +9,4 @@
 - [x] T007 Add focused tests.
 - [x] T008 Run AIverse dry-run.
 - [x] T009 Run full validation.
-- [x] T010 Run independent Claude review.
+- [ ] T010 Run independent Claude review.

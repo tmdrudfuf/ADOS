@@ -120,6 +120,14 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("PLANNED", result.status)
         self.assertTrue(result.eligibility.warnings)
 
+    def test_changes_requested_review_state_does_not_claim_recovery_block(self):
+        with self.project() as fixture:
+            self.write_archive(fixture.repo, approved_review_sha=self.head(fixture.repo), decision="Changes Requested")
+            result = RunService().run(RunRequest(fixture.repo, "New unrelated spec", None, fixture.config, dry_run=True))
+
+        self.assertEqual("PLANNED", result.status)
+        self.assertNotIn("UNSAFE_RECOVERY_STATE", self.codes(result))
+
     def test_worktree_created_before_any_run_record_write(self):
         with self.project() as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Ordering proof", None, fixture.config))
@@ -240,10 +248,10 @@ class CliRunTests(unittest.TestCase):
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
 
-    def write_archive(self, repo, *, validated_sha="", approved_review_sha=""):
+    def write_archive(self, repo, *, validated_sha="", approved_review_sha="", decision="Approved"):
         archive = repo / ".agent-workflow" / "runs" / "000-old" / "ados-review-evidence.json"
         archive.parent.mkdir(parents=True, exist_ok=True)
-        archive.write_text(json.dumps({"validated_sha": validated_sha, "approved_review_sha": approved_review_sha, "claude_decision": "Approved"}), encoding="utf-8")
+        archive.write_text(json.dumps({"validated_sha": validated_sha, "approved_review_sha": approved_review_sha, "claude_decision": decision}), encoding="utf-8")
 
     def read_run_record(self, worktree, run_dir):
         return json.loads((worktree / ".agent-workflow" / "runs" / run_dir / "ados-run.json").read_text(encoding="utf-8"))

@@ -214,7 +214,7 @@ class RunService:
 
         status = self.status.run(StatusRequest(project_path=project_path, config_path=config_path))
         warnings.extend(_historical_warnings(status))
-        blocking_recovery = _run_blocking_recovery_codes(status.recovery.reason_codes)
+        blocking_recovery = _run_blocking_recovery_codes(status.recovery.state, status.recovery.reason_codes)
         if blocking_recovery:
             violations.append(
                 _violation(
@@ -293,7 +293,9 @@ def _historical_warnings(status: Any) -> list[RunViolation]:
     return warnings
 
 
-def _run_blocking_recovery_codes(reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+def _run_blocking_recovery_codes(recovery_state: str, reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+    if recovery_state != "HUMAN_INTERVENTION_REQUIRED":
+        return ()
     historical = {"VALIDATION_STALE", "REVIEW_STALE", "PUBLICATION_STALE", "SHA_MISMATCH"}
     return tuple(code for code in reason_codes if code not in historical)
 
