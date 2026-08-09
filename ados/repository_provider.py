@@ -27,6 +27,9 @@ class RepositoryProvider(Protocol):
     def current_head(self, path: Path) -> str:
         """Return the current HEAD SHA."""
 
+    def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
+        """Return whether ancestor is reachable from descendant."""
+
     def status(self, path: Path) -> RepositoryStatus:
         """Return read-only repository status."""
 

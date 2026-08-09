@@ -131,7 +131,7 @@ class StatusService:
         worktrees = self._worktrees(project_path)
         evidence = _latest_archive_evidence(project_path)
         current_head = repository.evidence.get("head", "")
-        spec = _spec_status(project_path, worktrees, current_head)
+        spec = _spec_status(project_path, worktrees, current_head, self.git)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
         exact_head = _exact_head_status(evidence, current_head)
@@ -237,7 +237,12 @@ def _invalid_result(project: StatusSection, code: str, evidence: dict[str, str])
     )
 
 
-def _spec_status(project_path: Path, worktrees: tuple[WorktreeStatus, ...], current_head: str) -> StatusSection:
+def _spec_status(
+    project_path: Path,
+    worktrees: tuple[WorktreeStatus, ...],
+    current_head: str,
+    git: GitRepositoryProvider,
+) -> StatusSection:
     numbers = sorted(_spec_number(path.name) for path in (project_path / "specs").glob("*") if path.is_dir())
     present = [number for number in numbers if number is not None]
     next_unused = _next_unused(present)
@@ -255,7 +260,7 @@ def _spec_status(project_path: Path, worktrees: tuple[WorktreeStatus, ...], curr
         "active_spec": ",".join(f"{number:03d}" for number in active_numbers) if active_numbers else "None",
         "next_unused_spec": f"{next_unused:03d}",
     }
-    archive = _merged_archive_evidence(project_path, current_head)
+    archive = _merged_archive_evidence(project_path, current_head, git)
     archive_spec = _archive_spec_number(archive)
     if archive_spec is not None:
         evidence["latest_merged_spec"] = f"{archive_spec:03d}"
@@ -387,14 +392,27 @@ def _latest_archive_evidence(project_path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _merged_archive_evidence(project_path: Path, current_head: str) -> dict[str, Any] | None:
+def _merged_archive_evidence(project_path: Path, current_head: str, git: GitRepositoryProvider) -> dict[str, Any] | None:
     if not current_head:
         return None
+    merged: list[tuple[int, str, dict[str, Any]]] = []
     for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
         raw = _read_archive(candidate)
-        if raw is not None and str(raw.get("merge_commit", "")) == current_head:
-            return raw
-    return None
+        if raw is None:
+            continue
+        spec_number = _archive_spec_number(raw)
+        merge_commit = str(raw.get("merge_commit", ""))
+        if spec_number is None or not merge_commit:
+            continue
+        try:
+            is_merged = git.is_ancestor(project_path, merge_commit, current_head)
+        except RepositoryProviderError:
+            continue
+        if is_merged:
+            merged.append((spec_number, merge_commit, raw))
+    if not merged:
+        return None
+    return max(merged, key=lambda item: (item[0], item[1]))[2]
 
 
 def _archive_evidence_records(project_path: Path) -> list[Path]:

@@ -38,3 +38,10 @@
 - Decision: Changes Requested
 - Blocking finding: `latest_merged_spec` could be reported from any archive evidence, even when the archive did not prove a merge.
 - Disposition: Valid. Status now reports `latest_merged_spec` only when archive evidence includes `merge_commit` equal to the current repository HEAD. Added regression coverage for an unmerged `Changes Requested` archive.
+
+### Round 2
+
+- Reviewed SHA: `c636619c2ea7a5113f2b55d25782ad8fb05270b7`
+- Decision: Changes Requested
+- Blocking finding: requiring `merge_commit == current HEAD` made `latest_merged_spec` unavailable after any later commit, even when the recorded merge commit remained reachable from current HEAD.
+- Disposition: Valid. Added a read-only Git ancestry check and resolved latest merged Spec from archive merge commits that are ancestors of the current HEAD. Validation/review/exact-head/publication remain exact-SHA scoped.

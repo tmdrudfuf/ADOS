@@ -20,6 +20,28 @@ class GitRepositoryProvider:
     def current_head(self, path: Path) -> str:
         return self._git(path, "rev-parse", "HEAD")
 
+    def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
+        if not path.is_dir():
+            raise RepositoryProviderError("REPOSITORY_PATH_INVALID", f"repository path is not a directory: {path}")
+        try:
+            completed = subprocess.run(
+                ("git", "merge-base", "--is-ancestor", ancestor, descendant),
+                cwd=path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RepositoryProviderError("GIT_UNAVAILABLE", "git executable is unavailable") from exc
+        except OSError as exc:
+            raise RepositoryProviderError("REPOSITORY_PATH_INVALID", str(exc)) from exc
+        if completed.returncode == 0:
+            return True
+        if completed.returncode == 1:
+            return False
+        message = (completed.stderr or completed.stdout or "git merge-base failed").strip()
+        raise RepositoryProviderError("GIT_ANCESTRY_UNAVAILABLE", message)
+
     def status(self, path: Path) -> RepositoryStatus:
         root = self.repository_root(path)
         branch = self.current_branch(root)

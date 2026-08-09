@@ -104,6 +104,19 @@ class CliStatusTests(unittest.TestCase):
         self.assertEqual("Unavailable", result.spec.evidence["latest_merged_spec_basis"])
         self.assertEqual("Unavailable", result.publication.state)
 
+    def test_latest_merged_spec_uses_reachable_merge_commit(self):
+        with self.project(specs=[1, 2]) as fixture:
+            merge_commit = self.head(fixture.repo)
+            self.write_archive(fixture.repo, spec="002-status-foundation", merge_commit=merge_commit)
+            (fixture.repo / "README.md").write_text("after merge\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "README.md")
+            self.git(fixture.repo, "commit", "-m", "post merge commit")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("002", result.spec.evidence["latest_merged_spec"])
+        self.assertEqual("merge_commit", result.spec.evidence["latest_merged_spec_basis"])
+        self.assertEqual("Stale", result.publication.state)
+
     def test_validation_evidence_current_stale_and_unavailable(self):
         with self.project() as current:
             self.write_archive(current.repo, validated_sha=self.head(current.repo))
