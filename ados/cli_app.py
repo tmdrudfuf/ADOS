@@ -13,6 +13,7 @@ from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfigError, load_project_config
 from .review_engine import ReviewEngine, ReviewRequest
+from .run_command import RunRequest, RunResult, RunService
 from .status import StatusRequest, StatusResult, StatusService
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
@@ -35,6 +36,14 @@ class CliApplication:
         status.add_argument("--project", dest="project_option")
         status.add_argument("--config")
         status.add_argument("--json", action="store_true")
+
+        run = subparsers.add_parser("run", help="start an ADOS-managed feature run")
+        run.add_argument("--project", required=True)
+        run.add_argument("--feature", required=True)
+        run.add_argument("--spec", type=int)
+        run.add_argument("--config")
+        run.add_argument("--dry-run", action="store_true")
+        run.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
         policy_subparsers = policy_parser.add_subparsers(dest="action", required=True)
@@ -128,6 +137,22 @@ class CliApplication:
             else:
                 print(_format_status_human(result))
             return _status_exit_code(result)
+
+        if args.area == "run":
+            result = RunService().run(
+                RunRequest(
+                    project_path=Path(args.project),
+                    feature_description=args.feature,
+                    spec_number=args.spec,
+                    config_path=Path(args.config) if args.config else None,
+                    dry_run=args.dry_run,
+                )
+            )
+            if args.json:
+                print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(_format_run_human(result))
+            return _run_exit_code(result)
 
         if args.area == "config" and args.action == "validate":
             try:
@@ -271,6 +296,42 @@ def _format_status_human(result: StatusResult) -> str:
 
 
 def _status_exit_code(result: StatusResult) -> int:
+    if result.status == "INVALID":
+        return 2
+    if result.status == "BLOCKED":
+        return 1
+    return 0
+
+
+def _format_run_human(result: RunResult) -> str:
+    lines = ["ADOS Run", ""]
+    if result.plan:
+        lines.extend(
+            [
+                f"Spec: {result.plan.spec_number}",
+                f"Branch: {result.plan.feature_branch}",
+                f"Worktree: {result.plan.feature_worktree}",
+                f"Base: {result.plan.authoritative_base_sha}",
+                "",
+            ]
+        )
+    if result.run_record:
+        lines.extend(["Implementation handoff:", result.run_record.next_stage, ""])
+    if result.eligibility.violations:
+        lines.append("Violations:")
+        for violation in result.eligibility.violations:
+            lines.append(f"{violation.code}: {violation.message}")
+        lines.append("")
+    if result.eligibility.warnings:
+        lines.append("Warnings:")
+        for warning in result.eligibility.warnings:
+            lines.append(f"{warning.code}: {warning.message}")
+        lines.append("")
+    lines.append(result.status)
+    return "\n".join(lines)
+
+
+def _run_exit_code(result: RunResult) -> int:
     if result.status == "INVALID":
         return 2
     if result.status == "BLOCKED":
