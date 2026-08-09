@@ -13,6 +13,7 @@ from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfigError, load_project_config
 from .review_engine import ReviewEngine, ReviewRequest
+from .status import StatusRequest, StatusResult, StatusService
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 
@@ -28,6 +29,12 @@ class CliApplication:
         doctor.add_argument("--project", dest="project_option")
         doctor.add_argument("--config")
         doctor.add_argument("--json", action="store_true")
+
+        status = subparsers.add_parser("status", help="report ADOS project status")
+        status.add_argument("project", nargs="?")
+        status.add_argument("--project", dest="project_option")
+        status.add_argument("--config")
+        status.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
         policy_subparsers = policy_parser.add_subparsers(dest="action", required=True)
@@ -105,6 +112,22 @@ class CliApplication:
             else:
                 print(_format_doctor_human(result))
             return _doctor_exit_code(result)
+
+        if args.area == "status":
+            project = args.project_option or args.project
+            if not project:
+                parser.error("status requires --project <path> or a project path argument")
+            result = StatusService().run(
+                StatusRequest(
+                    project_path=Path(project),
+                    config_path=Path(args.config) if args.config else None,
+                )
+            )
+            if args.json:
+                print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(_format_status_human(result))
+            return _status_exit_code(result)
 
         if args.area == "config" and args.action == "validate":
             try:
@@ -216,3 +239,40 @@ def _doctor_exit_code(result: DoctorResult) -> int:
     if result.status == "BLOCKED":
         return 1
     return 2
+
+
+def _format_status_human(result: StatusResult) -> str:
+    evidence = result.repository.evidence
+    lines = [
+        "ADOS Status",
+        "",
+        f"Project: {result.project.evidence.get('project_id', 'Unknown')}",
+        f"Primary: {result.guardian.state}",
+        f"Branch: {evidence.get('branch', 'Unknown')}",
+        f"HEAD: {evidence.get('head', 'Unknown')}",
+        "",
+        f"Latest merged Spec: {result.spec.evidence.get('latest_merged_spec', 'Unknown')}",
+        f"Active Spec: {result.spec.evidence.get('active_spec', 'None')}",
+        f"Next Spec: {result.spec.evidence.get('next_unused_spec', 'Unknown')}",
+        "",
+        f"Validation: {result.validation.state}",
+        f"Review: {result.review.state}",
+        f"Exact HEAD Gate: {result.exact_head_gate.state}",
+        f"Publication: {result.publication.state}",
+        "",
+        "Next action:",
+        result.next_action.action,
+        "",
+        result.status,
+    ]
+    if result.recovery.reason_codes:
+        lines.insert(-2, f"Reasons: {', '.join(result.recovery.reason_codes)}")
+    return "\n".join(lines)
+
+
+def _status_exit_code(result: StatusResult) -> int:
+    if result.status == "INVALID":
+        return 2
+    if result.status == "BLOCKED":
+        return 1
+    return 0
