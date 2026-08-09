@@ -20,6 +20,20 @@ class GitRepositoryProvider:
     def current_head(self, path: Path) -> str:
         return self._git(path, "rev-parse", "HEAD")
 
+    def ref_head(self, path: Path, ref: str) -> str:
+        return self._git(path, "rev-parse", ref)
+
+    def branch_exists(self, path: Path, branch: str) -> bool:
+        try:
+            self._git(path, "rev-parse", "--verify", f"refs/heads/{branch}")
+        except RepositoryProviderError:
+            return False
+        return True
+
+    def local_branches(self, path: Path) -> tuple[str, ...]:
+        output = self._git(path, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+        return tuple(line for line in output.splitlines() if line.strip())
+
     def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
         if not path.is_dir():
             raise RepositoryProviderError("REPOSITORY_PATH_INVALID", f"repository path is not a directory: {path}")

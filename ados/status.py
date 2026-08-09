@@ -270,13 +270,38 @@ def _spec_status(
 
 def _workflow_status(worktrees: tuple[WorktreeStatus, ...], spec: StatusSection, publication: StatusSection, doctor_status: str) -> StatusSection:
     active = [worktree for worktree in worktrees if not worktree.primary]
+    run_evidence = _active_run_evidence(active)
     if len(active) > 1:
-        return StatusSection("Active", {"active_worktree_count": str(len(active)), "doctor_status": doctor_status}, ("MULTIPLE_ACTIVE_WORKTREES",))
+        evidence = {"active_worktree_count": str(len(active)), "doctor_status": doctor_status}
+        evidence.update(run_evidence)
+        return StatusSection("Active", evidence, ("MULTIPLE_ACTIVE_WORKTREES",))
     if len(active) == 1:
-        return StatusSection("Active", {"active_worktree": active[0].path, "branch": active[0].branch, "doctor_status": doctor_status})
+        evidence = {"active_worktree": active[0].path, "branch": active[0].branch, "doctor_status": doctor_status}
+        evidence.update(run_evidence)
+        return StatusSection("Active", evidence)
     if publication.state == "Merged":
         return StatusSection("Idle", {"latest_merged_spec": spec.evidence.get("latest_merged_spec", "Unknown"), "doctor_status": doctor_status})
     return StatusSection("Idle", {"doctor_status": doctor_status})
+
+
+def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
+    for worktree in active:
+        runs = Path(worktree.path) / ".agent-workflow" / "runs"
+        if not runs.is_dir():
+            continue
+        for candidate in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(raw, dict) and raw.get("status"):
+                return {
+                    "run_id": str(raw.get("runId", "")),
+                    "run_status": str(raw.get("status", "")),
+                    "run_spec": str(raw.get("specNumber", "")),
+                    "run_record": str(candidate),
+                }
+    return {}
 
 
 def _validation_status(evidence: dict[str, Any] | None, current_head: str) -> StatusSection:

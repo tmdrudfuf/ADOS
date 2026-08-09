@@ -9,6 +9,7 @@ from .project_config import ProjectConfig, ProjectConfigError, load_project_conf
 from .publication_engine import PublicationEngine, PublicationEvidence
 from .recovery_engine import RecoveryDecision, RecoveryEngine, RecoveryIssue
 from .review_engine import ReviewEngine, ReviewRequest
+from .run_command import RunRequest, RunResult, RunService, WorkflowRunRecord
 from .status import StatusRequest, StatusResult, StatusService
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
@@ -27,10 +28,14 @@ __all__ = [
     "RecoveryIssue",
     "ReviewEngine",
     "ReviewRequest",
+    "RunRequest",
+    "RunResult",
+    "RunService",
     "StatusRequest",
     "StatusResult",
     "StatusService",
     "ValidationEngine",
+    "WorkflowRunRecord",
     "WorktreeLifecycleEngine",
     "WorktreeRequest",
     "load_execution_policy",

@@ -27,6 +27,15 @@ class RepositoryProvider(Protocol):
     def current_head(self, path: Path) -> str:
         """Return the current HEAD SHA."""
 
+    def ref_head(self, path: Path, ref: str) -> str:
+        """Return the SHA for a ref."""
+
+    def branch_exists(self, path: Path, branch: str) -> bool:
+        """Return whether a local branch exists."""
+
+    def local_branches(self, path: Path) -> tuple[str, ...]:
+        """Return local branch names."""
+
     def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
         """Return whether ancestor is reachable from descendant."""
 
