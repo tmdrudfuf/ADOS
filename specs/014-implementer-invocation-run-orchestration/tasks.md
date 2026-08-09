@@ -9,4 +9,4 @@
 - [x] T007 Add focused tests.
 - [x] T008 Run safe smoke test.
 - [x] T009 Run full validation.
-- [ ] T010 Run independent Claude review.
+- [x] T010 Run independent Claude review.

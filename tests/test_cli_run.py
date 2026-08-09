@@ -206,6 +206,31 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual("PLANNED", json.loads(stdout)["status"])
 
+    def test_cli_implementer_failure_exit_one(self):
+        with self.project(implementer_mode="failure") as fixture:
+            code, stdout = self.run_cli("run", "--project", str(fixture.repo), "--config", str(fixture.config), "--feature", "Failing implementation", "--json")
+
+        self.assertEqual(1, code)
+        self.assertEqual("IMPLEMENTATION_FAILED", json.loads(stdout)["status"])
+
+    def test_cli_implementer_timeout_exit_one(self):
+        with self.project(implementer_mode="timeout") as fixture:
+            code, stdout = self.run_cli(
+                "run",
+                "--project",
+                str(fixture.repo),
+                "--config",
+                str(fixture.config),
+                "--feature",
+                "Timed implementation",
+                "--implementer-timeout-ms",
+                "100",
+                "--json",
+            )
+
+        self.assertEqual(1, code)
+        self.assertEqual("IMPLEMENTATION_TIMED_OUT", json.loads(stdout)["status"])
+
     def run_cli(self, *args):
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
@@ -227,17 +252,21 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success"):
         if implementer is None:
             runner = path.parent / "implementer.py"
-            runner.write_text(
-                "from pathlib import Path\n"
-                "import os, sys\n"
-                "Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
-                "print(os.getcwd())\n"
-                "print(sys.stdin.read()[:200])\n",
-                encoding="utf-8",
-            )
+            scripts = {
+                "success": (
+                    "from pathlib import Path\n"
+                    "import os, sys\n"
+                    "Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
+                    "print(os.getcwd())\n"
+                    "print(sys.stdin.read()[:200])\n"
+                ),
+                "failure": "import sys\nprint('failed', file=sys.stderr)\nsys.exit(9)\n",
+                "timeout": "import time\ntime.sleep(5)\n",
+            }
+            runner.write_text(scripts[implementer_mode], encoding="utf-8")
             implementer = f'"{sys.executable}" "{runner}"'
         config = {
             "project": {

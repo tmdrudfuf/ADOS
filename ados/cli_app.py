@@ -336,6 +336,8 @@ def _format_run_human(result: RunResult) -> str:
 def _run_exit_code(result: RunResult) -> int:
     if result.status == "INVALID":
         return 2
-    if result.status == "BLOCKED":
+    if result.status in {"BLOCKED", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
         return 1
-    return 0
+    if result.status in {"PLANNED", "READY_FOR_IMPLEMENTATION", "READY_FOR_VALIDATION"}:
+        return 0
+    return 1

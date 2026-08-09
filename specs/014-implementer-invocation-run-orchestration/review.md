@@ -25,4 +25,9 @@ Automated fixture runners were used instead of invoking real Codex. This avoids 
 
 ## Independent Review
 
-Pending.
+### Round 1
+
+- Reviewed SHA: `63860fc64f0346c7200e0e2d1028b052d74ca04a`
+- Decision: Changes Requested
+- Blocking finding: CLI exit code returned success for `IMPLEMENTATION_FAILED` and `IMPLEMENTATION_TIMED_OUT`.
+- Disposition: Valid. `_run_exit_code` now maps implementer failure/timeout and unknown non-success statuses to exit code 1. Added CLI-level regression tests for failure and timeout.
