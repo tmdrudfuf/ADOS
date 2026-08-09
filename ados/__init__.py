@@ -4,6 +4,7 @@ __version__ = "1.0.0"
 
 from .execution_policy import ExecutionPolicy, PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
+from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .publication_engine import PublicationEngine, PublicationEvidence
@@ -17,6 +18,8 @@ from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 __all__ = [
     "ExecutionPolicy",
     "ExactHeadGate",
+    "ImplementerRuntime",
+    "ImplementerRuntimeOutcome",
     "PolicyValidationError",
     "PrimaryRepositoryGuardian",
     "ProjectConfig",

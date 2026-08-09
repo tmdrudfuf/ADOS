@@ -43,6 +43,7 @@ class CliApplication:
         run.add_argument("--spec", type=int)
         run.add_argument("--config")
         run.add_argument("--dry-run", action="store_true")
+        run.add_argument("--implementer-timeout-ms", type=int, default=300000)
         run.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
@@ -146,6 +147,7 @@ class CliApplication:
                     spec_number=args.spec,
                     config_path=Path(args.config) if args.config else None,
                     dry_run=args.dry_run,
+                    implementer_timeout_ms=args.implementer_timeout_ms,
                 )
             )
             if args.json:
@@ -334,6 +336,8 @@ def _format_run_human(result: RunResult) -> str:
 def _run_exit_code(result: RunResult) -> int:
     if result.status == "INVALID":
         return 2
-    if result.status == "BLOCKED":
+    if result.status in {"BLOCKED", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
         return 1
-    return 0
+    if result.status in {"PLANNED", "READY_FOR_IMPLEMENTATION", "READY_FOR_VALIDATION"}:
+        return 0
+    return 1
