@@ -214,6 +214,15 @@ class RunService:
 
         status = self.status.run(StatusRequest(project_path=project_path, config_path=config_path))
         warnings.extend(_historical_warnings(status))
+        blocking_recovery = _run_blocking_recovery_codes(status.recovery.reason_codes)
+        if blocking_recovery:
+            violations.append(
+                _violation(
+                    "UNSAFE_RECOVERY_STATE",
+                    "Status recovery requires human intervention before starting a new run",
+                    {"reason_codes": ",".join(blocking_recovery), "status": status.status},
+                )
+            )
 
         guardian = self.guardian.audit(
             policy=config.execution_policy,
@@ -282,6 +291,11 @@ def _historical_warnings(status: Any) -> list[RunViolation]:
         if section.state == "Stale":
             warnings.append(_violation(f"HISTORICAL_{section_name.upper()}_STALE", "historical evidence is stale for current HEAD", section.evidence))
     return warnings
+
+
+def _run_blocking_recovery_codes(reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+    historical = {"VALIDATION_STALE", "REVIEW_STALE", "PUBLICATION_STALE", "SHA_MISMATCH"}
+    return tuple(code for code in reason_codes if code not in historical)
 
 
 def _slug(description: str) -> str:

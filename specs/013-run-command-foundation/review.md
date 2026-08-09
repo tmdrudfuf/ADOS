@@ -34,4 +34,9 @@
 
 ## Independent Review
 
-Pending.
+### Round 1
+
+- Reviewed SHA: `0a2e38298c0ad27dbc3bded21cc9a6fd40b02054`
+- Decision: Changes Requested
+- Blocking finding: Run eligibility ignored Status `HUMAN_INTERVENTION_REQUIRED`, allowing mutation with multiple active worktrees.
+- Disposition: Valid. Added run-start recovery classification that blocks non-historical Status recovery codes before mutation while keeping stale historical validation/review/publication evidence as warnings. Added regression coverage for multiple active worktrees with zero mutation.

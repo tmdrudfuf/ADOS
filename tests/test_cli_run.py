@@ -96,6 +96,22 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual("PLANNED", result.status)
 
+    def test_status_human_intervention_blocks_before_mutation(self):
+        with self.project() as fixture:
+            first = fixture.root / "first"
+            second = fixture.root / "second"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/099-first", str(first), "HEAD")
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/098-second", str(second), "HEAD")
+            before = self.snapshot(fixture.repo)
+            result = RunService().run(RunRequest(fixture.repo, "Must not start", 5, fixture.config))
+            after = self.snapshot(fixture.repo)
+            self.git(fixture.repo, "worktree", "remove", str(first))
+            self.git(fixture.repo, "worktree", "remove", str(second))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
+        self.assertEqual(before, after)
+
     def test_stale_historical_evidence_warns_not_blocks(self):
         with self.project() as fixture:
             self.write_archive(fixture.repo, validated_sha="1" * 40, approved_review_sha="1" * 40)
