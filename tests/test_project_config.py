@@ -40,6 +40,18 @@ class ProjectConfigTests(unittest.TestCase):
 
         self.assertEqual("main", config.default_branch)
 
+    def test_load_project_config_accepts_utf8_bom_from_windows_tools(self):
+        path = Path("tests/fixtures/project-config.valid.json")
+        raw = "\ufeff" + path.read_text(encoding="utf-8")
+        bom_path = Path("tests/fixtures/.tmp-bom-project-config.json")
+        try:
+            bom_path.write_text(raw, encoding="utf-8")
+            config = load_project_config(bom_path)
+        finally:
+            bom_path.unlink(missing_ok=True)
+
+        self.assertEqual("example-project", config.project_id)
+
 
 if __name__ == "__main__":
     unittest.main()

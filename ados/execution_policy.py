@@ -107,7 +107,7 @@ class ExecutionPolicy:
 def load_execution_policy(path: str | Path) -> ExecutionPolicy:
     policy_path = Path(path)
     try:
-        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+        raw = json.loads(policy_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise PolicyValidationError("POLICY_INVALID_JSON", str(exc)) from exc
     except OSError as exc:

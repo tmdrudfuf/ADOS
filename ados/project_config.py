@@ -27,6 +27,8 @@ class ProjectConfig:
     default_branch: str
     allowed_primary_local_paths: tuple[str, ...]
     execution_policy: ExecutionPolicy
+    implementer: str | None = None
+    reviewer: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ProjectConfig":
@@ -35,11 +37,18 @@ class ProjectConfig:
         primary_repository_path = _require_string(project, "primary_repository_path", "PROJECT_CONFIG_MISSING_PRIMARY_REPOSITORY_PATH")
         default_branch = _require_string(project, "default_branch", "PROJECT_CONFIG_MISSING_DEFAULT_BRANCH")
         allowed_paths = _require_string_list(project, "allowed_primary_local_paths", "PROJECT_CONFIG_INVALID_ALLOWED_PATHS")
+        roles = raw.get("roles", {})
+        if roles is None:
+            roles = {}
+        if not isinstance(roles, Mapping):
+            raise ProjectConfigError("PROJECT_CONFIG_INVALID_ROLES", "roles must be an object")
+        implementer = _optional_string(roles, "implementer", "PROJECT_CONFIG_INVALID_IMPLEMENTER")
+        reviewer = _optional_string(roles, "reviewer", "PROJECT_CONFIG_INVALID_REVIEWER")
         try:
             execution_policy = ExecutionPolicy.from_mapping(raw)
         except PolicyValidationError as exc:
             raise ProjectConfigError(exc.code, exc.message) from exc
-        return cls(project_id, primary_repository_path, default_branch, tuple(allowed_paths), execution_policy)
+        return cls(project_id, primary_repository_path, default_branch, tuple(allowed_paths), execution_policy, implementer, reviewer)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -50,7 +59,7 @@ class ProjectConfig:
 def load_project_config(path: str | Path) -> ProjectConfig:
     config_path = Path(path)
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ProjectConfigError("PROJECT_CONFIG_INVALID_JSON", str(exc)) from exc
     except OSError as exc:
@@ -71,6 +80,15 @@ def _require_string(raw: Mapping[str, Any], key: str, code: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ProjectConfigError(code, f"{key} must be a non-empty string")
+    return value
+
+
+def _optional_string(raw: Mapping[str, Any], key: str, code: str) -> str | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ProjectConfigError(code, f"{key} must be a non-empty string when provided")
     return value
 
 

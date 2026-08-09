@@ -1,5 +1,7 @@
 """ADOS executable runtime primitives."""
 
+__version__ = "1.0.0"
+
 from .execution_policy import ExecutionPolicy, PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
 from .primary_repository_guardian import PrimaryRepositoryGuardian

@@ -5,6 +5,10 @@
     "default_branch": "main",
     "allowed_primary_local_paths": []
   },
+  "roles": {
+    "implementer": "codex",
+    "reviewer": "claude"
+  },
   "execution_policy": {
     "schema_version": "1",
     "publication": {
