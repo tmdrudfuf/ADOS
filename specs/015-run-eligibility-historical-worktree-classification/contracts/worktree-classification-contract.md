@@ -12,7 +12,7 @@
   "classification": "MERGED_HISTORICAL",
   "reason_codes": [],
   "evidence": {
-    "merged_evidence": "head_ancestor_of_current_main"
+    "merged_evidence": "head_reachable_from_merged_pull_request_head"
   }
 }
 ```

@@ -113,9 +113,12 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
         self.assertEqual(before, after)
+        self.assertEqual(before, after)
 
     def test_multiple_historical_merged_worktrees_do_not_block_new_run(self):
         with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="001-example", merge_commit=self.head(fixture.repo))
+            self.write_archive(fixture.repo, spec="002-example", merge_commit=self.head(fixture.repo))
             self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
             first = fixture.root / "old-001"
             second = fixture.root / "old-002"
@@ -145,6 +148,22 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual("BLOCKED", result.status)
         self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
+
+    def test_abandoned_lower_numbered_spec_branch_blocks_run_start(self):
+        with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
+            worktree = fixture.root / "abandoned-002"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/002-abandoned", str(worktree), "HEAD")
+            (worktree / "abandoned.txt").write_text("abandoned\n", encoding="utf-8")
+            self.git(worktree, "add", "abandoned.txt")
+            self.git(worktree, "commit", "-m", "abandoned spec work")
+            before = self.snapshot(fixture.repo)
+            result = RunService().run(RunRequest(fixture.repo, "New work", 4, fixture.config, dry_run=True))
+            after = self.snapshot(fixture.repo)
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
         self.assertEqual(before, after)
 
     def test_preserved_worktree_blocks_run_start(self):

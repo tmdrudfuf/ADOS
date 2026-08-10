@@ -44,6 +44,8 @@ def classify_worktree(
     primary_root: Path,
     current_main_head: str,
     latest_merged_spec: int | None,
+    merged_spec_numbers: frozenset[int] = frozenset(),
+    merged_pull_request_heads: tuple[str, ...] = (),
     git: GitRepositoryProvider,
 ) -> WorktreeClassification:
     if record.path == primary_root:
@@ -83,10 +85,22 @@ def classify_worktree(
         return WorktreeClassification("UNKNOWN", tuple(dirty_reasons), evidence)
 
     spec_number = branch_spec_number(record.branch)
-    if spec_number is not None and latest_merged_spec is not None and spec_number <= latest_merged_spec:
-        evidence["merged_evidence"] = "branch_spec_not_newer_than_latest_merged_spec"
+    for pull_request_head in merged_pull_request_heads:
+        try:
+            if git.is_ancestor(primary_root, record.head, pull_request_head):
+                evidence["merged_evidence"] = "head_reachable_from_merged_pull_request_head"
+                evidence["merged_pull_request_head"] = pull_request_head
+                if spec_number is not None:
+                    evidence["branch_spec"] = f"{spec_number:03d}"
+                return WorktreeClassification("MERGED_HISTORICAL", (), evidence)
+        except RepositoryProviderError as exc:
+            evidence["pull_request_ancestor_error"] = exc.message
+
+    if spec_number is not None and spec_number in merged_spec_numbers:
+        evidence["merged_evidence"] = "merged_archive_for_branch_spec"
         evidence["branch_spec"] = f"{spec_number:03d}"
-        evidence["latest_merged_spec"] = f"{latest_merged_spec:03d}"
+        if latest_merged_spec is not None:
+            evidence["latest_merged_spec"] = f"{latest_merged_spec:03d}"
         return WorktreeClassification("MERGED_HISTORICAL", (), evidence)
 
     if spec_number is not None:

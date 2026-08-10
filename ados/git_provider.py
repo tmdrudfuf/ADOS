@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 
 from .repository_provider import RepositoryProviderError, RepositoryStatus
@@ -33,6 +34,60 @@ class GitRepositoryProvider:
     def local_branches(self, path: Path) -> tuple[str, ...]:
         output = self._git(path, "for-each-ref", "--format=%(refname:short)", "refs/heads")
         return tuple(line for line in output.splitlines() if line.strip())
+
+    def origin_url(self, path: Path) -> str:
+        return self._git(path, "remote", "get-url", "origin")
+
+    def merged_pull_request_heads(self, path: Path, current_head: str) -> tuple[str, ...]:
+        try:
+            origin = self.origin_url(path)
+        except RepositoryProviderError:
+            return ()
+        if "github.com" not in origin.lower():
+            return ()
+        try:
+            completed = subprocess.run(
+                (
+                    "gh",
+                    "pr",
+                    "list",
+                    "--state",
+                    "merged",
+                    "--json",
+                    "headRefOid,mergeCommit",
+                    "--limit",
+                    "200",
+                ),
+                cwd=path,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, OSError):
+            return ()
+        if completed.returncode != 0:
+            return ()
+        try:
+            raw = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return ()
+        heads: list[str] = []
+        if not isinstance(raw, list):
+            return ()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            head = str(item.get("headRefOid", ""))
+            merge = item.get("mergeCommit", {})
+            merge_oid = str(merge.get("oid", "")) if isinstance(merge, dict) else ""
+            if not head or not merge_oid:
+                continue
+            try:
+                if self.is_ancestor(path, merge_oid, current_head):
+                    heads.append(head)
+            except RepositoryProviderError:
+                continue
+        return tuple(heads)
 
     def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
         if not path.is_dir():

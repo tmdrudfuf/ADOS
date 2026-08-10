@@ -88,6 +88,8 @@ class CliStatusTests(unittest.TestCase):
 
     def test_multiple_historical_merged_worktrees_reported_without_blocking(self):
         with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="001-example", merge_commit=self.head(fixture.repo))
+            self.write_archive(fixture.repo, spec="002-example", merge_commit=self.head(fixture.repo))
             self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
             first = fixture.root / "historical-001"
             second = fixture.root / "historical-002"
@@ -144,6 +146,21 @@ class CliStatusTests(unittest.TestCase):
         self.assertEqual("ACTIVE", result.status)
         active = next(worktree for worktree in result.worktrees if worktree.branch == "codex/001-active")
         self.assertEqual("ACTIVE", active.classification)
+
+    def test_abandoned_lower_numbered_spec_branch_is_active_not_historical(self):
+        with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
+            worktree = fixture.root / "abandoned-002"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/002-abandoned", str(worktree), "HEAD")
+            (worktree / "abandoned.txt").write_text("abandoned\n", encoding="utf-8")
+            self.git(worktree, "add", "abandoned.txt")
+            self.git(worktree, "commit", "-m", "abandoned spec work")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        abandoned = next(worktree for worktree in result.worktrees if worktree.branch == "codex/002-abandoned")
+        self.assertEqual("ACTIVE", abandoned.classification)
+        self.assertEqual("002", result.spec.evidence["active_spec"])
 
     def test_latest_active_and_next_spec_resolution(self):
         with self.project(specs=[1, 2, 4]) as fixture:

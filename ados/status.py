@@ -135,7 +135,9 @@ class StatusService:
         current_head = repository.evidence.get("head", "")
         merged_archive = _merged_archive_evidence(project_path, current_head, self.git)
         latest_merged_spec = _archive_spec_number(merged_archive)
-        worktrees = self._worktrees(project_path, current_head, latest_merged_spec)
+        merged_spec_numbers = _merged_spec_numbers(project_path, current_head, self.git)
+        merged_pull_request_heads = self.git.merged_pull_request_heads(project_path, current_head)
+        worktrees = self._worktrees(project_path, current_head, latest_merged_spec, merged_spec_numbers, merged_pull_request_heads)
         spec = _spec_status(project_path, worktrees, current_head, self.git)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
@@ -186,7 +188,14 @@ class StatusService:
             evidence.update({f"{violation.code}.{key}": value for key, value in violation.evidence.items()})
         return StatusSection("BLOCKED", evidence, tuple(violation.code for violation in result.violations))
 
-    def _worktrees(self, project_path: Path, current_head: str, latest_merged_spec: int | None) -> tuple[WorktreeStatus, ...]:
+    def _worktrees(
+        self,
+        project_path: Path,
+        current_head: str,
+        latest_merged_spec: int | None,
+        merged_spec_numbers: frozenset[int],
+        merged_pull_request_heads: tuple[str, ...],
+    ) -> tuple[WorktreeStatus, ...]:
         try:
             root = self.git.repository_root(project_path)
             records = self.worktree_provider.list_worktrees(project_path)
@@ -201,6 +210,8 @@ class StatusService:
                 primary_root=root,
                 current_main_head=current_head,
                 latest_merged_spec=latest_merged_spec,
+                merged_spec_numbers=merged_spec_numbers,
+                merged_pull_request_heads=merged_pull_request_heads,
                 git=self.git,
             )
             statuses.append(
@@ -489,6 +500,27 @@ def _merged_archive_evidence(project_path: Path, current_head: str, git: GitRepo
     if not merged:
         return None
     return max(merged, key=lambda item: (item[0], item[1]))[2]
+
+
+def _merged_spec_numbers(project_path: Path, current_head: str, git: GitRepositoryProvider) -> frozenset[int]:
+    if not current_head:
+        return frozenset()
+    merged: set[int] = set()
+    for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
+        raw = _read_archive(candidate)
+        if raw is None:
+            continue
+        spec_number = _archive_spec_number(raw)
+        merge_commit = str(raw.get("merge_commit", ""))
+        if spec_number is None or not merge_commit:
+            continue
+        try:
+            is_merged = git.is_ancestor(project_path, merge_commit, current_head)
+        except RepositoryProviderError:
+            continue
+        if is_merged:
+            merged.add(spec_number)
+    return frozenset(merged)
 
 
 def _archive_evidence_records(project_path: Path) -> list[Path]:

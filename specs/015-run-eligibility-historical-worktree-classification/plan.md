@@ -12,7 +12,7 @@ CLI
 ## Classification
 
 - `ACTIVE`: current unfinished durable run or unmerged Spec worktree.
-- `MERGED_HISTORICAL`: clean worktree with HEAD reachable from current main, or clean Spec worktree whose Spec is not newer than the latest merged Spec evidence.
+- `MERGED_HISTORICAL`: clean non-Spec worktree with HEAD reachable from current main, clean Spec worktree with merged archive evidence for that exact Spec, or clean worktree whose HEAD is reachable from a merged pull request head whose merge commit is reachable from current main.
 - `PRESERVED`: clean non-Spec worktree with unmerged history that should not be discarded.
 - `UNKNOWN`: missing, dirty, unreadable, or otherwise unprovable state.
 
