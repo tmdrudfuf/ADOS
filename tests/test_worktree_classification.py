@@ -43,7 +43,49 @@ class WorktreeClassificationTests(unittest.TestCase):
                 primary_root=primary,
                 current_main_head="main-head",
                 latest_merged_spec=3,
-                merged_spec_numbers=frozenset({3}),
+                merged_spec_commits={3: ("spec-003-merge",)},
+                git=git,
+            )
+
+        self.assertEqual("ACTIVE", result.classification)
+        self.assertIn("UNMERGED_SPEC_WORKTREE", result.reason_codes)
+
+    def test_spec_archive_merge_commit_requires_head_reachability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "project"
+            worktree = root / "project-spec-015"
+            primary.mkdir()
+            worktree.mkdir()
+            git = FakeGit({("spec-head", "spec-merge"): True})
+
+            result = classify_worktree(
+                record=WorktreeRecord(worktree, "codex/015-fix", "spec-head"),
+                primary_root=primary,
+                current_main_head="main-head",
+                latest_merged_spec=15,
+                merged_spec_commits={15: ("spec-merge",)},
+                git=git,
+            )
+
+        self.assertEqual("MERGED_HISTORICAL", result.classification)
+        self.assertEqual("head_reachable_from_merged_archive_commit", result.evidence["merged_evidence"])
+
+    def test_spec_archive_without_head_reachability_stays_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "project"
+            worktree = root / "project-spec-015"
+            primary.mkdir()
+            worktree.mkdir()
+            git = FakeGit({("old-head", "spec-merge"): True})
+
+            result = classify_worktree(
+                record=WorktreeRecord(worktree, "codex/015-fix", "new-unmerged-head"),
+                primary_root=primary,
+                current_main_head="main-head",
+                latest_merged_spec=15,
+                merged_spec_commits={15: ("spec-merge",)},
                 git=git,
             )
 

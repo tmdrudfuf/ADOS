@@ -135,9 +135,9 @@ class StatusService:
         current_head = repository.evidence.get("head", "")
         merged_archive = _merged_archive_evidence(project_path, current_head, self.git)
         latest_merged_spec = _archive_spec_number(merged_archive)
-        merged_spec_numbers = _merged_spec_numbers(project_path, current_head, self.git)
+        merged_spec_commits = _merged_spec_commits(project_path, current_head, self.git)
         merged_pull_request_heads = self.git.merged_pull_request_heads(project_path, current_head)
-        worktrees = self._worktrees(project_path, current_head, latest_merged_spec, merged_spec_numbers, merged_pull_request_heads)
+        worktrees = self._worktrees(project_path, current_head, latest_merged_spec, merged_spec_commits, merged_pull_request_heads)
         spec = _spec_status(project_path, worktrees, current_head, self.git)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
@@ -193,7 +193,7 @@ class StatusService:
         project_path: Path,
         current_head: str,
         latest_merged_spec: int | None,
-        merged_spec_numbers: frozenset[int],
+        merged_spec_commits: dict[int, tuple[str, ...]],
         merged_pull_request_heads: tuple[str, ...],
     ) -> tuple[WorktreeStatus, ...]:
         try:
@@ -210,7 +210,7 @@ class StatusService:
                 primary_root=root,
                 current_main_head=current_head,
                 latest_merged_spec=latest_merged_spec,
-                merged_spec_numbers=merged_spec_numbers,
+                merged_spec_commits=merged_spec_commits,
                 merged_pull_request_heads=merged_pull_request_heads,
                 git=self.git,
             )
@@ -502,10 +502,10 @@ def _merged_archive_evidence(project_path: Path, current_head: str, git: GitRepo
     return max(merged, key=lambda item: (item[0], item[1]))[2]
 
 
-def _merged_spec_numbers(project_path: Path, current_head: str, git: GitRepositoryProvider) -> frozenset[int]:
+def _merged_spec_commits(project_path: Path, current_head: str, git: GitRepositoryProvider) -> dict[int, tuple[str, ...]]:
     if not current_head:
-        return frozenset()
-    merged: set[int] = set()
+        return {}
+    merged: dict[int, list[str]] = {}
     for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
         raw = _read_archive(candidate)
         if raw is None:
@@ -519,8 +519,8 @@ def _merged_spec_numbers(project_path: Path, current_head: str, git: GitReposito
         except RepositoryProviderError:
             continue
         if is_merged:
-            merged.add(spec_number)
-    return frozenset(merged)
+            merged.setdefault(spec_number, []).append(merge_commit)
+    return {spec: tuple(commits) for spec, commits in merged.items()}
 
 
 def _archive_evidence_records(project_path: Path) -> list[Path]:

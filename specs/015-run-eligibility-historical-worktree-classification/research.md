@@ -14,4 +14,4 @@ Dirty, unreadable, missing, preserved, or ambiguous worktrees continue to block.
 
 ## Decision: Spec Numbers Are Not Merge Proof
 
-A lower-numbered Spec branch is not historical merely because a later Spec is merged. Spec branches require direct merged archive evidence or read-only GitHub PR evidence showing the worktree HEAD is reachable from a merged pull request head whose merge commit is reachable from current main.
+A lower-numbered Spec branch is not historical merely because a later Spec is merged. Spec branches require direct merged archive evidence showing the worktree HEAD is reachable from that Spec's merge commit, or read-only GitHub PR evidence showing the worktree HEAD is reachable from a merged pull request head whose merge commit is reachable from current main.
