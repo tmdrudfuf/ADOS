@@ -6,9 +6,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from ados.cli import main
+from ados.git_provider import MergedPullRequest
 from ados.status import StatusRequest, StatusService
+from ados.worktree_provider import WorktreeRecord
 
 
 class CliStatusTests(unittest.TestCase):
@@ -191,7 +194,7 @@ class CliStatusTests(unittest.TestCase):
 
         self.assertEqual("002", result.spec.evidence["latest_merged_spec"])
         self.assertEqual("merge_commit", result.spec.evidence["latest_merged_spec_basis"])
-        self.assertEqual("Stale", result.publication.state)
+        self.assertEqual("Merged", result.publication.state)
 
     def test_validation_evidence_current_stale_and_unavailable(self):
         with self.project() as current:
@@ -251,13 +254,51 @@ class CliStatusTests(unittest.TestCase):
 
     def test_merged_archive_exact_head_gate_is_historical_not_live_mismatch(self):
         with self.project() as fixture:
-            head = self.head(fixture.repo)
-            self.write_archive(fixture.repo, approved_review_sha="1" * 40, validated_sha="1" * 40, merge_commit=head)
+            self.git(fixture.repo, "checkout", "-b", "codex/012-status-foundation")
+            (fixture.repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "feature.txt")
+            self.git(fixture.repo, "commit", "-m", "feature")
+            candidate = self.head(fixture.repo)
+            self.git(fixture.repo, "checkout", "main")
+            self.git(fixture.repo, "merge", "--no-ff", "codex/012-status-foundation", "-m", "merge feature")
+            merge_commit = self.head(fixture.repo)
+            self.write_archive(fixture.repo, approved_review_sha=candidate, validated_sha=candidate, merge_commit=merge_commit)
             result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
 
         self.assertEqual("Merged", result.publication.state)
-        self.assertEqual("Unavailable", result.exact_head_gate.state)
+        self.assertEqual("Merged", result.exact_head_gate.state)
         self.assertNotIn("SHA_MISMATCH", result.recovery.reason_codes)
+
+    def test_aiverse_spec084_merged_pull_request_evidence_is_not_stale(self):
+        candidate = "530954d2d5ee0a57c699e001fe88dbe56f4ab66e"
+        merge_commit = "6b00a1ceb2107be566cea01179865a11b315e1a8"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "AIverse"
+            repo.mkdir()
+            (repo / "specs" / "084-post-validation-re-review-decision-continuation").mkdir(parents=True)
+            config = self.write_config(root / "aiverse-config.json", repo, project_id="AIverse", allowed_paths=[".claude"])
+            fake_git = FakeStatusGit(repo, current_head=merge_commit, candidate=candidate)
+            service = StatusService(
+                doctor=FakeDoctor(),
+                guardian=FakeGuardian(),
+                git=fake_git,
+                worktrees=FakeWorktrees(repo, merge_commit),
+            )
+            result = service.run(StatusRequest(repo, config))
+
+        self.assertEqual("IDLE", result.status)
+        self.assertEqual("084", result.spec.evidence["latest_merged_spec"])
+        self.assertEqual("None", result.spec.evidence["active_spec"])
+        self.assertEqual("PassedForMergedCandidate", result.validation.state)
+        self.assertEqual("ApprovedForMergedCandidate", result.review.state)
+        self.assertEqual("Merged", result.exact_head_gate.state)
+        self.assertEqual("Merged", result.publication.state)
+        self.assertEqual("74", result.publication.evidence["pull_request"])
+        self.assertNotIn("VALIDATION_STALE", result.recovery.reason_codes)
+        self.assertNotIn("REVIEW_STALE", result.recovery.reason_codes)
+        self.assertNotIn("SHA_MISMATCH", result.recovery.reason_codes)
+        self.assertEqual("Start Spec 001", result.next_action.action)
 
     def test_recovery_and_safe_next_action(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -432,6 +473,61 @@ class TemporaryProject:
 
     def __exit__(self, exc_type, exc, traceback):
         self.temp.cleanup()
+
+
+class FakeDoctor:
+    def run(self, request):
+        return SimpleNamespace(status="READY")
+
+
+class FakeGuardian:
+    def audit(self, **kwargs):
+        return SimpleNamespace(status="PASS", violations=())
+
+
+class FakeWorktrees:
+    def __init__(self, repo, head):
+        self.repo = repo.resolve()
+        self.head = head
+
+    def list_worktrees(self, project_path):
+        return (WorktreeRecord(self.repo, "main", self.head),)
+
+
+class FakeStatusGit:
+    def __init__(self, repo, *, current_head, candidate):
+        self.repo = repo.resolve()
+        self.current = current_head
+        self.candidate = candidate
+
+    def repository_root(self, path):
+        return self.repo
+
+    def current_branch(self, path):
+        return "main"
+
+    def current_head(self, path):
+        return self.current
+
+    def status(self, path):
+        return SimpleNamespace(staged=(), dirty_tracked=(), untracked=())
+
+    def merged_pull_requests(self, path, current_head):
+        return (
+            MergedPullRequest(
+                number="74",
+                title="Spec 084: Post-Validation Re-Review Decision & Continuation Foundation",
+                head_ref_name="codex/084-post-validation-re-review-decision-continuation",
+                head_ref_oid=self.candidate,
+                merge_commit_oid=self.current,
+            ),
+        )
+
+    def is_ancestor(self, path, ancestor, descendant):
+        return (ancestor, descendant) in {
+            (self.current, self.current),
+            (self.candidate, self.current),
+        }
 
 
 if __name__ == "__main__":

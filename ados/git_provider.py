@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import json
 import subprocess
 
 from .repository_provider import RepositoryProviderError, RepositoryStatus
+
+
+@dataclass(frozen=True)
+class MergedPullRequest:
+    number: str
+    title: str
+    head_ref_name: str
+    head_ref_oid: str
+    merge_commit_oid: str
 
 
 class GitRepositoryProvider:
@@ -39,6 +49,9 @@ class GitRepositoryProvider:
         return self._git(path, "remote", "get-url", "origin")
 
     def merged_pull_request_heads(self, path: Path, current_head: str) -> tuple[str, ...]:
+        return tuple(record.head_ref_oid for record in self.merged_pull_requests(path, current_head))
+
+    def merged_pull_requests(self, path: Path, current_head: str) -> tuple[MergedPullRequest, ...]:
         try:
             origin = self.origin_url(path)
         except RepositoryProviderError:
@@ -54,7 +67,7 @@ class GitRepositoryProvider:
                     "--state",
                     "merged",
                     "--json",
-                    "headRefOid,mergeCommit",
+                    "number,title,headRefName,headRefOid,mergeCommit",
                     "--limit",
                     "200",
                 ),
@@ -71,23 +84,26 @@ class GitRepositoryProvider:
             raw = json.loads(completed.stdout)
         except json.JSONDecodeError:
             return ()
-        heads: list[str] = []
+        records: list[MergedPullRequest] = []
         if not isinstance(raw, list):
             return ()
         for item in raw:
             if not isinstance(item, dict):
                 continue
             head = str(item.get("headRefOid", ""))
+            head_ref = str(item.get("headRefName", ""))
+            title = str(item.get("title", ""))
+            number = str(item.get("number", ""))
             merge = item.get("mergeCommit", {})
             merge_oid = str(merge.get("oid", "")) if isinstance(merge, dict) else ""
             if not head or not merge_oid:
                 continue
             try:
                 if self.is_ancestor(path, merge_oid, current_head):
-                    heads.append(head)
+                    records.append(MergedPullRequest(number, title, head_ref, head, merge_oid))
             except RepositoryProviderError:
                 continue
-        return tuple(heads)
+        return tuple(records)
 
     def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
         if not path.is_dir():

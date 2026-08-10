@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from .doctor import DoctorRequest, DoctorService, discover_project_config
-from .git_provider import GitRepositoryProvider
+from .git_provider import GitRepositoryProvider, MergedPullRequest
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
@@ -131,14 +131,15 @@ class StatusService:
 
         repository = self._repository(project_path)
         guardian = self._guardian(project_path, config)
-        evidence = _latest_archive_evidence(project_path)
         current_head = repository.evidence.get("head", "")
-        merged_archive = _merged_archive_evidence(project_path, current_head, self.git)
+        merged_pull_requests = self.git.merged_pull_requests(project_path, current_head)
+        evidence = _latest_complete_evidence(project_path, current_head, self.git, merged_pull_requests)
+        merged_archive = _merged_archive_evidence(project_path, current_head, self.git, merged_pull_requests)
         latest_merged_spec = _archive_spec_number(merged_archive)
-        merged_spec_commits = _merged_spec_commits(project_path, current_head, self.git)
-        merged_pull_request_heads = self.git.merged_pull_request_heads(project_path, current_head)
+        merged_spec_commits = _merged_spec_commits(project_path, current_head, self.git, merged_pull_requests)
+        merged_pull_request_heads = tuple(record.head_ref_oid for record in merged_pull_requests)
         worktrees = self._worktrees(project_path, current_head, latest_merged_spec, merged_spec_commits, merged_pull_request_heads)
-        spec = _spec_status(project_path, worktrees, current_head, self.git)
+        spec = _spec_status(project_path, worktrees, current_head, self.git, merged_pull_requests)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
         exact_head = _exact_head_status(evidence, current_head)
@@ -267,6 +268,7 @@ def _spec_status(
     worktrees: tuple[WorktreeStatus, ...],
     current_head: str,
     git: GitRepositoryProvider,
+    merged_pull_requests: tuple[MergedPullRequest, ...] = (),
 ) -> StatusSection:
     numbers = sorted(_spec_number(path.name) for path in (project_path / "specs").glob("*") if path.is_dir())
     present = [number for number in numbers if number is not None]
@@ -293,7 +295,7 @@ def _spec_status(
         "historical_spec": ",".join(f"{number:03d}" for number in historical_numbers) if historical_numbers else "None",
         "next_unused_spec": f"{next_unused:03d}",
     }
-    archive = _merged_archive_evidence(project_path, current_head, git)
+    archive = _merged_archive_evidence(project_path, current_head, git, merged_pull_requests)
     archive_spec = _archive_spec_number(archive)
     if archive_spec is not None:
         evidence["latest_merged_spec"] = f"{archive_spec:03d}"
@@ -365,6 +367,11 @@ def _validation_status(evidence: dict[str, Any] | None, current_head: str) -> St
     if not evidence or not evidence.get("validated_sha"):
         return StatusSection("Unavailable", {})
     validated = str(evidence.get("validated_sha", ""))
+    if _is_merged_candidate_evidence(evidence, current_head) and evidence.get("validation_status", "PASS") == "PASS":
+        return StatusSection(
+            "PassedForMergedCandidate",
+            {"validated_sha": validated, "current_head": current_head, "merge_commit": str(evidence.get("merge_commit", ""))},
+        )
     if current_head and validated != current_head:
         return StatusSection("Stale", {"validated_sha": validated, "current_head": current_head}, ("VALIDATION_STALE",))
     return StatusSection("Passed", {"validated_sha": validated})
@@ -375,6 +382,11 @@ def _review_status(evidence: dict[str, Any] | None, current_head: str) -> Status
         return StatusSection("Unavailable", {})
     reviewed = str(evidence.get("approved_review_sha", ""))
     decision = str(evidence.get("claude_decision", "Unknown"))
+    if _is_merged_candidate_evidence(evidence, current_head) and decision == "Approved":
+        return StatusSection(
+            "ApprovedForMergedCandidate",
+            {"reviewed_sha": reviewed, "current_head": current_head, "decision": decision, "merge_commit": str(evidence.get("merge_commit", ""))},
+        )
     if current_head and reviewed != current_head:
         return StatusSection("Stale", {"reviewed_sha": reviewed, "current_head": current_head, "decision": decision}, ("REVIEW_STALE",))
     if decision == "Approved":
@@ -392,15 +404,15 @@ def _exact_head_status(evidence: dict[str, Any] | None, current_head: str) -> St
     merge_commit = str(evidence.get("merge_commit", ""))
     if not approved or not validated or not current_head:
         return StatusSection("Unavailable", {"approved_review_sha": approved, "validated_sha": validated, "current_head": current_head})
-    if merge_commit and merge_commit == current_head and approved == validated and approved != current_head:
+    if _is_merged_candidate_evidence(evidence, current_head) and approved == validated and approved != current_head:
         return StatusSection(
-            "Unavailable",
+            "Merged",
             {
                 "approved_review_sha": approved,
                 "validated_sha": validated,
                 "current_head": current_head,
                 "merge_commit": merge_commit,
-                "reason": "archived feature gate already merged",
+                "reason": "feature gate satisfied before merge",
             },
         )
     if approved == validated == current_head:
@@ -412,7 +424,7 @@ def _publication_status(evidence: dict[str, Any] | None, current_head: str) -> S
     if not evidence:
         return StatusSection("Unavailable", {})
     merge_commit = str(evidence.get("merge_commit", ""))
-    if merge_commit and current_head and merge_commit == current_head:
+    if evidence.get("_merged_into_current_head") == "true" or (merge_commit and current_head and merge_commit == current_head):
         return StatusSection("Merged", {"merge_commit": merge_commit, "pull_request": str(evidence.get("pull_request", ""))})
     if merge_commit:
         return StatusSection("Stale", {"merge_commit": merge_commit, "current_head": current_head}, ("PUBLICATION_STALE",))
@@ -470,7 +482,15 @@ def _overall_status(guardian: StatusSection, workflow: StatusSection, recovery: 
     return "IDLE"
 
 
-def _latest_archive_evidence(project_path: Path) -> dict[str, Any] | None:
+def _latest_complete_evidence(
+    project_path: Path,
+    current_head: str,
+    git: GitRepositoryProvider,
+    merged_pull_requests: tuple[MergedPullRequest, ...] = (),
+) -> dict[str, Any] | None:
+    merged = _merged_archive_evidence(project_path, current_head, git, merged_pull_requests)
+    if merged is not None:
+        return merged
     candidates = _archive_evidence_records(project_path)
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     for candidate in candidates:
@@ -480,46 +500,71 @@ def _latest_archive_evidence(project_path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _merged_archive_evidence(project_path: Path, current_head: str, git: GitRepositoryProvider) -> dict[str, Any] | None:
+def _merged_archive_evidence(
+    project_path: Path,
+    current_head: str,
+    git: GitRepositoryProvider,
+    merged_pull_requests: tuple[MergedPullRequest, ...] = (),
+) -> dict[str, Any] | None:
     if not current_head:
         return None
     merged: list[tuple[int, str, dict[str, Any]]] = []
+    for pull_request in merged_pull_requests:
+        evidence = _merged_pull_request_evidence(project_path, current_head, git, pull_request)
+        spec_number = _archive_spec_number(evidence)
+        if evidence is not None and spec_number is not None:
+            merged.append((spec_number, str(evidence["merge_commit"]), evidence))
     for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
         raw = _read_archive(candidate)
         if raw is None:
             continue
+        raw = _normalize_archive_evidence(raw)
         spec_number = _archive_spec_number(raw)
         merge_commit = str(raw.get("merge_commit", ""))
         if spec_number is None or not merge_commit:
             continue
         try:
             is_merged = git.is_ancestor(project_path, merge_commit, current_head)
+            candidate_reachable = _candidate_reaches_current(project_path, current_head, git, raw)
         except RepositoryProviderError:
             continue
-        if is_merged:
+        if is_merged and candidate_reachable:
+            raw["_merged_into_current_head"] = "true"
             merged.append((spec_number, merge_commit, raw))
     if not merged:
         return None
     return max(merged, key=lambda item: (item[0], item[1]))[2]
 
 
-def _merged_spec_commits(project_path: Path, current_head: str, git: GitRepositoryProvider) -> dict[int, tuple[str, ...]]:
+def _merged_spec_commits(
+    project_path: Path,
+    current_head: str,
+    git: GitRepositoryProvider,
+    merged_pull_requests: tuple[MergedPullRequest, ...] = (),
+) -> dict[int, tuple[str, ...]]:
     if not current_head:
         return {}
     merged: dict[int, list[str]] = {}
+    for pull_request in merged_pull_requests:
+        evidence = _merged_pull_request_evidence(project_path, current_head, git, pull_request)
+        spec_number = _archive_spec_number(evidence)
+        if evidence is not None and spec_number is not None:
+            merged.setdefault(spec_number, []).append(str(evidence["merge_commit"]))
     for candidate in sorted(_archive_evidence_records(project_path), key=lambda path: str(path)):
         raw = _read_archive(candidate)
         if raw is None:
             continue
+        raw = _normalize_archive_evidence(raw)
         spec_number = _archive_spec_number(raw)
         merge_commit = str(raw.get("merge_commit", ""))
         if spec_number is None or not merge_commit:
             continue
         try:
             is_merged = git.is_ancestor(project_path, merge_commit, current_head)
+            candidate_reachable = _candidate_reaches_current(project_path, current_head, git, raw)
         except RepositoryProviderError:
             continue
-        if is_merged:
+        if is_merged and candidate_reachable:
             merged.setdefault(spec_number, []).append(merge_commit)
     return {spec: tuple(commits) for spec, commits in merged.items()}
 
@@ -538,8 +583,94 @@ def _read_archive(candidate: Path) -> dict[str, Any] | None:
         return None
     if isinstance(raw, dict):
         raw["_evidence_path"] = str(candidate)
-        return raw
+        return _normalize_archive_evidence(raw)
     return None
+
+
+def _normalize_archive_evidence(raw: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(raw)
+    pr = normalized.get("pr")
+    if isinstance(pr, dict):
+        if not normalized.get("pull_request") and pr.get("number"):
+            normalized["pull_request"] = pr.get("number")
+        if not normalized.get("merge_commit") and pr.get("merge_commit_sha"):
+            normalized["merge_commit"] = pr.get("merge_commit_sha")
+        if not normalized.get("candidate_sha") and pr.get("head_sha"):
+            normalized["candidate_sha"] = pr.get("head_sha")
+    if not normalized.get("candidate_sha"):
+        candidate = normalized.get("approved_review_sha") or normalized.get("validated_sha")
+        if candidate:
+            normalized["candidate_sha"] = candidate
+    validation = normalized.get("validation")
+    if isinstance(validation, dict) and validation.get("status"):
+        normalized["validation_status"] = validation.get("status")
+    return normalized
+
+
+def _merged_pull_request_evidence(
+    project_path: Path,
+    current_head: str,
+    git: GitRepositoryProvider,
+    pull_request: MergedPullRequest,
+) -> dict[str, Any] | None:
+    spec = _pull_request_spec(pull_request)
+    if spec is None:
+        return None
+    if not pull_request.merge_commit_oid or not pull_request.head_ref_oid:
+        return None
+    try:
+        if not git.is_ancestor(project_path, pull_request.merge_commit_oid, current_head):
+            return None
+        if not git.is_ancestor(project_path, pull_request.head_ref_oid, current_head):
+            return None
+    except RepositoryProviderError:
+        return None
+    return {
+        "spec": f"{spec:03d}-{_pull_request_slug(pull_request)}",
+        "validated_sha": pull_request.head_ref_oid,
+        "approved_review_sha": pull_request.head_ref_oid,
+        "candidate_sha": pull_request.head_ref_oid,
+        "claude_decision": "Approved",
+        "validation_status": "PASS",
+        "pull_request": pull_request.number,
+        "merge_commit": pull_request.merge_commit_oid,
+        "_evidence_source": "merged_pull_request",
+        "_merged_into_current_head": "true",
+    }
+
+
+def _pull_request_spec(pull_request: MergedPullRequest) -> int | None:
+    for value in (pull_request.head_ref_name, pull_request.title):
+        match = re.search(r"(?:^|/|\b)(\d{3})(?:-|:|\b)", value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _pull_request_slug(pull_request: MergedPullRequest) -> str:
+    match = re.search(r"\d{3}[-: ]+(.+)$", pull_request.head_ref_name)
+    if not match:
+        match = re.search(r"\d{3}[-: ]+(.+)$", pull_request.title)
+    if not match:
+        return "merged-pull-request"
+    words = re.findall(r"[a-z0-9]+", match.group(1).lower())
+    return "-".join(words[:8]) or "merged-pull-request"
+
+
+def _is_merged_candidate_evidence(evidence: dict[str, Any], current_head: str) -> bool:
+    merge_commit = str(evidence.get("merge_commit", ""))
+    candidate = str(evidence.get("candidate_sha", "") or evidence.get("approved_review_sha", "") or evidence.get("validated_sha", ""))
+    return bool(merge_commit and current_head and candidate and evidence.get("_merged_into_current_head") == "true")
+
+
+def _candidate_reaches_current(project_path: Path, current_head: str, git: GitRepositoryProvider, evidence: dict[str, Any]) -> bool:
+    candidate = str(evidence.get("candidate_sha", "") or evidence.get("approved_review_sha", "") or evidence.get("validated_sha", ""))
+    if not candidate:
+        return True
+    try:
+        return git.is_ancestor(project_path, candidate, current_head)
+    except RepositoryProviderError:
+        return False
 
 
 def _spec_number(name: str) -> int | None:
