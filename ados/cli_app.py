@@ -83,6 +83,7 @@ class CliApplication:
         review_subparsers = review_parser.add_subparsers(dest="action", required=True)
         review_run = review_subparsers.add_parser("run")
         review_run.add_argument("--policy", required=True)
+        review_run.add_argument("--repo", required=True)
         review_run.add_argument("--candidate-sha", required=True)
         review_run.add_argument("--base-sha", required=True)
         review_run.add_argument("--scope", required=True)
@@ -205,6 +206,7 @@ class CliApplication:
             result = ReviewEngine().run(
                 policy=policy,
                 request=ReviewRequest(
+                    repository_path=Path(args.repo),
                     candidate_sha=args.candidate_sha,
                     base_sha=args.base_sha,
                     scope=args.scope,
