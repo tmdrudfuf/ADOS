@@ -21,6 +21,7 @@ from .repository_provider import RepositoryProviderError
 
 SAFE_TIMEOUT_MS = 300_000
 UNSAFE_TOKENS = ("&", "|", ";", "<", ">", "`", "$(", "\n", "\r")
+RESUMABLE_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}
 
 
 @dataclass(frozen=True)
@@ -186,12 +187,13 @@ class ImplementerRuntime:
                 violations.append(_violation("RUN_RECORD_INVALID", "run record is missing required field", {"field": key}))
         if violations:
             return tuple(violations)
-        if record["status"] != "READY_FOR_IMPLEMENTATION":
+        if record["status"] not in RESUMABLE_STATUSES:
             violations.append(_violation("RUN_NOT_READY_FOR_IMPLEMENTATION", "run is not ready for implementer invocation", {"status": record["status"]}))
         if record["projectId"] != config.project_id:
             violations.append(_violation("RUN_PROJECT_MISMATCH", "run project does not match configuration", {"run": record["projectId"], "config": config.project_id}))
-        if record["implementer"] != (config.implementer or ""):
-            violations.append(_violation("IMPLEMENTER_ROLE_MISMATCH", "run implementer does not match configuration", {"run": record["implementer"], "config": config.implementer or ""}))
+        expected_implementer = config.implementer or "Unavailable"
+        if record["implementer"] != expected_implementer:
+            violations.append(_violation("IMPLEMENTER_ROLE_MISMATCH", "run implementer does not match configuration", {"run": record["implementer"], "config": expected_implementer}))
         primary = Path(record["primaryRepository"]).resolve()
         worktree = Path(record["featureWorktree"]).resolve()
         if primary != Path(config.primary_repository_path).resolve():

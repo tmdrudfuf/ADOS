@@ -20,6 +20,9 @@ from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, Worktr
 from .worktree_provider import GitWorktreeProvider
 
 
+RESUMABLE_RUN_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}
+
+
 @dataclass(frozen=True)
 class RunRequest:
     project_path: Path
@@ -111,6 +114,7 @@ class RunResult:
     run_record: WorkflowRunRecord | None = None
     worktree_result: WorktreeLifecycleResult | None = None
     implementer_result: ImplementerRuntimeOutcome | None = None
+    resumed: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -120,6 +124,7 @@ class RunResult:
             "runRecord": self.run_record.to_dict() if self.run_record else None,
             "worktreeResult": self.worktree_result.to_dict() if self.worktree_result else None,
             "implementerResult": self.implementer_result.to_dict() if self.implementer_result else None,
+            "resumed": self.resumed,
         }
 
 
@@ -162,11 +167,17 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),))
             return RunResult("BLOCKED", eligibility)
 
-        eligibility = self._eligibility(project_path, config, config_path, plan)
+        resume = self._resumable_run(project_path, config, plan)
+        eligibility = self._eligibility(project_path, config, config_path, plan, resume)
         if eligibility.status != "ELIGIBLE":
             return RunResult("INVALID" if eligibility.status == "INVALID" else "BLOCKED", eligibility, plan)
         if request.dry_run:
-            return RunResult("PLANNED", eligibility, plan, self._record(config, request, plan))
+            return RunResult("PLANNED", eligibility, plan, resume.record if resume else self._record(config, request, plan), resumed=resume is not None)
+
+        if resume is not None:
+            implementer_result = self.implementer.run(config=config, run_record_path=resume.record_path, timeout_ms=request.implementer_timeout_ms)
+            updated_record = _record_from_mapping(implementer_result.run_record) if implementer_result.run_record else resume.record
+            return RunResult(implementer_result.status, eligibility, plan, updated_record, implementer_result=implementer_result, resumed=True)
 
         worktree_request = WorktreeRequest(
             primary_repository_path=project_path,
@@ -209,7 +220,7 @@ class RunService:
         worktree_path = project_path.parent / f"{project_path.name}-{slug}"
         return RunPlan(str(project_path), spec, slug, branch_name, str(worktree_path), head)
 
-    def _eligibility(self, project_path: Path, config: ProjectConfig, config_path: Path, plan: RunPlan) -> RunEligibility:
+    def _eligibility(self, project_path: Path, config: ProjectConfig, config_path: Path, plan: RunPlan, resume: "_ResumeCandidate | None" = None) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
         doctor = self.doctor.run(DoctorRequest(project_path=project_path, config_path=config_path))
@@ -232,7 +243,7 @@ class RunService:
                 )
             )
         active_count = status.workflow.evidence.get("active_worktree_count", "0")
-        if active_count not in {"", "0"}:
+        if active_count not in {"", "0"} and resume is None:
             violations.append(
                 _violation(
                     "ACTIVE_WORKTREE_PRESENT",
@@ -267,26 +278,81 @@ class RunService:
         if any(_spec_number(path.name) == spec_number for path in (project_path / "specs").glob("*") if path.is_dir()):
             violations.append(_violation("SPEC_NUMBER_USED", "requested Spec number already has a directory", {"spec": plan.spec_number}))
         try:
-            if self.git.branch_exists(project_path, plan.feature_branch):
+            if self.git.branch_exists(project_path, plan.feature_branch) and resume is None:
                 violations.append(_violation("FEATURE_BRANCH_EXISTS", "feature branch already exists", {"branch": plan.feature_branch}))
         except RepositoryProviderError as exc:
             violations.append(_violation(exc.code, exc.message, {"branch": plan.feature_branch}))
-        if Path(plan.feature_worktree).exists():
+        if Path(plan.feature_worktree).exists() and resume is None:
             violations.append(_violation("WORKTREE_PATH_EXISTS", "feature worktree path already exists", {"worktree_path": plan.feature_worktree}))
         for record in self.worktrees.list_worktrees(project_path):
+            if resume is not None and record.path == Path(resume.record.feature_worktree).resolve():
+                continue
             if record.branch == plan.feature_branch or _branch_spec_number(record.branch) == spec_number:
                 violations.append(_violation("CONFLICTING_WORKTREE", "active worktree already owns requested Spec or branch", {"branch": record.branch, "path": str(record.path)}))
 
         return RunEligibility("BLOCKED" if violations else "ELIGIBLE", tuple(violations), tuple(warnings))
 
+    def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan) -> "_ResumeCandidate | None":
+        candidates: list[_ResumeCandidate] = []
+        for record in self.worktrees.list_worktrees(project_path):
+            runs = record.path / ".agent-workflow" / "runs"
+            if not runs.is_dir():
+                continue
+            for candidate_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
+                raw = _read_mapping(candidate_path)
+                if raw is None:
+                    continue
+                candidate = self._resume_candidate(config, plan, record, candidate_path, raw)
+                if candidate is not None:
+                    candidates.append(candidate)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _resume_candidate(
+        self,
+        config: ProjectConfig,
+        plan: RunPlan,
+        worktree_record: Any,
+        record_path: Path,
+        raw: dict[str, Any],
+    ) -> "_ResumeCandidate | None":
+        try:
+            record = _record_from_mapping(raw)
+        except (KeyError, TypeError):
+            return None
+        expected = self._record_from_plan(config, plan, record.feature_description)
+        if record.status not in RESUMABLE_RUN_STATUSES:
+            return None
+        if (
+            record.run_id != expected.run_id
+            or record.project_id != expected.project_id
+            or Path(record.primary_repository).resolve() != Path(expected.primary_repository).resolve()
+            or record.spec_number != expected.spec_number
+            or record.feature_slug != expected.feature_slug
+            or record.authoritative_base_sha != expected.authoritative_base_sha
+            or record.feature_branch != expected.feature_branch
+            or Path(record.feature_worktree).resolve() != Path(expected.feature_worktree).resolve()
+            or record.execution_policy_version != expected.execution_policy_version
+            or record.implementer != expected.implementer
+            or record.reviewer != expected.reviewer
+            or worktree_record.branch != expected.feature_branch
+            or worktree_record.path != Path(expected.feature_worktree).resolve()
+        ):
+            return None
+        return _ResumeCandidate(record_path=record_path, record=record)
+
     def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan) -> WorkflowRunRecord:
+        return self._record_from_plan(config, plan, request.feature_description)
+
+    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str) -> WorkflowRunRecord:
         run_id = _run_id(config.project_id, plan.spec_number, plan.feature_slug, plan.authoritative_base_sha)
         return WorkflowRunRecord(
             run_id=run_id,
             project_id=config.project_id,
             spec_number=plan.spec_number,
             feature_slug=plan.feature_slug,
-            feature_description=request.feature_description,
+            feature_description=feature_description,
             authoritative_base_sha=plan.authoritative_base_sha,
             primary_repository=plan.project_path,
             feature_branch=plan.feature_branch,
@@ -323,6 +389,14 @@ def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
         status=str(raw["status"]),
         next_stage=str(raw["nextStage"]),
     )
+
+
+def _read_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
 
 
 def _violation(code: str, message: str, evidence: dict[str, str]) -> RunViolation:
@@ -388,3 +462,9 @@ class _RunPlanError(RuntimeError):
         self.code = code
         self.message = message
         self.evidence = evidence
+
+
+@dataclass(frozen=True)
+class _ResumeCandidate:
+    record_path: Path
+    record: WorkflowRunRecord
