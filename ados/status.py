@@ -356,6 +356,7 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
                     "run_status": str(raw.get("status", "")),
                     "run_spec": str(raw.get("specNumber", "")),
                     "run_record": str(candidate),
+                    "resumable": str(raw.get("status", "") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}),
                 }
     return {}
 

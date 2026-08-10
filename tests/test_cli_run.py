@@ -9,6 +9,7 @@ import unittest
 
 from ados.cli import main
 from ados.run_command import RunRequest, RunService
+from ados.project_config import load_project_config
 from ados.status import StatusRequest, StatusService
 
 
@@ -258,6 +259,100 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", second.status)
         self.assertIn("WORKTREE_PATH_EXISTS", self.codes(second))
 
+    def test_ready_for_implementation_resumes_existing_run(self):
+        with self.project() as fixture:
+            record_path, record = self.create_durable_run(fixture, "Resume me", 8, "READY_FOR_IMPLEMENTATION")
+            result = RunService().run(RunRequest(fixture.repo, "Resume me", 8, fixture.config))
+            updated = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual(record["runId"], result.run_record.run_id)
+        self.assertEqual(record["featureWorktree"], result.run_record.feature_worktree)
+        self.assertEqual("READY_FOR_VALIDATION", updated["status"])
+
+    def test_auto_spec_retry_reuses_existing_resumable_spec(self):
+        with self.project(specs=[1]) as fixture:
+            record_path, record = self.create_durable_run(fixture, "Auto resume", None, "READY_FOR_IMPLEMENTATION")
+            result = RunService().run(RunRequest(fixture.repo, "Auto resume", None, fixture.config))
+            updated = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("002", result.plan.spec_number)
+        self.assertEqual(record["runId"], result.run_record.run_id)
+        self.assertEqual("READY_FOR_VALIDATION", updated["status"])
+
+    def test_failed_and_timed_out_runs_resume(self):
+        for status in ("IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"):
+            with self.project() as fixture:
+                _record_path, record = self.create_durable_run(fixture, "Retry me", 8, status)
+                result = RunService().run(RunRequest(fixture.repo, "Retry me", 8, fixture.config))
+
+            self.assertTrue(result.resumed)
+            self.assertEqual("READY_FOR_VALIDATION", result.status)
+            self.assertEqual(record["runId"], result.run_record.run_id)
+
+    def test_resume_identity_mismatch_blocks(self):
+        cases = {
+            "different_spec": ("specNumber", "009", "Different feature", 8),
+            "different_project": ("projectId", "other-project", "Resume me", 8),
+            "different_branch": ("featureBranch", "codex/008-other-branch", "Resume me", 8),
+            "different_worktree": ("featureWorktree", "C:/elsewhere", "Resume me", 8),
+        }
+        for _name, (field, value, feature, spec) in cases.items():
+            with self.project() as fixture:
+                record_path, record = self.create_durable_run(fixture, "Resume me", 8, "READY_FOR_IMPLEMENTATION")
+                record[field] = value
+                record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+                result = RunService().run(RunRequest(fixture.repo, feature, spec, fixture.config, dry_run=True))
+
+            self.assertEqual("BLOCKED", result.status)
+            self.assertFalse(result.resumed)
+
+    def test_duplicate_unrelated_run_blocks(self):
+        with self.project() as fixture:
+            self.create_durable_run(fixture, "First active", 8, "READY_FOR_IMPLEMENTATION")
+            self.create_durable_run(fixture, "Second active", 9, "READY_FOR_IMPLEMENTATION")
+            result = RunService().run(RunRequest(fixture.repo, "First active", 8, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
+
+    def test_resume_invokes_implementer_once_and_completion_does_not_rerun(self):
+        with self.project(implementer_mode="count") as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            self.create_durable_run(fixture, "Counted resume", 8, "READY_FOR_IMPLEMENTATION")
+            first = RunService().run(RunRequest(fixture.repo, "Counted resume", 8, fixture.config))
+            second = RunService().run(RunRequest(fixture.repo, "Counted resume", 8, fixture.config))
+            count = counter.read_text(encoding="utf-8")
+
+        self.assertTrue(first.resumed)
+        self.assertEqual("READY_FOR_VALIDATION", first.status)
+        self.assertEqual("BLOCKED", second.status)
+        self.assertEqual("1", count)
+
+    def test_aiverse_production_ready_run_shape_resumes(self):
+        with self.project(project_id="AIverse", allowed_paths=[".claude"]) as fixture:
+            record_path, _record = self.create_durable_run(
+                fixture,
+                "Post-Validation Re-Review Decision & Continuation Foundation",
+                84,
+                "READY_FOR_IMPLEMENTATION",
+            )
+            result = RunService().run(
+                RunRequest(
+                    fixture.repo,
+                    "Post-Validation Re-Review Decision & Continuation Foundation",
+                    84,
+                    fixture.config,
+                )
+            )
+            updated = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual("084", updated["specNumber"])
+
     def test_project_neutral_and_ados_self_hosting_shape(self):
         with self.project(project_id="other") as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Self hosting shape", None, fixture.config, dry_run=True))
@@ -331,6 +426,13 @@ class CliRunTests(unittest.TestCase):
                 ),
                 "failure": "import sys\nprint('failed', file=sys.stderr)\nsys.exit(9)\n",
                 "timeout": "import time\ntime.sleep(5)\n",
+                "count": (
+                    "from pathlib import Path\n"
+                    f"counter = Path(r'{path.parent / 'implementer-count.txt'}')\n"
+                    "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                    "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                    "Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
+                ),
             }
             runner.write_text(scripts[implementer_mode], encoding="utf-8")
             implementer = f'"{sys.executable}" "{runner}"'
@@ -389,6 +491,21 @@ class CliRunTests(unittest.TestCase):
             "status": self.git(repo, "status", "--short").stdout,
             "worktrees": self.git(repo, "worktree", "list", "--porcelain").stdout,
         }
+
+    def create_durable_run(self, fixture, feature, spec, status):
+        service = RunService()
+        config = load_project_config(fixture.config)
+        plan = service._plan(fixture.repo, config, RunRequest(fixture.repo, feature, spec, fixture.config, dry_run=True))
+        record_model = service._record(config, RunRequest(fixture.repo, feature, spec, fixture.config, dry_run=True), plan)
+        worktree = Path(record_model.feature_worktree)
+        self.git(fixture.repo, "worktree", "add", "-b", record_model.feature_branch, str(worktree), record_model.authoritative_base_sha)
+        record = record_model.to_dict()
+        record["status"] = status
+        record["nextStage"] = "implementation_handoff" if status == "READY_FOR_IMPLEMENTATION" else "implementation_recovery"
+        record_path = worktree / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-run.json"
+        record_path.parent.mkdir(parents=True)
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        return record_path, record
 
 
 class TemporaryProject:
