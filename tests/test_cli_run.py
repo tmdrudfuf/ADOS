@@ -271,6 +271,17 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(record["featureWorktree"], result.run_record.feature_worktree)
         self.assertEqual("READY_FOR_VALIDATION", updated["status"])
 
+    def test_auto_spec_retry_reuses_existing_resumable_spec(self):
+        with self.project(specs=[1]) as fixture:
+            record_path, record = self.create_durable_run(fixture, "Auto resume", None, "READY_FOR_IMPLEMENTATION")
+            result = RunService().run(RunRequest(fixture.repo, "Auto resume", None, fixture.config))
+            updated = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("002", result.plan.spec_number)
+        self.assertEqual(record["runId"], result.run_record.run_id)
+        self.assertEqual("READY_FOR_VALIDATION", updated["status"])
+
     def test_failed_and_timed_out_runs_resume(self):
         for status in ("IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"):
             with self.project() as fixture:

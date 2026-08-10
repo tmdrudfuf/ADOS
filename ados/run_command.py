@@ -214,11 +214,42 @@ class RunService:
             raise _RunPlanError("DEFAULT_BRANCH_NOT_SYNCED", "local default branch does not match origin", {"local_head": head, "origin_head": upstream})
 
         slug = _slug(request.feature_description)
-        spec_number = request.spec_number if request.spec_number is not None else _next_unused_spec(project_path, self.git)
+        spec_number = request.spec_number
+        if spec_number is None:
+            spec_number = self._existing_resumable_spec(project_path, config, slug, head)
+        if spec_number is None:
+            spec_number = _next_unused_spec(project_path, self.git)
         spec = f"{spec_number:03d}"
         branch_name = f"codex/{spec}-{slug}"
         worktree_path = project_path.parent / f"{project_path.name}-{slug}"
         return RunPlan(str(project_path), spec, slug, branch_name, str(worktree_path), head)
+
+    def _existing_resumable_spec(self, project_path: Path, config: ProjectConfig, slug: str, base_head: str) -> int | None:
+        matches: set[int] = set()
+        for worktree in self.worktrees.list_worktrees(project_path):
+            runs = worktree.path / ".agent-workflow" / "runs"
+            if not runs.is_dir():
+                continue
+            for record_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
+                raw = _read_mapping(record_path)
+                if raw is None:
+                    continue
+                try:
+                    record = _record_from_mapping(raw)
+                except (KeyError, TypeError):
+                    continue
+                if (
+                    record.status in RESUMABLE_RUN_STATUSES
+                    and record.project_id == config.project_id
+                    and Path(record.primary_repository).resolve() == project_path
+                    and record.feature_slug == slug
+                    and record.authoritative_base_sha == base_head
+                    and record.execution_policy_version == config.execution_policy.schema_version
+                ):
+                    matches.add(int(record.spec_number))
+        if len(matches) > 1:
+            raise _RunPlanError("AMBIGUOUS_RESUMABLE_RUN", "multiple resumable runs match this feature", {"feature_slug": slug})
+        return next(iter(matches)) if matches else None
 
     def _eligibility(self, project_path: Path, config: ProjectConfig, config_path: Path, plan: RunPlan, resume: "_ResumeCandidate | None" = None) -> RunEligibility:
         violations: list[RunViolation] = []
