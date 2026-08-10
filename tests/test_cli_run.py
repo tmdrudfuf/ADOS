@@ -95,7 +95,8 @@ class CliRunTests(unittest.TestCase):
             result = RunService().run(RunRequest(fixture.repo, "Fresh start", 5, fixture.config, dry_run=True))
             self.git(fixture.repo, "worktree", "remove", str(worktree))
 
-        self.assertEqual("PLANNED", result.status)
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
     def test_status_human_intervention_blocks_before_mutation(self):
         with self.project() as fixture:
@@ -112,6 +113,52 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
         self.assertEqual(before, after)
+
+    def test_multiple_historical_merged_worktrees_do_not_block_new_run(self):
+        with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
+            first = fixture.root / "old-001"
+            second = fixture.root / "old-002"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-old", str(first), "HEAD")
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/002-old", str(second), "HEAD")
+            before = self.snapshot(fixture.repo)
+            result = RunService().run(RunRequest(fixture.repo, "New production fix", 4, fixture.config, dry_run=True))
+            after = self.snapshot(fixture.repo)
+            self.git(fixture.repo, "worktree", "remove", str(first))
+            self.git(fixture.repo, "worktree", "remove", str(second))
+
+        self.assertEqual("PLANNED", result.status)
+        self.assertEqual(before, after)
+        self.assertTrue(any(warning.code == "HISTORICAL_WORKTREES_PRESENT" for warning in result.eligibility.warnings))
+
+    def test_unknown_dirty_historical_worktree_blocks_run_start(self):
+        with self.project(specs=[1]) as fixture:
+            self.write_archive(fixture.repo, spec="001-example", merge_commit=self.head(fixture.repo))
+            worktree = fixture.root / "dirty-historical"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-old", str(worktree), "HEAD")
+            (worktree / "scratch.txt").write_text("unique\n", encoding="utf-8")
+            before = self.snapshot(fixture.repo)
+            result = RunService().run(RunRequest(fixture.repo, "Blocked by dirty old tree", 2, fixture.config, dry_run=True))
+            after = self.snapshot(fixture.repo)
+            (worktree / "scratch.txt").unlink()
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
+        self.assertEqual(before, after)
+
+    def test_preserved_worktree_blocks_run_start(self):
+        with self.project() as fixture:
+            worktree = fixture.root / "preserved"
+            self.git(fixture.repo, "worktree", "add", "-b", "experiment-preserve", str(worktree), "HEAD")
+            (worktree / "preserved.txt").write_text("preserve\n", encoding="utf-8")
+            self.git(worktree, "add", "preserved.txt")
+            self.git(worktree, "commit", "-m", "preserved branch work")
+            result = RunService().run(RunRequest(fixture.repo, "Blocked by preserved", 2, fixture.config, dry_run=True))
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("UNSAFE_RECOVERY_STATE", self.codes(result))
 
     def test_stale_historical_evidence_warns_not_blocks(self):
         with self.project() as fixture:
@@ -289,10 +336,21 @@ class CliRunTests(unittest.TestCase):
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
 
-    def write_archive(self, repo, *, validated_sha="", approved_review_sha="", decision="Approved"):
-        archive = repo / ".agent-workflow" / "runs" / "000-old" / "ados-review-evidence.json"
+    def write_archive(self, repo, *, spec="000-old", validated_sha="", approved_review_sha="", decision="Approved", merge_commit=""):
+        archive = repo / ".agent-workflow" / "runs" / spec / "ados-review-evidence.json"
         archive.parent.mkdir(parents=True, exist_ok=True)
-        archive.write_text(json.dumps({"validated_sha": validated_sha, "approved_review_sha": approved_review_sha, "claude_decision": decision}), encoding="utf-8")
+        archive.write_text(
+            json.dumps(
+                {
+                    "spec": spec,
+                    "validated_sha": validated_sha,
+                    "approved_review_sha": approved_review_sha,
+                    "claude_decision": decision,
+                    "merge_commit": merge_commit,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def read_run_record(self, worktree, run_dir):
         return json.loads((worktree / ".agent-workflow" / "runs" / run_dir / "ados-run.json").read_text(encoding="utf-8"))

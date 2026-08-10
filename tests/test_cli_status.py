@@ -86,6 +86,65 @@ class CliStatusTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertEqual("2", result.workflow.evidence["active_worktree_count"])
 
+    def test_multiple_historical_merged_worktrees_reported_without_blocking(self):
+        with self.project(specs=[1, 2, 3]) as fixture:
+            self.write_archive(fixture.repo, spec="003-example", merge_commit=self.head(fixture.repo))
+            first = fixture.root / "historical-001"
+            second = fixture.root / "historical-002"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-old", str(first), "HEAD")
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/002-old", str(second), "HEAD")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            self.git(fixture.repo, "worktree", "remove", str(first))
+            self.git(fixture.repo, "worktree", "remove", str(second))
+
+        self.assertEqual("IDLE", result.status)
+        self.assertEqual("0", result.workflow.evidence["active_worktree_count"])
+        self.assertEqual("2", result.workflow.evidence["historical_worktree_count"])
+        classifications = {worktree.branch: worktree.classification for worktree in result.worktrees}
+        self.assertEqual("MERGED_HISTORICAL", classifications["codex/001-old"])
+        self.assertEqual("MERGED_HISTORICAL", classifications["codex/002-old"])
+
+    def test_unknown_dirty_historical_worktree_blocks(self):
+        with self.project(specs=[1]) as fixture:
+            self.write_archive(fixture.repo, spec="001-example", merge_commit=self.head(fixture.repo))
+            worktree = fixture.root / "dirty-historical"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-old", str(worktree), "HEAD")
+            (worktree / "scratch.txt").write_text("unique\n", encoding="utf-8")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            (worktree / "scratch.txt").unlink()
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("UNKNOWN_WORKTREE_CLASSIFICATION", result.recovery.reason_codes)
+
+    def test_preserved_unmerged_non_spec_worktree_blocks(self):
+        with self.project() as fixture:
+            worktree = fixture.root / "preserved"
+            self.git(fixture.repo, "worktree", "add", "-b", "experiment-preserve", str(worktree), "HEAD")
+            (worktree / "preserved.txt").write_text("preserve\n", encoding="utf-8")
+            self.git(worktree, "add", "preserved.txt")
+            self.git(worktree, "commit", "-m", "preserved branch work")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("PRESERVED_WORKTREE_REQUIRES_HUMAN", result.recovery.reason_codes)
+
+    def test_active_durable_run_keeps_merged_branch_active(self):
+        with self.project(specs=[1]) as fixture:
+            self.write_archive(fixture.repo, spec="001-example", merge_commit=self.head(fixture.repo))
+            worktree = fixture.root / "active-run"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-active", str(worktree), "HEAD")
+            run = worktree / ".agent-workflow" / "runs" / "001-active" / "ados-run.json"
+            run.parent.mkdir(parents=True)
+            run.write_text(json.dumps({"runId": "run-1", "status": "READY_FOR_VALIDATION", "specNumber": "001"}), encoding="utf-8")
+            result = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            self.git(fixture.repo, "worktree", "remove", str(worktree))
+
+        self.assertEqual("ACTIVE", result.status)
+        active = next(worktree for worktree in result.worktrees if worktree.branch == "codex/001-active")
+        self.assertEqual("ACTIVE", active.classification)
+
     def test_latest_active_and_next_spec_resolution(self):
         with self.project(specs=[1, 2, 4]) as fixture:
             self.write_archive(fixture.repo, spec="002-cli-foundation", merge_commit=self.head(fixture.repo))

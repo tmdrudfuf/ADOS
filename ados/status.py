@@ -13,6 +13,7 @@ from .git_provider import GitRepositoryProvider
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
+from .worktree_classification import branch_spec_number, classify_worktree
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
 
 
@@ -39,7 +40,9 @@ class WorktreeStatus:
     head: str
     primary: bool
     state: str
+    classification: str = "UNKNOWN"
     reason_codes: tuple[str, ...] = ()
+    evidence: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -128,9 +131,11 @@ class StatusService:
 
         repository = self._repository(project_path)
         guardian = self._guardian(project_path, config)
-        worktrees = self._worktrees(project_path)
         evidence = _latest_archive_evidence(project_path)
         current_head = repository.evidence.get("head", "")
+        merged_archive = _merged_archive_evidence(project_path, current_head, self.git)
+        latest_merged_spec = _archive_spec_number(merged_archive)
+        worktrees = self._worktrees(project_path, current_head, latest_merged_spec)
         spec = _spec_status(project_path, worktrees, current_head, self.git)
         validation = _validation_status(evidence, current_head)
         review = _review_status(evidence, current_head)
@@ -181,16 +186,23 @@ class StatusService:
             evidence.update({f"{violation.code}.{key}": value for key, value in violation.evidence.items()})
         return StatusSection("BLOCKED", evidence, tuple(violation.code for violation in result.violations))
 
-    def _worktrees(self, project_path: Path) -> tuple[WorktreeStatus, ...]:
+    def _worktrees(self, project_path: Path, current_head: str, latest_merged_spec: int | None) -> tuple[WorktreeStatus, ...]:
         try:
             root = self.git.repository_root(project_path)
             records = self.worktree_provider.list_worktrees(project_path)
         except RepositoryProviderError as exc:
-            return (WorktreeStatus(str(project_path), "", "", True, "Unavailable", (exc.code,)),)
+            return (WorktreeStatus(str(project_path), "", "", True, "Unavailable", "UNKNOWN", (exc.code,), {"error": exc.message}),)
 
         statuses: list[WorktreeStatus] = []
         for record in records:
             state, reasons = self._worktree_state(record)
+            classification = classify_worktree(
+                record=record,
+                primary_root=root,
+                current_main_head=current_head,
+                latest_merged_spec=latest_merged_spec,
+                git=self.git,
+            )
             statuses.append(
                 WorktreeStatus(
                     path=str(record.path),
@@ -198,7 +210,9 @@ class StatusService:
                     head=record.head,
                     primary=record.path == root,
                     state=state,
-                    reason_codes=reasons,
+                    classification=classification.classification,
+                    reason_codes=tuple(dict.fromkeys((*reasons, *classification.reason_codes))),
+                    evidence=classification.evidence,
                 )
             )
         return tuple(statuses)
@@ -249,8 +263,15 @@ def _spec_status(
     active_numbers = sorted(
         number
         for worktree in worktrees
-        if not worktree.primary
-        for number in [_branch_spec_number(worktree.branch)]
+        if not worktree.primary and worktree.classification == "ACTIVE"
+        for number in [branch_spec_number(worktree.branch)]
+        if number is not None
+    )
+    historical_numbers = sorted(
+        number
+        for worktree in worktrees
+        if not worktree.primary and worktree.classification == "MERGED_HISTORICAL"
+        for number in [branch_spec_number(worktree.branch)]
         if number is not None
     )
     evidence = {
@@ -258,6 +279,7 @@ def _spec_status(
         "latest_merged_spec": "Unknown",
         "latest_merged_spec_basis": "Unavailable",
         "active_spec": ",".join(f"{number:03d}" for number in active_numbers) if active_numbers else "None",
+        "historical_spec": ",".join(f"{number:03d}" for number in historical_numbers) if historical_numbers else "None",
         "next_unused_spec": f"{next_unused:03d}",
     }
     archive = _merged_archive_evidence(project_path, current_head, git)
@@ -269,19 +291,42 @@ def _spec_status(
 
 
 def _workflow_status(worktrees: tuple[WorktreeStatus, ...], spec: StatusSection, publication: StatusSection, doctor_status: str) -> StatusSection:
-    active = [worktree for worktree in worktrees if not worktree.primary]
+    active = [worktree for worktree in worktrees if not worktree.primary and worktree.classification == "ACTIVE"]
+    historical = [worktree for worktree in worktrees if not worktree.primary and worktree.classification == "MERGED_HISTORICAL"]
+    preserved = [worktree for worktree in worktrees if not worktree.primary and worktree.classification == "PRESERVED"]
+    unknown = [worktree for worktree in worktrees if not worktree.primary and worktree.classification == "UNKNOWN"]
     run_evidence = _active_run_evidence(active)
+    base_evidence = {
+        "active_worktree_count": str(len(active)),
+        "historical_worktree_count": str(len(historical)),
+        "preserved_worktree_count": str(len(preserved)),
+        "unknown_worktree_count": str(len(unknown)),
+        "doctor_status": doctor_status,
+    }
+    if unknown:
+        evidence = dict(base_evidence)
+        evidence["unknown_worktrees"] = ",".join(worktree.path for worktree in unknown)
+        evidence.update(run_evidence)
+        return StatusSection("Blocked", evidence, ("UNKNOWN_WORKTREE_CLASSIFICATION",))
+    if preserved:
+        evidence = dict(base_evidence)
+        evidence["preserved_worktrees"] = ",".join(worktree.path for worktree in preserved)
+        evidence.update(run_evidence)
+        return StatusSection("Blocked", evidence, ("PRESERVED_WORKTREE_REQUIRES_HUMAN",))
     if len(active) > 1:
-        evidence = {"active_worktree_count": str(len(active)), "doctor_status": doctor_status}
+        evidence = dict(base_evidence)
         evidence.update(run_evidence)
         return StatusSection("Active", evidence, ("MULTIPLE_ACTIVE_WORKTREES",))
     if len(active) == 1:
-        evidence = {"active_worktree": active[0].path, "branch": active[0].branch, "doctor_status": doctor_status}
+        evidence = dict(base_evidence)
+        evidence.update({"active_worktree": active[0].path, "branch": active[0].branch})
         evidence.update(run_evidence)
         return StatusSection("Active", evidence)
     if publication.state == "Merged":
-        return StatusSection("Idle", {"latest_merged_spec": spec.evidence.get("latest_merged_spec", "Unknown"), "doctor_status": doctor_status})
-    return StatusSection("Idle", {"doctor_status": doctor_status})
+        evidence = dict(base_evidence)
+        evidence["latest_merged_spec"] = spec.evidence.get("latest_merged_spec", "Unknown")
+        return StatusSection("Idle", evidence)
+    return StatusSection("Idle", base_evidence)
 
 
 def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
@@ -372,7 +417,13 @@ def _recovery_status(
     reasons: list[str] = []
     for section in (guardian, validation, review, exact_head, workflow):
         reasons.extend(section.reason_codes)
-    if guardian.state == "BLOCKED" or "SHA_MISMATCH" in reasons or "MULTIPLE_ACTIVE_WORKTREES" in reasons:
+    blocking = {
+        "SHA_MISMATCH",
+        "MULTIPLE_ACTIVE_WORKTREES",
+        "UNKNOWN_WORKTREE_CLASSIFICATION",
+        "PRESERVED_WORKTREE_REQUIRES_HUMAN",
+    }
+    if guardian.state == "BLOCKED" or any(reason in blocking for reason in reasons):
         return StatusSection("HUMAN_INTERVENTION_REQUIRED", {}, tuple(reasons))
     return StatusSection("NotRequired", {}, tuple(reasons))
 
@@ -460,11 +511,6 @@ def _read_archive(candidate: Path) -> dict[str, Any] | None:
 
 def _spec_number(name: str) -> int | None:
     match = re.match(r"^(\d{3})-", name)
-    return int(match.group(1)) if match else None
-
-
-def _branch_spec_number(branch: str) -> int | None:
-    match = re.search(r"(?:^|/)(\d{3})-", branch)
     return int(match.group(1)) if match else None
 
 
