@@ -222,6 +222,24 @@ class RunService:
 
         status = self.status.run(StatusRequest(project_path=project_path, config_path=config_path))
         warnings.extend(_historical_warnings(status))
+        historical_count = status.workflow.evidence.get("historical_worktree_count", "0")
+        if historical_count not in {"", "0"}:
+            warnings.append(
+                _violation(
+                    "HISTORICAL_WORKTREES_PRESENT",
+                    "historical merged worktrees are present but do not block a new run",
+                    {"historical_worktree_count": historical_count},
+                )
+            )
+        active_count = status.workflow.evidence.get("active_worktree_count", "0")
+        if active_count not in {"", "0"}:
+            violations.append(
+                _violation(
+                    "ACTIVE_WORKTREE_PRESENT",
+                    "active feature worktree prevents starting a new run",
+                    {"active_worktree_count": active_count},
+                )
+            )
         blocking_recovery = _run_blocking_recovery_codes(status.recovery.state, status.recovery.reason_codes)
         if blocking_recovery:
             violations.append(
