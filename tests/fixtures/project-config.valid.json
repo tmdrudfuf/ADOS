@@ -7,6 +7,9 @@
       ".claude"
     ]
   },
+  "bootstrap": {
+    "commands": []
+  },
   "execution_policy": {
     "schema_version": "1",
     "publication": {
