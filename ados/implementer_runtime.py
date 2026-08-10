@@ -220,6 +220,8 @@ class ImplementerRuntime:
                 shell=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=command.timeout_ms / 1000,
             )
         except FileNotFoundError:
@@ -401,7 +403,9 @@ def _runtime_id(run_id: str, base: str) -> str:
     return hashlib.sha256(f"implementer:{run_id}:{base}".encode("utf-8")).hexdigest()[:24]
 
 
-def _bounded(value: str | bytes) -> str:
+def _bounded(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     return value[:20_000]

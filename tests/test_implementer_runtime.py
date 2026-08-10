@@ -4,8 +4,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from ados.implementer_runtime import ImplementerRuntime
+from ados.implementer_runtime import ImplementerCommand, ImplementerRuntime, _bounded
 from ados.project_config import load_project_config
 
 
@@ -108,6 +109,47 @@ class ImplementerRuntimeTests(unittest.TestCase):
         self.assertEqual(ok.status, ok.result.status)
         self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
         self.assertEqual("IMPLEMENTATION_TIMED_OUT", timed.status)
+
+    def test_utf8_stdout_unicode_stderr_and_invalid_bytes_are_captured(self):
+        with self.project() as utf8:
+            runner = self.runner(utf8.root / "unicode.py", "unicode_output")
+            config = self.write_config(utf8.config, utf8.repo, implementer=f'"{sys.executable}" "{runner}"')
+            ok = ImplementerRuntime().run(config=config, run_record_path=self.ready_run(utf8, config))
+        with self.project() as invalid:
+            runner = self.runner(invalid.root / "invalid.py", "invalid_bytes")
+            config = self.write_config(invalid.config, invalid.repo, implementer=f'"{sys.executable}" "{runner}"')
+            failed = ImplementerRuntime().run(config=config, run_record_path=self.ready_run(invalid, config))
+
+        self.assertEqual("READY_FOR_VALIDATION", ok.status)
+        self.assertIn("snowman", ok.result.stdout)
+        self.assertIn("\u2603", ok.result.stdout)
+        self.assertIn("rocket", ok.result.stderr)
+        self.assertIn("\U0001f680", ok.result.stderr)
+        self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
+        self.assertIn("\ufffd", failed.result.stdout)
+        self.assertIn("stderr-ok", failed.result.stderr)
+        self.assertEqual(9, failed.result.exit_code)
+
+    def test_bounded_evidence_handles_none_ascii_and_truncation(self):
+        self.assertEqual("", _bounded(None))
+        self.assertEqual("plain ascii", _bounded("plain ascii"))
+        self.assertEqual("abc", _bounded(b"abc"))
+        self.assertEqual("\ufffd", _bounded(b"\x9d"))
+        self.assertEqual(20_000, len(_bounded("x" * 20_001)))
+
+    def test_subprocess_capture_uses_utf8_replacement_and_no_shell(self):
+        with self.project() as fixture:
+            command = ImplementerCommand("fake", sys.executable, ("-c", "print('ok')"), str(fixture.worktree), 1000)
+            with mock.patch("ados.implementer_runtime.subprocess.run") as mocked:
+                mocked.return_value = subprocess.CompletedProcess((sys.executable, "-c", "print('ok')"), 0, "ok", "warn")
+                completed = ImplementerRuntime()._spawn(command, "handoff")
+
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(0, completed.returncode)
+        self.assertIs(kwargs["shell"], False)
+        self.assertEqual("utf-8", kwargs["encoding"])
+        self.assertEqual("replace", kwargs["errors"])
+        self.assertIs(kwargs["text"], True)
 
     def test_primary_dirty_after_invocation_blocks(self):
         with self.project() as fixture:
@@ -215,6 +257,8 @@ class ImplementerRuntimeTests(unittest.TestCase):
             "cwd": "import os\nprint(os.getcwd())\n",
             "success": "from pathlib import Path\nPath('implementation.txt').write_text('ok', encoding='utf-8')\nprint('done')\n",
             "stdout_stderr": "import sys\nprint('hello stdout')\nprint('hello stderr', file=sys.stderr)\n",
+            "unicode_output": "import sys\nsys.stdout.buffer.write('snowman \u2603\\n'.encode('utf-8'))\nsys.stderr.buffer.write('rocket \U0001f680\\n'.encode('utf-8'))\n",
+            "invalid_bytes": "import sys\nsys.stdout.buffer.write(b'bad-\\x9d-byte')\nsys.stderr.write('stderr-ok')\nsys.exit(9)\n",
             "failure": "import sys\nprint('bad', file=sys.stderr)\nsys.exit(7)\n",
             "timeout": "import time\ntime.sleep(5)\n",
         }
