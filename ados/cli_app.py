@@ -333,6 +333,12 @@ def _format_run_human(result: RunResult) -> str:
         for warning in result.eligibility.warnings:
             lines.append(f"{warning.code}: {warning.message}")
         lines.append("")
+    if result.pipeline_result:
+        lines.append("Pipeline:")
+        total = len(result.pipeline_result.stages)
+        for index, stage in enumerate(result.pipeline_result.stages, start=1):
+            lines.append(f"[{index}/{total}] {stage.id} .............. {stage.status}")
+        lines.append("")
     lines.append(result.status)
     return "\n".join(lines)
 
@@ -340,8 +346,8 @@ def _format_run_human(result: RunResult) -> str:
 def _run_exit_code(result: RunResult) -> int:
     if result.status == "INVALID":
         return 2
-    if result.status in {"BLOCKED", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+    if result.status in {"BLOCKED", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "BOOTSTRAP_FAILED", "VALIDATION_FAILED", "REVIEW_BLOCKED", "REVIEW_CHANGES_REQUESTED", "EXACT_HEAD_BLOCKED", "PUBLICATION_BLOCKED", "CLEANUP_INCOMPLETE", "CANDIDATE_BLOCKED"}:
         return 1
-    if result.status in {"PLANNED", "READY_FOR_IMPLEMENTATION", "READY_FOR_VALIDATION"}:
+    if result.status in {"PLANNED", "READY_FOR_IMPLEMENTATION", "READY_FOR_VALIDATION", "READY_FOR_PUBLICATION", "COMPLETE"}:
         return 0
     return 1

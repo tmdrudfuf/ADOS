@@ -15,12 +15,13 @@ from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, 
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider
 
 
-RESUMABLE_RUN_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}
+RESUMABLE_RUN_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", *PIPELINE_READY_STATUSES}
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ class RunResult:
     run_record: WorkflowRunRecord | None = None
     worktree_result: WorktreeLifecycleResult | None = None
     implementer_result: ImplementerRuntimeOutcome | None = None
+    pipeline_result: PipelineOutcome | None = None
     resumed: bool = False
 
     def to_dict(self) -> dict[str, object]:
@@ -124,6 +126,7 @@ class RunResult:
             "runRecord": self.run_record.to_dict() if self.run_record else None,
             "worktreeResult": self.worktree_result.to_dict() if self.worktree_result else None,
             "implementerResult": self.implementer_result.to_dict() if self.implementer_result else None,
+            "pipelineResult": self.pipeline_result.to_dict() if self.pipeline_result else None,
             "resumed": self.resumed,
         }
 
@@ -139,6 +142,7 @@ class RunService:
         worktrees: GitWorktreeProvider | None = None,
         lifecycle: WorktreeLifecycleEngine | None = None,
         implementer: ImplementerRuntime | None = None,
+        pipeline: RunPipeline | None = None,
     ) -> None:
         self.doctor = doctor or DoctorService()
         self.status = status or StatusService()
@@ -147,6 +151,7 @@ class RunService:
         self.worktrees = worktrees or GitWorktreeProvider()
         self.lifecycle = lifecycle or WorktreeLifecycleEngine()
         self.implementer = implementer or ImplementerRuntime()
+        self.pipeline = pipeline or RunPipeline(implementer=self.implementer, lifecycle=self.lifecycle)
 
     def run(self, request: RunRequest) -> RunResult:
         if not request.feature_description.strip():
@@ -175,9 +180,9 @@ class RunService:
             return RunResult("PLANNED", eligibility, plan, resume.record if resume else self._record(config, request, plan), resumed=resume is not None)
 
         if resume is not None:
-            implementer_result = self.implementer.run(config=config, run_record_path=resume.record_path, timeout_ms=request.implementer_timeout_ms)
-            updated_record = _record_from_mapping(implementer_result.run_record) if implementer_result.run_record else resume.record
-            return RunResult(implementer_result.status, eligibility, plan, updated_record, implementer_result=implementer_result, resumed=True)
+            pipeline_result = self.pipeline.run(config=config, run_record_path=resume.record_path, timeout_ms=request.implementer_timeout_ms)
+            updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
+            return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
 
         worktree_request = WorktreeRequest(
             primary_repository_path=project_path,
@@ -197,9 +202,9 @@ class RunService:
         record_path = self._record_path(Path(plan.feature_worktree), plan.spec_number, plan.feature_slug)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-        implementer_result = self.implementer.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
-        updated_record = _record_from_mapping(implementer_result.run_record) if implementer_result.run_record else record
-        return RunResult(implementer_result.status, eligibility, plan, updated_record, created, implementer_result)
+        pipeline_result = self.pipeline.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
+        updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
+        return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
 
     def _plan(self, project_path: Path, config: ProjectConfig, request: RunRequest) -> RunPlan:
         try:
@@ -226,10 +231,9 @@ class RunService:
 
     def _existing_resumable_spec(self, project_path: Path, config: ProjectConfig, slug: str, base_head: str) -> int | None:
         matches: set[int] = set()
-        for worktree in self.worktrees.list_worktrees(project_path):
-            runs = worktree.path / ".agent-workflow" / "runs"
-            if not runs.is_dir():
-                continue
+        run_dirs = [project_path / ".agent-workflow" / "runs"]
+        run_dirs.extend(worktree.path / ".agent-workflow" / "runs" for worktree in self.worktrees.list_worktrees(project_path))
+        for runs in run_dirs:
             for record_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
                 raw = _read_mapping(record_path)
                 if raw is None:
@@ -243,7 +247,7 @@ class RunService:
                     and record.project_id == config.project_id
                     and Path(record.primary_repository).resolve() == project_path
                     and record.feature_slug == slug
-                    and record.authoritative_base_sha == base_head
+                    and (record.authoritative_base_sha == base_head or record.status in {"MERGED", "CLEANUP_INCOMPLETE"})
                     and record.execution_policy_version == config.execution_policy.schema_version
                 ):
                     matches.add(int(record.spec_number))
@@ -325,26 +329,37 @@ class RunService:
 
     def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
+        primary_runs = project_path / ".agent-workflow" / "runs"
+        candidates.extend(self._resume_candidates_in_run_dir(config, plan, None, primary_runs))
         for record in self.worktrees.list_worktrees(project_path):
             runs = record.path / ".agent-workflow" / "runs"
-            if not runs.is_dir():
-                continue
-            for candidate_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
-                raw = _read_mapping(candidate_path)
-                if raw is None:
-                    continue
-                candidate = self._resume_candidate(config, plan, record, candidate_path, raw)
-                if candidate is not None:
-                    candidates.append(candidate)
+            candidates.extend(self._resume_candidates_in_run_dir(config, plan, record, runs))
+        deduped: dict[tuple[str, str], _ResumeCandidate] = {}
+        for candidate in candidates:
+            deduped.setdefault((candidate.record.run_id, str(Path(candidate.record.feature_worktree).resolve())), candidate)
+        candidates = list(deduped.values())
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def _resume_candidates_in_run_dir(self, config: ProjectConfig, plan: RunPlan, worktree_record: Any | None, runs: Path) -> list["_ResumeCandidate"]:
+        candidates: list[_ResumeCandidate] = []
+        if not runs.is_dir():
+            return candidates
+        for candidate_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
+            raw = _read_mapping(candidate_path)
+            if raw is None:
+                continue
+            candidate = self._resume_candidate(config, plan, worktree_record, candidate_path, raw)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
 
     def _resume_candidate(
         self,
         config: ProjectConfig,
         plan: RunPlan,
-        worktree_record: Any,
+        worktree_record: Any | None,
         record_path: Path,
         raw: dict[str, Any],
     ) -> "_ResumeCandidate | None":
@@ -355,20 +370,21 @@ class RunService:
         expected = self._record_from_plan(config, plan, record.feature_description)
         if record.status not in RESUMABLE_RUN_STATUSES:
             return None
+        cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE"}
         if (
-            record.run_id != expected.run_id
+            (record.run_id != expected.run_id and not cleanup_resume)
             or record.project_id != expected.project_id
             or Path(record.primary_repository).resolve() != Path(expected.primary_repository).resolve()
             or record.spec_number != expected.spec_number
             or record.feature_slug != expected.feature_slug
-            or record.authoritative_base_sha != expected.authoritative_base_sha
+            or (record.authoritative_base_sha != expected.authoritative_base_sha and not cleanup_resume)
             or record.feature_branch != expected.feature_branch
             or Path(record.feature_worktree).resolve() != Path(expected.feature_worktree).resolve()
             or record.execution_policy_version != expected.execution_policy_version
             or record.implementer != expected.implementer
             or record.reviewer != expected.reviewer
-            or worktree_record.branch != expected.feature_branch
-            or worktree_record.path != Path(expected.feature_worktree).resolve()
+            or (worktree_record is not None and worktree_record.branch != expected.feature_branch)
+            or (worktree_record is not None and worktree_record.path != Path(expected.feature_worktree).resolve())
         ):
             return None
         return _ResumeCandidate(record_path=record_path, record=record)

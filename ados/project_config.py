@@ -27,6 +27,7 @@ class ProjectConfig:
     default_branch: str
     allowed_primary_local_paths: tuple[str, ...]
     execution_policy: ExecutionPolicy
+    bootstrap_commands: tuple[str, ...] = ()
     implementer: str | None = None
     reviewer: str | None = None
 
@@ -48,7 +49,13 @@ class ProjectConfig:
             execution_policy = ExecutionPolicy.from_mapping(raw)
         except PolicyValidationError as exc:
             raise ProjectConfigError(exc.code, exc.message) from exc
-        return cls(project_id, primary_repository_path, default_branch, tuple(allowed_paths), execution_policy, implementer, reviewer)
+        bootstrap = raw.get("bootstrap", {})
+        if bootstrap is None:
+            bootstrap = {}
+        if not isinstance(bootstrap, Mapping):
+            raise ProjectConfigError("PROJECT_CONFIG_INVALID_BOOTSTRAP", "bootstrap must be an object")
+        bootstrap_commands = _optional_string_list(bootstrap, "commands", "PROJECT_CONFIG_INVALID_BOOTSTRAP_COMMANDS")
+        return cls(project_id, primary_repository_path, default_branch, tuple(allowed_paths), execution_policy, tuple(bootstrap_commands), implementer, reviewer)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -96,6 +103,17 @@ def _require_string_list(raw: Mapping[str, Any], key: str, code: str) -> tuple[s
     value = raw.get(key)
     if not isinstance(value, list):
         raise ProjectConfigError(code, f"{key} must be a list")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ProjectConfigError(code, f"{key} must contain only non-empty strings")
+    return tuple(value)
+
+
+def _optional_string_list(raw: Mapping[str, Any], key: str, code: str) -> tuple[str, ...]:
+    value = raw.get(key, [])
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ProjectConfigError(code, f"{key} must be a list when provided")
     if any(not isinstance(item, str) or not item.strip() for item in value):
         raise ProjectConfigError(code, f"{key} must contain only non-empty strings")
     return tuple(value)

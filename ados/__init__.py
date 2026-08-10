@@ -11,6 +11,7 @@ from .publication_engine import PublicationEngine, PublicationEvidence
 from .recovery_engine import RecoveryDecision, RecoveryEngine, RecoveryIssue
 from .review_engine import ReviewEngine, ReviewRequest
 from .run_command import RunRequest, RunResult, RunService, WorkflowRunRecord
+from .run_pipeline import PipelineOutcome, RunPipeline
 from .status import StatusRequest, StatusResult, StatusService
 from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
@@ -34,6 +35,8 @@ __all__ = [
     "RunRequest",
     "RunResult",
     "RunService",
+    "PipelineOutcome",
+    "RunPipeline",
     "StatusRequest",
     "StatusResult",
     "StatusService",

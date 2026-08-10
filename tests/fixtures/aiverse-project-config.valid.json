@@ -8,6 +8,11 @@
       ".serena"
     ]
   },
+  "bootstrap": {
+    "commands": [
+      "npm ci"
+    ]
+  },
   "execution_policy": {
     "schema_version": "1",
     "publication": {

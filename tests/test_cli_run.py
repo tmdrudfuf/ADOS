@@ -6,9 +6,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
+import ados.run_pipeline as run_pipeline
 from ados.cli import main
 from ados.run_command import RunRequest, RunService
+from ados.run_pipeline import PipelineViolation, PullRequestInfo, RunPipeline
 from ados.project_config import load_project_config
 from ados.status import StatusRequest, StatusService
 
@@ -26,16 +29,16 @@ class CliRunTests(unittest.TestCase):
             payload = self.read_run_record(fixture.root / "project-add-run-command", "003-add-run-command")
 
         self.assertEqual(0, code)
-        self.assertIn("READY_FOR_VALIDATION", stdout)
+        self.assertIn("READY_FOR_PUBLICATION", stdout)
         self.assertEqual("003", payload["specNumber"])
-        self.assertEqual("READY_FOR_VALIDATION", payload["status"])
+        self.assertEqual("READY_FOR_PUBLICATION", payload["status"])
         self.assertEqual("codex/003-add-run-command", payload["featureBranch"])
 
     def test_explicit_spec(self):
         with self.project(specs=[1]) as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Build status handoff", 7, fixture.config))
 
-        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual("READY_FOR_PUBLICATION", result.status)
         self.assertEqual("007", result.plan.spec_number)
 
     def test_automatic_next_spec(self):
@@ -200,7 +203,7 @@ class CliRunTests(unittest.TestCase):
         with self.project() as fixture:
             result = RunService().run(RunRequest(fixture.repo, "Ordering proof", None, fixture.config))
             record = next(Path(result.run_record.feature_worktree, ".agent-workflow", "runs").glob("*/ados-run.json"))
-            self.assertEqual("READY_FOR_VALIDATION", result.status)
+            self.assertEqual("READY_FOR_PUBLICATION", result.status)
             self.assertTrue(record.is_file())
             self.assertTrue(Path(result.run_record.feature_worktree, ".git").exists())
 
@@ -221,7 +224,7 @@ class CliRunTests(unittest.TestCase):
             result = RunService().run(RunRequest(fixture.repo, "Status sees run", None, fixture.config))
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
 
-        self.assertEqual("READY_FOR_VALIDATION", result.run_record.status)
+        self.assertEqual("READY_FOR_PUBLICATION", result.run_record.status)
         self.assertEqual(result.run_record.run_id, status.workflow.evidence["run_id"])
 
     def test_dry_run_has_zero_mutations(self):
@@ -247,7 +250,7 @@ class CliRunTests(unittest.TestCase):
             result = RunService().run(RunRequest(fixture.repo, "No later stages", None, fixture.config))
             output = self.git(fixture.repo, "log", "--oneline").stdout
 
-        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual("READY_FOR_PUBLICATION", result.status)
         self.assertNotIn("validation", output.lower())
 
     def test_repeated_invocation_detects_existing_run(self):
@@ -255,9 +258,9 @@ class CliRunTests(unittest.TestCase):
             first = RunService().run(RunRequest(fixture.repo, "Repeatable", None, fixture.config))
             second = RunService().run(RunRequest(fixture.repo, "Repeatable", None, fixture.config))
 
-        self.assertEqual("READY_FOR_VALIDATION", first.status)
-        self.assertEqual("BLOCKED", second.status)
-        self.assertIn("WORKTREE_PATH_EXISTS", self.codes(second))
+        self.assertEqual("READY_FOR_PUBLICATION", first.status)
+        self.assertEqual("READY_FOR_PUBLICATION", second.status)
+        self.assertTrue(second.resumed)
 
     def test_ready_for_implementation_resumes_existing_run(self):
         with self.project() as fixture:
@@ -266,10 +269,10 @@ class CliRunTests(unittest.TestCase):
             updated = json.loads(record_path.read_text(encoding="utf-8"))
 
         self.assertTrue(result.resumed)
-        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual("READY_FOR_PUBLICATION", result.status)
         self.assertEqual(record["runId"], result.run_record.run_id)
         self.assertEqual(record["featureWorktree"], result.run_record.feature_worktree)
-        self.assertEqual("READY_FOR_VALIDATION", updated["status"])
+        self.assertEqual("READY_FOR_PUBLICATION", updated["status"])
 
     def test_auto_spec_retry_reuses_existing_resumable_spec(self):
         with self.project(specs=[1]) as fixture:
@@ -280,7 +283,7 @@ class CliRunTests(unittest.TestCase):
         self.assertTrue(result.resumed)
         self.assertEqual("002", result.plan.spec_number)
         self.assertEqual(record["runId"], result.run_record.run_id)
-        self.assertEqual("READY_FOR_VALIDATION", updated["status"])
+        self.assertEqual("READY_FOR_PUBLICATION", updated["status"])
 
     def test_failed_and_timed_out_runs_resume(self):
         for status in ("IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"):
@@ -289,7 +292,7 @@ class CliRunTests(unittest.TestCase):
                 result = RunService().run(RunRequest(fixture.repo, "Retry me", 8, fixture.config))
 
             self.assertTrue(result.resumed)
-            self.assertEqual("READY_FOR_VALIDATION", result.status)
+            self.assertEqual("READY_FOR_PUBLICATION", result.status)
             self.assertEqual(record["runId"], result.run_record.run_id)
 
     def test_resume_identity_mismatch_blocks(self):
@@ -327,8 +330,8 @@ class CliRunTests(unittest.TestCase):
             count = counter.read_text(encoding="utf-8")
 
         self.assertTrue(first.resumed)
-        self.assertEqual("READY_FOR_VALIDATION", first.status)
-        self.assertEqual("BLOCKED", second.status)
+        self.assertEqual("READY_FOR_PUBLICATION", first.status)
+        self.assertEqual("READY_FOR_PUBLICATION", second.status)
         self.assertEqual("1", count)
 
     def test_aiverse_production_ready_run_shape_resumes(self):
@@ -350,7 +353,7 @@ class CliRunTests(unittest.TestCase):
             updated = json.loads(record_path.read_text(encoding="utf-8"))
 
         self.assertTrue(result.resumed)
-        self.assertEqual("READY_FOR_VALIDATION", result.status)
+        self.assertEqual("READY_FOR_PUBLICATION", result.status)
         self.assertEqual("084", updated["specNumber"])
 
     def test_project_neutral_and_ados_self_hosting_shape(self):
@@ -392,6 +395,183 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("IMPLEMENTATION_TIMED_OUT", json.loads(stdout)["status"])
 
+    def test_end_to_end_pipeline_publishes_merges_and_cleans_up_with_provider(self):
+        with self.project() as fixture:
+            publisher = FakePublisher(fixture.repo)
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Ship pipeline", None, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("MERGED", result.pipeline_result.merge.status)
+        self.assertFalse(Path(result.plan.feature_worktree).exists())
+        self.assertEqual("IDLE", status.status)
+        self.assertEqual("001", status.spec.evidence["latest_merged_spec"])
+        self.assertEqual(["push", "create_pr", "ready", "merge", "delete_remote"], publisher.calls)
+
+    def test_bootstrap_runs_before_validation(self):
+        with self.project() as fixture:
+            marker = fixture.root / "bootstrap-marker.txt"
+            bootstrap = fixture.root / "bootstrap.py"
+            bootstrap.write_text(f"from pathlib import Path\nPath(r'{marker}').write_text('bootstrapped', encoding='utf-8')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, bootstrap_commands=[f'"{sys.executable}" "{bootstrap}"'])
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Bootstrap order", None, fixture.config))
+            marker_exists = marker.exists()
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertTrue(marker_exists)
+        self.assertEqual("PASS", result.pipeline_result.stages[0].status)
+
+    def test_bootstrap_failure_blocks_before_validation(self):
+        with self.project() as fixture:
+            failing = fixture.root / "bootstrap-fail.py"
+            failing.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, bootstrap_commands=[f'"{sys.executable}" "{failing}"'])
+            result = RunService().run(RunRequest(fixture.repo, "Bootstrap fails", None, fixture.config))
+
+        self.assertEqual("BOOTSTRAP_FAILED", result.status)
+        self.assertIsNone(result.pipeline_result.validation)
+
+    def test_validation_failure_does_not_review(self):
+        with self.project() as fixture:
+            config = json.loads(fixture.config.read_text(encoding="utf-8"))
+            config["execution_policy"]["validation"]["commands"] = ["python -c \"import sys; sys.exit(4)\""]
+            fixture.config.write_text(json.dumps(config), encoding="utf-8")
+            result = RunService().run(RunRequest(fixture.repo, "Validation fails", None, fixture.config))
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIsNone(result.pipeline_result.review)
+
+    def test_review_changes_requested_enters_bounded_fix_loop(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            counter = fixture.root / "review-count.txt"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Changes Requested' if value == 0 else 'Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Fix loop", None, fixture.config))
+            review_count = counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("2", review_count)
+        self.assertIn("implementer_fix", [stage.id for stage in result.pipeline_result.stages])
+
+    def test_publication_gate_remote_sha_drift_blocks(self):
+        with self.project() as fixture:
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True))).run(RunRequest(fixture.repo, "Drift blocks", None, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertIn("SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_remote_branch_delete_failure_does_not_report_complete(self):
+        with self.project() as fixture:
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_delete_failure=True))).run(RunRequest(fixture.repo, "Cleanup fails", None, fixture.config))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", result.status)
+        self.assertIn("REMOTE_BRANCH_DELETE_FAILED", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual("1", result.pipeline_result.run_record["pullRequest"])
+        self.assertTrue(result.pipeline_result.run_record["mergeCommitSha"])
+
+    def test_cleanup_incomplete_resumes_after_main_moves(self):
+        with self.project() as fixture:
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_delete_failure=True))).run(RunRequest(fixture.repo, "Retry cleanup", None, fixture.config))
+            worktree_path = Path(first.plan.feature_worktree)
+            second_publisher = FakePublisher(fixture.repo)
+            second = RunService(pipeline=RunPipeline(publisher=second_publisher)).run(RunRequest(fixture.repo, "Retry cleanup", None, fixture.config))
+            primary_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-retry-cleanup" / "ados-run.json").read_text(encoding="utf-8"))
+            worktree_exists_after_resume = worktree_path.exists()
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("COMPLETE", primary_record["status"])
+        self.assertEqual("1", primary_record["pullRequest"])
+        self.assertTrue(primary_record["mergeCommitSha"])
+        self.assertFalse(worktree_exists_after_resume)
+        self.assertIn("delete_remote", second_publisher.calls)
+
+    def test_dry_run_still_has_zero_mutations_with_pipeline_available(self):
+        with self.project() as fixture:
+            before = self.snapshot(fixture.repo)
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Plan only full", None, fixture.config, dry_run=True))
+            after = self.snapshot(fixture.repo)
+
+        self.assertEqual("PLANNED", result.status)
+        self.assertIsNone(result.pipeline_result)
+        self.assertEqual(before, after)
+
+    def test_ready_for_publication_resume_does_not_rerun_review(self):
+        with self.project() as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            counter = fixture.root / "review-count.txt"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, reviewer=f'"{sys.executable}" "{reviewer}"')
+            first = RunService().run(RunRequest(fixture.repo, "No duplicate review", None, fixture.config))
+            second = RunService().run(RunRequest(fixture.repo, "No duplicate review", None, fixture.config))
+            review_count = counter.read_text(encoding="utf-8")
+
+        self.assertEqual("READY_FOR_PUBLICATION", first.status)
+        self.assertEqual("READY_FOR_PUBLICATION", second.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("1", review_count)
+
+    def test_cleanup_resume_retries_primary_update_before_complete(self):
+        with self.project() as fixture:
+            blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
+            with mock.patch("ados.run_pipeline._update_primary_main", side_effect=[(blocker,), ()]):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry primary update", None, fixture.config))
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry primary update", None, fixture.config))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+
+    def test_cleanup_resume_remote_delete_failure_returns_canonical_record(self):
+        with self.project() as fixture:
+            blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
+            with mock.patch("ados.run_pipeline._update_primary_main", return_value=(blocker,)):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Canonical cleanup", None, fixture.config))
+            with mock.patch("ados.run_pipeline._update_primary_main", return_value=()):
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_delete_failure=True))).run(RunRequest(fixture.repo, "Canonical cleanup", None, fixture.config))
+            primary_record_path = fixture.repo / ".agent-workflow" / "runs" / "001-canonical-cleanup" / "ados-run.json"
+            primary_record = json.loads(primary_record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("CLEANUP_INCOMPLETE", second.status)
+        self.assertEqual(primary_record, second.pipeline_result.run_record)
+
+    def test_local_branch_delete_failure_does_not_recreate_removed_worktree(self):
+        with self.project() as fixture:
+            original_run = run_pipeline._run
+
+            def fail_branch_delete(args, cwd):
+                if args[:3] == ("git", "branch", "-d"):
+                    return subprocess.CompletedProcess(args, 1, "", "branch delete failed")
+                return original_run(args, cwd)
+
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_branch_delete):
+                result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Squash cleanup", None, fixture.config))
+            primary_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-squash-cleanup" / "ados-run.json").read_text(encoding="utf-8"))
+            worktree_exists_after_failure = Path(result.plan.feature_worktree).exists()
+
+        self.assertEqual("CLEANUP_INCOMPLETE", result.status)
+        self.assertEqual("CLEANUP_INCOMPLETE", primary_record["status"])
+        self.assertFalse(worktree_exists_after_failure)
+        self.assertIn("LOCAL_BRANCH_DELETE_FAILED", {violation.code for violation in result.pipeline_result.violations})
+
     def run_cli(self, *args):
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
@@ -413,7 +593,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success"):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -436,6 +616,10 @@ class CliRunTests(unittest.TestCase):
             }
             runner.write_text(scripts[implementer_mode], encoding="utf-8")
             implementer = f'"{sys.executable}" "{runner}"'
+        if reviewer is None:
+            reviewer_runner = path.parent / "reviewer.py"
+            reviewer_runner.write_text("print('Approved')\n", encoding="utf-8")
+            reviewer = f'"{sys.executable}" "{reviewer_runner}"'
         config = {
             "project": {
                 "id": project_id,
@@ -443,11 +627,12 @@ class CliRunTests(unittest.TestCase):
                 "default_branch": "main",
                 "allowed_primary_local_paths": list(allowed_paths),
             },
-            "roles": {"implementer": implementer, "reviewer": "claude"},
+            "roles": {"implementer": implementer, "reviewer": reviewer},
+            "bootstrap": {"commands": list(bootstrap_commands or [])},
             "execution_policy": {
                 "schema_version": "1",
                 "publication": {"merge_strategy": "merge"},
-                "review": {"reviewer": "claude", "max_rounds": 5},
+                "review": {"reviewer": reviewer, "max_rounds": 5},
                 "cleanup": {"autonomous": True},
                 "guardian": {"stop_on_uncertain": True},
                 "validation": {"commands": ["git diff --check"]},
@@ -532,3 +717,50 @@ class TemporaryProject:
 
     def __exit__(self, exc_type, exc, traceback):
         self.temp.cleanup()
+
+
+class FakePublisher:
+    def __init__(self, primary, *, remote_drift=False, remote_delete_failure=False):
+        self.primary = Path(primary)
+        self.remote_drift = remote_drift
+        self.remote_delete_failure = remote_delete_failure
+        self.calls = []
+        self.pr = None
+
+    def push(self, repo, branch):
+        self.calls.append("push")
+        return None
+
+    def remote_head(self, repo, branch):
+        if self.remote_drift:
+            return "0" * 40
+        return subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+    def create_or_get_draft_pr(self, repo, *, base, head, title, body):
+        self.calls.append("create_pr")
+        head_sha = self.remote_head(repo, head)
+        self.pr = PullRequestInfo("1", "https://example.invalid/pr/1", base, head, head_sha, True, True)
+        return self.pr
+
+    def mark_ready(self, repo, number):
+        self.calls.append("ready")
+        if self.pr is not None:
+            self.pr = PullRequestInfo(self.pr.number, self.pr.url, self.pr.base_branch, self.pr.head_branch, self.pr.head_sha, self.pr.mergeable, False)
+        return None
+
+    def merge(self, repo, number, strategy, subject):
+        self.calls.append("merge")
+        subprocess.run(("git", "merge", "--no-ff", str(self.pr.head_branch), "-m", subject), cwd=self.primary, check=True, capture_output=True, text=True)
+        merge_sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.primary, check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run(("git", "update-ref", "refs/remotes/origin/main", merge_sha), cwd=self.primary, check=True, capture_output=True, text=True)
+        from ados.run_pipeline import MergeResult
+
+        return MergeResult("MERGED", merge_sha)
+
+    def delete_remote_branch(self, repo, branch):
+        self.calls.append("delete_remote")
+        if self.remote_delete_failure:
+            from ados.run_pipeline import PipelineViolation
+
+            return PipelineViolation("REMOTE_BRANCH_DELETE_FAILED", "remote branch deletion failed", {"branch": branch})
+        return None
