@@ -354,14 +354,17 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(raw, dict) and raw.get("status"):
+                review_block = _review_block_evidence(raw, candidate)
                 resumable = _active_run_resumable(candidate, str(raw.get("status", "")))
-                return {
+                evidence = {
                     "run_id": str(raw.get("runId", "")),
                     "run_status": str(raw.get("status", "")),
                     "run_spec": str(raw.get("specNumber", "")),
                     "run_record": str(candidate),
                     "resumable": str(resumable),
                 }
+                evidence.update(review_block)
+                return evidence
     return {}
 
 
@@ -391,6 +394,30 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
         _read_json_object(record_path.with_name("validation-runtime.json")),
         _read_json_object(record_path.with_name("review-runtime.json")),
     )
+
+
+def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[str, str]:
+    if str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return {}
+    current_resumable = _active_run_resumable(record_path, "REVIEW_BLOCKED")
+    block = record.get("reviewBlock")
+    if isinstance(block, dict):
+        reason = str(block.get("reasonCode", ""))
+        return {
+            "review_block_reason": reason,
+            "review_block_transient": str(current_resumable),
+            "resume_stage": "review" if current_resumable else "",
+        }
+    review = _read_json_object(record_path.with_name("review-runtime.json"))
+    if not isinstance(review, dict):
+        return {}
+    violations = review.get("violations", [])
+    codes = ",".join(str(item.get("code", "")) for item in violations if isinstance(item, dict))
+    return {
+        "review_block_reason": codes or "Unknown",
+        "review_block_transient": str(current_resumable),
+        "resume_stage": "review" if current_resumable else "",
+    }
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:

@@ -337,13 +337,13 @@ class RunPipeline:
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
             stages.append(_stage("review", review_result.decision, {"reviewed_sha": review_result.reviewed_sha, "round": str(round_number)}))
             if review_result.status != "PASS":
-                _write_status(run_record_path, record, "REVIEW_BLOCKED")
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=tuple(_from_review(item) for item in review_result.violations))
             if review_result.decision == "Approved":
                 _write_status(run_record_path, record, "REVIEW_APPROVED")
                 break
             if review_result.decision != "Changes Requested":
-                _write_status(run_record_path, record, "REVIEW_BLOCKED")
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
             if round_number == max_rounds:
                 _write_status(run_record_path, record, "REVIEW_CHANGES_REQUESTED")
@@ -607,13 +607,13 @@ class RunPipeline:
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
         stages.append(_stage("review", review.decision, {"reviewed_sha": review.reviewed_sha, "resumed": "true"}))
         if review.status != "PASS":
-            _write_status(run_record_path, record, "REVIEW_BLOCKED")
+            _write_review_block_status(run_record_path, record, review, candidate, validation)
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=tuple(_from_review(item) for item in review.violations))
         if review.decision == "Changes Requested":
             _write_status(run_record_path, record, "READY_FOR_IMPLEMENTATION")
             return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
         if review.decision != "Approved":
-            _write_status(run_record_path, record, "REVIEW_BLOCKED")
+            _write_review_block_status(run_record_path, record, review, candidate, validation)
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
         _write_status(run_record_path, record, "REVIEW_APPROVED")
         exact = self.exact_head.verify(repository_path=worktree, approved_review_sha=review.reviewed_sha, validated_sha=validation.head_after)
@@ -636,6 +636,30 @@ def _write_status(path: Path, record: dict[str, Any], status: str) -> None:
     updated = dict(record)
     updated["status"] = status
     updated["nextStage"] = _next_stage(status)
+    _write_json(path, updated)
+
+
+def _write_review_block_status(path: Path, record: dict[str, Any], review: ReviewResult, candidate: CandidatePreparationResult, validation: ValidationResult) -> None:
+    transient = _is_transient_review_block(review)
+    reason_code = _review_block_reason_code(review)
+    updated = dict(record)
+    updated["status"] = "REVIEW_BLOCKED"
+    updated["nextStage"] = "review" if transient else "recovery"
+    updated["reviewBlock"] = {
+        "status": review.status,
+        "decision": review.decision,
+        "reasonCode": reason_code,
+        "reasonCodes": [violation.code for violation in review.violations],
+        "transient": transient,
+        "resumeStage": "review" if transient else "",
+        "reviewer": str(record.get("reviewer", "")),
+        "candidateSha": candidate.candidate_sha,
+        "validatedSha": validation.head_after,
+        "baseSha": str(record.get("authoritativeBaseSha", "")),
+        "reviewedSha": review.reviewed_sha,
+        "exitCode": review.exit_code,
+        "timedOut": reason_code == "REVIEWER_TIMED_OUT",
+    }
     _write_json(path, updated)
 
 
@@ -804,12 +828,26 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
                 {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
             ),
         )
-    codes = tuple(violation.code for violation in review_result.violations)
-    if not codes:
+    if not _is_transient_review_block(review_result):
         return (_violation("REVIEW_RESUME_TRANSIENT_FAILURE_UNPROVEN", "review blocker does not prove transient reviewer failure", {}),)
-    if codes and not all(code in TRANSIENT_REVIEW_FAILURE_CODES for code in codes):
-        return (_violation("REVIEW_RESUME_NON_TRANSIENT_BLOCKER", "review blocker is not a transient reviewer execution failure", {"reason_codes": ",".join(codes)}),)
     return ()
+
+
+def _is_transient_review_block(review: ReviewResult) -> bool:
+    codes = tuple(violation.code for violation in review.violations)
+    if not codes:
+        return False
+    if all(code in TRANSIENT_REVIEW_FAILURE_CODES for code in codes):
+        return True
+    return False
+
+
+def _review_block_reason_code(review: ReviewResult) -> str:
+    if _is_transient_review_block(review):
+        codes = tuple(violation.code for violation in review.violations)
+        return codes[0] if codes else "REVIEWER_UNAVAILABLE"
+    codes = tuple(violation.code for violation in review.violations)
+    return codes[0] if codes else "REVIEW_BLOCK_UNCLASSIFIED"
 
 
 def _commit_message(record: dict[str, Any]) -> str:
