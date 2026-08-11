@@ -13,6 +13,7 @@ from .git_provider import GitRepositoryProvider, MergedPullRequest
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
+from .run_pipeline import transient_review_blocked_evidence
 from .worktree_classification import branch_spec_number, classify_worktree
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
 
@@ -353,32 +354,51 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(raw, dict) and raw.get("status"):
+                resumable = _active_run_resumable(candidate, str(raw.get("status", "")))
                 return {
                     "run_id": str(raw.get("runId", "")),
                     "run_status": str(raw.get("status", "")),
                     "run_spec": str(raw.get("specNumber", "")),
                     "run_record": str(candidate),
-                    "resumable": str(
-                        raw.get("status", "")
-                        in {
-                            "READY_FOR_IMPLEMENTATION",
-                            "IMPLEMENTATION_FAILED",
-                            "IMPLEMENTATION_TIMED_OUT",
-                            "READY_FOR_VALIDATION",
-                            "VALIDATION_FAILED",
-                            "READY_FOR_REVIEW",
-                            "REVIEWING",
-                            "REVIEW_CHANGES_REQUESTED",
-                            "REVIEW_APPROVED",
-                            "READY_FOR_PUBLICATION",
-                            "PR_CREATED",
-                            "PR_READY",
-                            "MERGED",
-                            "CLEANUP_INCOMPLETE",
-                        }
-                    ),
+                    "resumable": str(resumable),
                 }
     return {}
+
+
+def _active_run_resumable(record_path: Path, status: str) -> bool:
+    resumable_statuses = {
+        "READY_FOR_IMPLEMENTATION",
+        "IMPLEMENTATION_FAILED",
+        "IMPLEMENTATION_TIMED_OUT",
+        "READY_FOR_VALIDATION",
+        "VALIDATION_FAILED",
+        "READY_FOR_REVIEW",
+        "REVIEWING",
+        "REVIEW_CHANGES_REQUESTED",
+        "REVIEW_APPROVED",
+        "READY_FOR_PUBLICATION",
+        "PR_CREATED",
+        "PR_READY",
+        "MERGED",
+        "CLEANUP_INCOMPLETE",
+    }
+    if status in resumable_statuses:
+        return True
+    if status != "REVIEW_BLOCKED":
+        return False
+    return not transient_review_blocked_evidence(
+        _read_json_object(record_path.with_name("candidate.json")),
+        _read_json_object(record_path.with_name("validation-runtime.json")),
+        _read_json_object(record_path.with_name("review-runtime.json")),
+    )
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
 
 
 def _validation_status(evidence: dict[str, Any] | None, current_head: str) -> StatusSection:
