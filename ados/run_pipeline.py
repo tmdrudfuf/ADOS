@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 from typing import Any, Protocol
 
@@ -366,7 +367,8 @@ class RunPipeline:
             else:
                 try:
                     parts = _split_command(command)
-                    completed = subprocess.run(tuple(parts), cwd=Path(record["featureWorktree"]), shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    executable = _resolve_executable(parts[0])
+                    completed = subprocess.run((executable, *parts[1:]), cwd=Path(record["featureWorktree"]), shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
                     result = BootstrapCommandResult(command, completed.returncode, _bounded(completed.stdout), _bounded(completed.stderr), False)
                 except (FileNotFoundError, OSError) as exc:
                     result = BootstrapCommandResult(command, None, "", str(exc), False)
@@ -714,6 +716,11 @@ def _split_command(command: str) -> list[str]:
         return [argv[index] for index in range(argc.value)]
     finally:
         local_free(argv)
+
+
+def _resolve_executable(executable: str) -> str:
+    resolved = shutil.which(executable)
+    return resolved or executable
 
 
 def _read_json(path: Path) -> Any:

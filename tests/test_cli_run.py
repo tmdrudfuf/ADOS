@@ -431,6 +431,23 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BOOTSTRAP_FAILED", result.status)
         self.assertIsNone(result.pipeline_result.validation)
 
+    def test_bootstrap_resolves_executable_without_shell(self):
+        with self.project() as fixture:
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, bootstrap_commands=["tool-shim --version"])
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append((args, kwargs))
+                return subprocess.CompletedProcess(args, 0, "ok", "")
+
+            with mock.patch("ados.run_pipeline.shutil.which", return_value=str(fixture.root / "tool-shim.cmd")):
+                with mock.patch("ados.run_pipeline.subprocess.run", side_effect=fake_run):
+                    result = RunService().pipeline._bootstrap(load_project_config(fixture.config), {"featureWorktree": str(fixture.repo)}, fixture.repo / ".agent-workflow" / "runs" / "001-test" / "ados-run.json")
+
+        self.assertEqual(0, result[0].exit_code)
+        self.assertEqual(str(fixture.root / "tool-shim.cmd"), calls[0][0][0])
+        self.assertIs(calls[0][1]["shell"], False)
+
     def test_validation_failure_does_not_review(self):
         with self.project() as fixture:
             config = json.loads(fixture.config.read_text(encoding="utf-8"))
