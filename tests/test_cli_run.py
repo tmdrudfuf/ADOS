@@ -478,6 +478,81 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("2", review_count)
         self.assertIn("implementer_fix", [stage.id for stage in result.pipeline_result.stages])
 
+    def test_review_blocked_transient_failure_resumes_at_review_and_completes(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('reviewer temporarily unavailable', file=sys.stderr)\n"
+                "    sys.exit(7)\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
+            publisher = FakePublisher(fixture.repo)
+            service = RunService(pipeline=RunPipeline(publisher=publisher))
+            first = service.run(RunRequest(fixture.repo, "Transient review outage", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            candidate_path = worktree / ".agent-workflow" / "runs" / "001-transient-review-outage" / "candidate.json"
+            candidate_before = json.loads(candidate_path.read_text(encoding="utf-8"))["candidate_sha"]
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+            second = service.run(RunRequest(fixture.repo, "Transient review outage", None, fixture.config))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_BLOCKED", status.workflow.evidence["run_status"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("2", reviewer_count)
+        self.assertEqual(candidate_before, second.pipeline_result.review.reviewed_sha)
+
+    def test_review_blocked_sha_mismatch_does_not_resume(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text("import sys\nprint('temporary outage', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Corrupt review resume", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            validation_path = worktree / ".agent-workflow" / "runs" / "001-corrupt-review-resume" / "validation-runtime.json"
+            validation = json.loads(validation_path.read_text(encoding="utf-8"))
+            validation["head_after"] = "0" * 40
+            validation_path.write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Corrupt review resume", None, fixture.config, dry_run=True))
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("BLOCKED", second.status)
+        self.assertFalse(second.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+
+    def test_review_blocked_without_transient_code_does_not_resume(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text("import sys\nprint('temporary outage', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Malformed review block", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            review_path = worktree / ".agent-workflow" / "runs" / "001-malformed-review-block" / "review-runtime.json"
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+            review["violations"] = []
+            review_path.write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8")
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Malformed review block", None, fixture.config, dry_run=True))
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("BLOCKED", second.status)
+        self.assertFalse(second.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+
     def test_publication_gate_remote_sha_drift_blocks(self):
         with self.project() as fixture:
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True))).run(RunRequest(fixture.repo, "Drift blocks", None, fixture.config))

@@ -15,7 +15,7 @@ from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, 
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, transient_review_blocked_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider
@@ -244,6 +244,7 @@ class RunService:
                     continue
                 if (
                     record.status in RESUMABLE_RUN_STATUSES
+                    and (record.status != "REVIEW_BLOCKED" or _review_blocked_is_resumable(record_path))
                     and record.project_id == config.project_id
                     and Path(record.primary_repository).resolve() == project_path
                     and record.feature_slug == slug
@@ -370,6 +371,8 @@ class RunService:
         expected = self._record_from_plan(config, plan, record.feature_description)
         if record.status not in RESUMABLE_RUN_STATUSES:
             return None
+        if record.status == "REVIEW_BLOCKED" and not _review_blocked_is_resumable(record_path):
+            return None
         cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE"}
         if (
             (record.run_id != expected.run_id and not cleanup_resume)
@@ -444,6 +447,14 @@ def _read_mapping(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _review_blocked_is_resumable(record_path: Path) -> bool:
+    return not transient_review_blocked_evidence(
+        _read_mapping(record_path.with_name("candidate.json")),
+        _read_mapping(record_path.with_name("validation-runtime.json")),
+        _read_mapping(record_path.with_name("review-runtime.json")),
+    )
 
 
 def _violation(code: str, message: str, evidence: dict[str, str]) -> RunViolation:
