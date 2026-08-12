@@ -406,7 +406,7 @@ class CliRunTests(unittest.TestCase):
         self.assertFalse(Path(result.plan.feature_worktree).exists())
         self.assertEqual("IDLE", status.status)
         self.assertEqual("001", status.spec.evidence["latest_merged_spec"])
-        self.assertEqual(["push", "create_pr", "ready", "merge", "delete_remote"], publisher.calls)
+        self.assertEqual(["push", "create_pr", "ready", "refresh_pr", "merge", "delete_remote"], publisher.calls)
 
     def test_bootstrap_runs_before_validation(self):
         with self.project() as fixture:
@@ -757,7 +757,7 @@ class CliRunTests(unittest.TestCase):
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True))).run(RunRequest(fixture.repo, "Drift blocks", None, fixture.config))
 
         self.assertEqual("PUBLICATION_BLOCKED", result.status)
-        self.assertIn("SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+        self.assertIn("PR_HEAD_SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
 
     def test_review_approved_resume_continues_publication_without_rerunning_review(self):
         with self.project() as fixture:
@@ -767,7 +767,7 @@ class CliRunTests(unittest.TestCase):
 
         self.assertTrue(result.resumed)
         self.assertEqual("COMPLETE", result.status)
-        self.assertEqual(["push", "create_pr", "ready", "merge", "delete_remote"], publisher.calls)
+        self.assertEqual(["push", "create_pr", "ready", "refresh_pr", "merge", "delete_remote"], publisher.calls)
 
     def test_publication_retry_after_ready_failure_resumes_and_prevents_duplicate_pr(self):
         with self.project() as fixture:
@@ -782,6 +782,63 @@ class CliRunTests(unittest.TestCase):
         self.assertTrue(second.resumed)
         self.assertEqual("COMPLETE", second.status)
         self.assertEqual(1, publisher.created_pr_count)
+
+    def test_publication_resume_refreshes_stale_pr_mergeability_before_gate(self):
+        with self.project() as fixture:
+            record_path, _ = self.create_review_approved_run(fixture, "Refresh stale PR", 1)
+            publisher = FakePublisher(fixture.repo, initial_mergeable=False, refresh_mergeable_sequence=[False, False, False, True])
+            first = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Refresh stale PR", 1, fixture.config))
+            first_record = json.loads(record_path.read_text(encoding="utf-8"))
+            second = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Refresh stale PR", 1, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", first.status)
+        self.assertEqual("false", first_record["prMergeable"])
+        self.assertEqual("PR_READY", first_record["status"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertIn("refresh_pr", publisher.calls)
+        self.assertEqual(1, publisher.created_pr_count)
+
+    def test_publication_refresh_blocks_wrong_pr_head(self):
+        with self.project() as fixture:
+            self.create_review_approved_run(fixture, "Wrong PR head", 1)
+            publisher = FakePublisher(fixture.repo, refresh_head_sha="0" * 40)
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Wrong PR head", 1, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertIn("PR_HEAD_SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_publication_refresh_blocks_wrong_pr_base(self):
+        with self.project() as fixture:
+            self.create_review_approved_run(fixture, "Wrong PR base", 1)
+            publisher = FakePublisher(fixture.repo, refresh_base="develop")
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Wrong PR base", 1, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertIn("PR_BASE_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_publication_refresh_blocks_conflict_and_draft(self):
+        with self.project() as conflict_fixture:
+            self.create_review_approved_run(conflict_fixture, "Conflicting PR", 1)
+            conflict = RunService(pipeline=RunPipeline(publisher=FakePublisher(conflict_fixture.repo, initial_mergeable=False, refresh_mergeable_sequence=[False], refresh_merge_state_sequence=["DIRTY"]))).run(RunRequest(conflict_fixture.repo, "Conflicting PR", 1, conflict_fixture.config))
+        with self.project() as draft_fixture:
+            self.create_review_approved_run(draft_fixture, "Draft PR", 1)
+            draft = RunService(pipeline=RunPipeline(publisher=FakePublisher(draft_fixture.repo, refresh_draft=True))).run(RunRequest(draft_fixture.repo, "Draft PR", 1, draft_fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", conflict.status)
+        self.assertIn("PR_NOT_MERGEABLE", {violation.code for violation in conflict.pipeline_result.violations})
+        self.assertEqual("PUBLICATION_BLOCKED", draft.status)
+        self.assertIn("PR_STILL_DRAFT", {violation.code for violation in draft.pipeline_result.violations})
+
+    def test_publication_refresh_retry_exhaustion_blocks_without_merge(self):
+        with self.project() as fixture:
+            self.create_review_approved_run(fixture, "Unresolved mergeability", 1)
+            publisher = FakePublisher(fixture.repo, initial_mergeable=False, refresh_mergeable_sequence=[False, False, False])
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Unresolved mergeability", 1, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertIn("PR_MERGEABILITY_UNRESOLVED", {violation.code for violation in result.pipeline_result.violations})
+        self.assertNotIn("merge", publisher.calls)
 
     def test_idempotent_merge_retry_resumes_cleanup_without_merging_again(self):
         with self.project() as fixture:
@@ -856,6 +913,43 @@ class CliRunTests(unittest.TestCase):
         self.assertTrue(second.resumed)
         self.assertEqual("1", review_count)
 
+    def test_approved_review_artifact_is_archived_outside_product_source(self):
+        with self.project() as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "Path('specs/001-review-artifact/review.md').write_text('Approved review evidence', encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            implementer = fixture.root / "implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "Path('specs/001-review-artifact').mkdir(parents=True, exist_ok=True)\n"
+                "Path('specs/001-review-artifact/spec.md').write_text('# Review artifact\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Review artifact", 1, fixture.config))
+            archive = Path(result.pipeline_result.run_record["primaryRepository"]) / ".agent-workflow" / "runs" / "001-review-artifact" / "ados-review-evidence.json"
+            generated_archive = archive.with_name("review-generated-artifacts.json")
+            archive_exists = archive.exists()
+            generated_archive_exists = generated_archive.exists()
+            generated_payload = json.loads(generated_archive.read_text(encoding="utf-8"))
+            generated_content = Path(generated_payload["artifacts"][0]["archive"]).read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertFalse((Path(result.plan.feature_worktree) / "specs" / "001-review-artifact" / "review.md").exists())
+        self.assertTrue(archive_exists)
+        self.assertTrue(generated_archive_exists)
+        self.assertEqual("archived", generated_payload["artifacts"][0]["status"])
+        self.assertEqual("Approved review evidence", generated_content)
+
     def test_cleanup_resume_retries_primary_update_before_complete(self):
         with self.project() as fixture:
             blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
@@ -866,6 +960,44 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("CLEANUP_INCOMPLETE", first.status)
         self.assertTrue(second.resumed)
         self.assertEqual("COMPLETE", second.status)
+
+    def test_cleanup_resume_archives_generated_review_artifact_before_worktree_removal(self):
+        with self.project() as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "Path('specs/001-cleanup-artifact/review.md').write_text('Approved cleanup evidence', encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            implementer = fixture.root / "custom-implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "Path('specs/001-cleanup-artifact').mkdir(parents=True, exist_ok=True)\n"
+                "Path('specs/001-cleanup-artifact/spec.md').write_text('# Cleanup artifact\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
+            with mock.patch("ados.run_pipeline._update_primary_main", side_effect=[(blocker,), ()]):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Cleanup artifact", 1, fixture.config))
+                worktree_path = Path(first.plan.feature_worktree)
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Cleanup artifact", 1, fixture.config))
+            generated_archive = fixture.repo / ".agent-workflow" / "runs" / "001-cleanup-artifact" / "review-generated-artifacts.json"
+            generated_payload = json.loads(generated_archive.read_text(encoding="utf-8"))
+            generated_content = Path(generated_payload["artifacts"][0]["archive"]).read_text(encoding="utf-8")
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertFalse(worktree_path.exists())
+        self.assertEqual("archived", generated_payload["artifacts"][0]["status"])
+        self.assertEqual("Approved cleanup evidence", generated_content)
 
     def test_cleanup_resume_remote_delete_failure_returns_canonical_record(self):
         with self.project() as fixture:
@@ -900,6 +1032,31 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("CLEANUP_INCOMPLETE", primary_record["status"])
         self.assertFalse(worktree_exists_after_failure)
         self.assertIn("LOCAL_BRANCH_DELETE_FAILED", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_cleanup_resume_after_worktree_removed_uses_existing_archive(self):
+        with self.project() as fixture:
+            original_run = run_pipeline._run
+            fail_delete = {"active": True}
+
+            def fail_branch_delete_once(args, cwd):
+                if fail_delete["active"] and args[:3] == ("git", "branch", "-d"):
+                    return subprocess.CompletedProcess(args, 1, "", "branch delete failed")
+                return original_run(args, cwd)
+
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_branch_delete_once):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Resume removed worktree", None, fixture.config))
+            worktree_exists_after_failure = Path(first.plan.feature_worktree).exists()
+            archive = fixture.repo / ".agent-workflow" / "runs" / "001-resume-removed-worktree" / "ados-review-evidence.json"
+            archive_exists = archive.exists()
+            fail_delete["active"] = False
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_branch_delete_once):
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Resume removed worktree", None, fixture.config))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertFalse(worktree_exists_after_failure)
+        self.assertTrue(archive_exists)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
 
     def run_cli(self, *args):
         stream = io.StringIO()
@@ -1075,11 +1232,30 @@ class TemporaryProject:
 
 
 class FakePublisher:
-    def __init__(self, primary, *, remote_drift=False, remote_delete_failure=False, ready_failure_once=False):
+    def __init__(
+        self,
+        primary,
+        *,
+        remote_drift=False,
+        remote_delete_failure=False,
+        ready_failure_once=False,
+        initial_mergeable=True,
+        refresh_mergeable_sequence=None,
+        refresh_merge_state_sequence=None,
+        refresh_head_sha=None,
+        refresh_base=None,
+        refresh_draft=False,
+    ):
         self.primary = Path(primary)
         self.remote_drift = remote_drift
         self.remote_delete_failure = remote_delete_failure
         self.ready_failure_once = ready_failure_once
+        self.initial_mergeable = initial_mergeable
+        self.refresh_mergeable_sequence = list(refresh_mergeable_sequence or [])
+        self.refresh_merge_state_sequence = list(refresh_merge_state_sequence or [])
+        self.refresh_head_sha = refresh_head_sha
+        self.refresh_base = refresh_base
+        self.refresh_draft = refresh_draft
         self.calls = []
         self.pr = None
         self.created_pr_count = 0
@@ -1098,7 +1274,7 @@ class FakePublisher:
         if self.pr is not None:
             return self.pr
         head_sha = self.remote_head(repo, head)
-        self.pr = PullRequestInfo("1", "https://example.invalid/pr/1", base, head, head_sha, True, True)
+        self.pr = PullRequestInfo("1", "https://example.invalid/pr/1", base, head, head_sha, self.initial_mergeable, True, base_sha=self.head(self.primary), merge_state_status="CLEAN" if self.initial_mergeable else "UNKNOWN")
         self.created_pr_count += 1
         return self.pr
 
@@ -1110,8 +1286,33 @@ class FakePublisher:
 
             return PipelineViolation("PR_READY_FAILED", "marking PR ready failed", {"number": number})
         if self.pr is not None:
-            self.pr = PullRequestInfo(self.pr.number, self.pr.url, self.pr.base_branch, self.pr.head_branch, self.pr.head_sha, self.pr.mergeable, False)
+            self.pr = PullRequestInfo(self.pr.number, self.pr.url, self.pr.base_branch, self.pr.head_branch, self.pr.head_sha, self.pr.mergeable, False, self.pr.base_sha, self.pr.merge_state_status)
         return None
+
+    def refresh_pr(self, repo, number):
+        self.calls.append("refresh_pr")
+        if self.pr is None:
+            return PipelineViolation("PR_REFRESH_FAILED", "PR refresh failed", {"number": number})
+        mergeable = self.pr.mergeable
+        if self.refresh_mergeable_sequence:
+            mergeable = self.refresh_mergeable_sequence.pop(0)
+        merge_state = "CLEAN" if mergeable else "UNKNOWN"
+        if self.refresh_merge_state_sequence:
+            merge_state = self.refresh_merge_state_sequence.pop(0)
+        head_sha = self.refresh_head_sha or self.pr.head_sha
+        base_branch = self.refresh_base or self.pr.base_branch
+        self.pr = PullRequestInfo(
+            self.pr.number,
+            self.pr.url,
+            base_branch,
+            self.pr.head_branch,
+            head_sha,
+            mergeable,
+            self.refresh_draft,
+            base_sha=self.head(self.primary),
+            merge_state_status=merge_state,
+        )
+        return self.pr
 
     def merge(self, repo, number, strategy, subject):
         self.calls.append("merge")
@@ -1129,3 +1330,6 @@ class FakePublisher:
 
             return PipelineViolation("REMOTE_BRANCH_DELETE_FAILED", "remote branch deletion failed", {"branch": branch})
         return None
+
+    def head(self, repo):
+        return subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()

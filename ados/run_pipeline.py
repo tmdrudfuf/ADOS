@@ -46,6 +46,7 @@ TRANSIENT_REVIEW_FAILURE_CODES = {
     "REVIEWER_COMMAND_FAILED",
     "REVIEWER_TIMED_OUT",
 }
+PR_REFRESH_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,8 @@ class PullRequestInfo:
     head_sha: str
     mergeable: bool
     draft: bool
+    base_sha: str = ""
+    merge_state_status: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -173,6 +176,9 @@ class PublicationProvider(Protocol):
     def mark_ready(self, repo: Path, number: str) -> PipelineViolation | None:
         ...
 
+    def refresh_pr(self, repo: Path, number: str) -> PullRequestInfo | PipelineViolation:
+        ...
+
     def merge(self, repo: Path, number: str, strategy: str, subject: str) -> MergeResult:
         ...
 
@@ -193,7 +199,7 @@ class GitHubCliPublicationProvider:
         return completed.stdout.strip() if completed.returncode == 0 else ""
 
     def create_or_get_draft_pr(self, repo: Path, *, base: str, head: str, title: str, body: str) -> PullRequestInfo | PipelineViolation:
-        existing = _run(("gh", "pr", "list", "--head", head, "--json", "number,url,baseRefName,headRefName,headRefOid,isDraft,mergeable"), repo)
+        existing = _run(("gh", "pr", "list", "--head", head, "--json", "number,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeable,mergeStateStatus"), repo)
         if existing.returncode == 0:
             try:
                 items = json.loads(existing.stdout)
@@ -211,6 +217,9 @@ class GitHubCliPublicationProvider:
         if completed.returncode != 0:
             return _violation("PR_READY_FAILED", "marking PR ready failed", {"stderr": completed.stderr})
         return None
+
+    def refresh_pr(self, repo: Path, number: str) -> PullRequestInfo | PipelineViolation:
+        return self._view_pr(repo, number)
 
     def merge(self, repo: Path, number: str, strategy: str, subject: str) -> MergeResult:
         flag = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}[strategy]
@@ -239,7 +248,7 @@ class GitHubCliPublicationProvider:
         return None
 
     def _view_pr(self, repo: Path, head: str) -> PullRequestInfo | PipelineViolation:
-        viewed = _run(("gh", "pr", "view", head, "--json", "number,url,baseRefName,headRefName,headRefOid,isDraft,mergeable"), repo)
+        viewed = _run(("gh", "pr", "view", head, "--json", "number,url,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeable,mergeStateStatus"), repo)
         if viewed.returncode != 0:
             return _violation("PR_VERIFY_FAILED", "PR could not be verified", {"stderr": viewed.stderr})
         try:
@@ -335,6 +344,7 @@ class RunPipeline:
             review_scope = f"specs/{record['specNumber']}-{record['featureSlug']}"
             if not (Path(record["featureWorktree"]) / review_scope).exists():
                 review_scope = str(record["featureDescription"])
+            review_artifact_snapshot = _review_artifact_snapshot(Path(record["featureWorktree"]), review_scope)
             review_result = self.review.run(
                 policy=config.execution_policy,
                 request=ReviewRequest(
@@ -346,6 +356,10 @@ class RunPipeline:
                 ),
             )
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
+            side_effect_violations = _isolate_review_artifacts(Path(record["featureWorktree"]), run_record_path, record, review_scope, candidate_result.candidate_sha, review_artifact_snapshot)
+            if side_effect_violations:
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
+                return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=side_effect_violations)
             stages.append(_stage("review", review_result.decision, {"reviewed_sha": review_result.reviewed_sha, "round": str(round_number)}))
             if review_result.status != "PASS":
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
@@ -461,6 +475,12 @@ class RunPipeline:
             return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, pull_request=pr, violations=(ready_violation,))
         _write_publication_status(run_record_path, {**_record_with_pr(record, pr, remote_sha), "prReady": "true"}, "PR_READY")
         stages.append(_stage("pr", "READY", {"number": pr.number, "head_sha": pr.head_sha}))
+        refreshed_pr = _refresh_pr_for_gate(self.publisher, worktree, pr, config.default_branch, str(record["authoritativeBaseSha"]), record["featureBranch"], candidate.candidate_sha)
+        if isinstance(refreshed_pr, PipelineViolation):
+            return PipelineOutcome("PUBLICATION_BLOCKED", tuple([*stages, _stage("pr_refresh", "BLOCKED", {})]), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, pull_request=pr, violations=(refreshed_pr,))
+        pr = refreshed_pr
+        _write_publication_status(run_record_path, {**_record_with_pr(record, pr, remote_sha), "prReady": str(not pr.draft).lower()}, "PR_READY")
+        stages.append(_stage("pr_refresh", "PASS", {"number": pr.number, "head_sha": pr.head_sha, "merge_state": pr.merge_state_status}))
         gate = self.publication.evaluate(
             policy=config.execution_policy,
             evidence=PublicationEvidence(
@@ -545,6 +565,15 @@ class RunPipeline:
         if primary_update_violations:
             _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
             return PipelineOutcome("CLEANUP_INCOMPLETE", tuple([*stages, _stage("primary_update", "BLOCKED", {})]), _read_json(canonical_record), violations=primary_update_violations)
+        archive = _existing_primary_archive(Path(record["primaryRepository"]), record)
+        if archive is None and Path(record["featureWorktree"]).exists():
+            archive = _archive_evidence_from_run(Path(record["primaryRepository"]), run_record_path, record)
+        elif archive is None:
+            archive = _violation("ARCHIVE_EVIDENCE_MISSING", "cleanup resume requires archived evidence when the feature worktree is absent", {"run_record": str(run_record_path)})
+        if isinstance(archive, PipelineViolation):
+            _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
+            return PipelineOutcome("CLEANUP_INCOMPLETE", tuple([*stages, _stage("archive", "BLOCKED", {})]), _read_json(canonical_record), violations=(archive,))
+        stages.append(_stage("archive", "PASS", {"archive": str(archive)}))
         remote_delete = self.publisher.delete_remote_branch(Path(record["primaryRepository"]), record["featureBranch"])
         if remote_delete:
             _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
@@ -611,6 +640,7 @@ class RunPipeline:
         review_scope = f"specs/{record['specNumber']}-{record['featureSlug']}"
         if not (worktree / review_scope).exists():
             review_scope = str(record["featureDescription"])
+        review_artifact_snapshot = _review_artifact_snapshot(worktree, review_scope)
         review = self.review.run(
             policy=config.execution_policy,
             request=ReviewRequest(
@@ -622,6 +652,10 @@ class RunPipeline:
             ),
         )
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
+        side_effect_violations = _isolate_review_artifacts(worktree, run_record_path, record, review_scope, candidate.candidate_sha, review_artifact_snapshot)
+        if side_effect_violations:
+            _write_review_block_status(run_record_path, record, review, candidate, validation)
+            return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=side_effect_violations)
         stages.append(_stage("review", review.decision, {"reviewed_sha": review.reviewed_sha, "resumed": "true"}))
         if review.status != "PASS":
             _write_review_block_status(run_record_path, record, review, candidate, validation)
@@ -740,7 +774,113 @@ def _record_with_pr(record: dict[str, Any], pr: PullRequestInfo, remote_sha: str
         "prHeadSha": pr.head_sha,
         "prMergeable": str(pr.mergeable).lower(),
         "prDraft": str(pr.draft).lower(),
+        "prBaseSha": pr.base_sha,
+        "prMergeStateStatus": pr.merge_state_status,
     }
+
+
+def _refresh_pr_for_gate(
+    publisher: PublicationProvider,
+    repo: Path,
+    pr: PullRequestInfo,
+    intended_base: str,
+    intended_base_sha: str,
+    intended_head: str,
+    candidate_sha: str,
+) -> PullRequestInfo | PipelineViolation:
+    last = pr
+    for _attempt in range(PR_REFRESH_ATTEMPTS):
+        refreshed = publisher.refresh_pr(repo, pr.number)
+        if isinstance(refreshed, PipelineViolation):
+            return refreshed
+        last = refreshed
+        if refreshed.head_sha != candidate_sha:
+            return _violation("PR_HEAD_SHA_MISMATCH", "refreshed PR head does not match candidate", {"expected": candidate_sha, "actual": refreshed.head_sha})
+        if refreshed.head_branch != intended_head:
+            return _violation("PR_HEAD_MISMATCH", "refreshed PR head branch does not match intended branch", {"expected": intended_head, "actual": refreshed.head_branch})
+        if refreshed.base_branch != intended_base:
+            return _violation("PR_BASE_MISMATCH", "refreshed PR base branch does not match intended branch", {"expected": intended_base, "actual": refreshed.base_branch})
+        if refreshed.base_sha and refreshed.base_sha != intended_base_sha:
+            return _violation("PR_BASE_SHA_MISMATCH", "refreshed PR base SHA does not match authoritative base", {"expected": intended_base_sha, "actual": refreshed.base_sha})
+        if refreshed.draft:
+            return _violation("PR_STILL_DRAFT", "PR remains draft after ready transition", {"number": refreshed.number})
+        if refreshed.mergeable:
+            return refreshed
+        if _mergeability_is_final_block(refreshed):
+            return refreshed
+    return _violation("PR_MERGEABILITY_UNRESOLVED", "PR mergeability did not resolve after bounded refresh", {"number": last.number, "merge_state_status": last.merge_state_status})
+
+
+def _mergeability_is_final_block(pr: PullRequestInfo) -> bool:
+    status = pr.merge_state_status.upper()
+    return status in {"DIRTY", "BEHIND", "BLOCKED", "UNSTABLE", "HAS_HOOKS"}
+
+
+def _review_artifact_snapshot(worktree: Path, scope: str) -> dict[Path, str]:
+    candidates = _review_artifact_candidates(worktree, scope)
+    snapshot: dict[Path, str] = {}
+    for path in candidates:
+        if path.exists():
+            try:
+                snapshot[path] = _git_output(worktree, "ls-files", "--error-unmatch", _relative_to_worktree(worktree, path))
+            except ValueError:
+                snapshot[path] = ""
+    return snapshot
+
+
+def _isolate_review_artifacts(
+    worktree: Path,
+    run_record_path: Path,
+    record: dict[str, Any],
+    scope: str,
+    candidate_sha: str,
+    before: dict[Path, str],
+) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+    archived: list[dict[str, str]] = []
+    for path in _review_artifact_candidates(worktree, scope):
+        if path in before or not path.exists():
+            continue
+        try:
+            relative = _relative_to_worktree(worktree, path)
+        except ValueError:
+            violations.append(_violation("REVIEW_ARTIFACT_PATH_INVALID", "review artifact path is outside worktree", {"path": str(path)}))
+            continue
+        if _git_output(worktree, "ls-files", "--others", "--exclude-standard", "--", relative).strip() != relative:
+            violations.append(_violation("REVIEW_SIDE_EFFECT_UNEXPECTED", "review produced an unexpected tracked or ignored side effect", {"path": relative}))
+            continue
+        archive_dir = run_record_path.parent / "review-artifacts"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive = archive_dir / f"{path.stem}-{candidate_sha[:12]}{path.suffix}"
+        archive.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        path.unlink()
+        archived.append({"source": relative, "archive": str(archive), "candidateSha": candidate_sha})
+    dirty = _run(("git", "status", "--short"), worktree)
+    remaining = [line for line in dirty.stdout.splitlines() if line.strip() and ".agent-workflow/" not in line.replace("\\", "/")]
+    if remaining:
+        violations.append(_violation("REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", "review left product worktree dirty", {"status": "\n".join(remaining)}))
+    if archived:
+        _write_json(run_record_path.with_name("review-generated-artifacts.json"), {"runId": str(record.get("runId", "")), "artifacts": archived})
+    return tuple(violations)
+
+
+def _review_artifact_candidates(worktree: Path, scope: str) -> tuple[Path, ...]:
+    if not _is_path_like_scope(scope):
+        return ()
+    scope_path = (worktree / scope).resolve()
+    try:
+        scope_path.relative_to(worktree.resolve())
+    except ValueError:
+        return ()
+    return (scope_path / "review.md",)
+
+
+def _is_path_like_scope(scope: str) -> bool:
+    return "/" in scope or "\\" in scope or scope.startswith("specs") or scope.startswith(".")
+
+
+def _relative_to_worktree(worktree: Path, path: Path) -> str:
+    return str(path.resolve().relative_to(worktree.resolve())).replace("\\", "/")
 
 
 def _read_run_artifact(run_record_path: Path, record: dict[str, Any], filename: str) -> Any:
@@ -813,7 +953,72 @@ def _archive_evidence(primary: Path, record: dict[str, Any], candidate: Candidat
             "merge_commit": merge.merge_commit_sha,
         },
     )
+    generated = Path(str(record.get("featureWorktree", ""))) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "review-generated-artifacts.json"
+    if generated.exists():
+        try:
+            generated_payload = json.loads(generated.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            _write_json(archive.with_name("review-generated-artifacts.json"), {"source": str(generated), "status": "invalid_json"})
+        else:
+            _write_json(archive.with_name("review-generated-artifacts.json"), _archive_generated_review_artifacts(archive.parent, generated_payload))
     return archive
+
+
+def _archive_evidence_from_run(primary: Path, run_record_path: Path, record: dict[str, Any]) -> Path | PipelineViolation:
+    candidate_raw = _read_run_artifact(run_record_path, record, "candidate.json")
+    validation_raw = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+    review_raw = _read_run_artifact(run_record_path, record, "review-runtime.json")
+    candidate = _candidate_from_mapping(candidate_raw)
+    if candidate is None or not isinstance(validation_raw, dict) or not isinstance(review_raw, dict):
+        return _violation("ARCHIVE_EVIDENCE_MISSING", "cleanup resume requires candidate, validation, and review evidence before worktree removal", {"run_record": str(run_record_path)})
+    validation = _validation_from_mapping(validation_raw)
+    review = _review_from_mapping(review_raw)
+    merge_sha = str(record.get("mergeCommitSha", ""))
+    pr_number = str(record.get("pullRequest", ""))
+    if not merge_sha or not pr_number:
+        return _violation("ARCHIVE_PUBLICATION_EVIDENCE_MISSING", "cleanup resume requires PR and merge evidence before worktree removal", {"pull_request": pr_number, "merge_commit": merge_sha})
+    pr = PullRequestInfo(
+        number=pr_number,
+        url=str(record.get("pullRequestUrl", "")),
+        base_branch=str(record.get("prBaseBranch", "")),
+        head_branch=str(record.get("prHeadBranch", "")) or str(record.get("featureBranch", "")),
+        head_sha=str(record.get("prHeadSha", "")) or str(record.get("remoteBranchHeadSha", "")) or candidate.candidate_sha,
+        mergeable=str(record.get("prMergeable", "")).lower() == "true",
+        draft=str(record.get("prDraft", "")).lower() == "true",
+        base_sha=str(record.get("prBaseSha", "")),
+        merge_state_status=str(record.get("prMergeStateStatus", "")),
+    )
+    return _archive_evidence(primary, record, candidate, validation, review, pr, MergeResult("MERGED", merge_sha))
+
+
+def _existing_primary_archive(primary: Path, record: dict[str, Any]) -> Path | None:
+    archive = primary / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-review-evidence.json"
+    return archive if archive.exists() else None
+
+
+def _archive_generated_review_artifacts(primary_run_dir: Path, payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"status": "invalid_payload"}
+    artifacts = payload.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        return {"status": "invalid_payload"}
+    archive_dir = primary_run_dir / "review-artifacts"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived: list[dict[str, str]] = []
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict):
+            continue
+        source_archive = Path(str(artifact.get("archive", "")))
+        if not source_archive.exists() or not source_archive.is_file():
+            archived.append({**{str(k): str(v) for k, v in artifact.items()}, "status": "missing_source"})
+            continue
+        target = archive_dir / f"{index:03d}-{source_archive.name}"
+        target.write_text(source_archive.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        updated = {str(k): str(v) for k, v in artifact.items()}
+        updated["archive"] = str(target)
+        updated["status"] = "archived"
+        archived.append(updated)
+    return {**payload, "artifacts": archived}
 
 
 def _archive_run_record(primary: Path, record: dict[str, Any], status: str) -> Path:
@@ -1009,6 +1214,8 @@ def _pr_info(raw: dict[str, Any]) -> PullRequestInfo:
         head_sha=str(raw.get("headRefOid", "")),
         mergeable=str(raw.get("mergeable", "")).upper() == "MERGEABLE",
         draft=bool(raw.get("isDraft", False)),
+        base_sha=str(raw.get("baseRefOid", "")),
+        merge_state_status=str(raw.get("mergeStateStatus", "")),
     )
 
 
