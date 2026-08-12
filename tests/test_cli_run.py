@@ -626,6 +626,44 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("PUBLICATION_BLOCKED", result.status)
         self.assertIn("SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
 
+    def test_review_approved_resume_continues_publication_without_rerunning_review(self):
+        with self.project() as fixture:
+            self.create_review_approved_run(fixture, "Publication resume", 1)
+            publisher = FakePublisher(fixture.repo)
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Publication resume", 1, fixture.config))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(["push", "create_pr", "ready", "merge", "delete_remote"], publisher.calls)
+
+    def test_publication_retry_after_ready_failure_resumes_and_prevents_duplicate_pr(self):
+        with self.project() as fixture:
+            record_path, _ = self.create_review_approved_run(fixture, "Retry publication", 1)
+            publisher = FakePublisher(fixture.repo, ready_failure_once=True)
+            first = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Retry publication", 1, fixture.config))
+            first_record = json.loads(record_path.read_text(encoding="utf-8"))
+            second = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Retry publication", 1, fixture.config))
+
+        self.assertEqual("PUBLICATION_BLOCKED", first.status)
+        self.assertEqual("PR_CREATED", first_record["status"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual(1, publisher.created_pr_count)
+
+    def test_idempotent_merge_retry_resumes_cleanup_without_merging_again(self):
+        with self.project() as fixture:
+            self.create_review_approved_run(fixture, "Retry merged cleanup", 1)
+            publisher = FakePublisher(fixture.repo)
+            blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
+            with mock.patch("ados.run_pipeline._update_primary_main", side_effect=[(blocker,), ()]):
+                first = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Retry merged cleanup", 1, fixture.config))
+                second = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Retry merged cleanup", 1, fixture.config))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual(1, publisher.calls.count("merge"))
+
     def test_remote_branch_delete_failure_does_not_report_complete(self):
         with self.project() as fixture:
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_delete_failure=True))).run(RunRequest(fixture.repo, "Cleanup fails", None, fixture.config))
@@ -850,6 +888,32 @@ class CliRunTests(unittest.TestCase):
         record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
         return record_path, record
 
+    def create_review_approved_run(self, fixture, feature, spec):
+        record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
+        worktree = Path(record["featureWorktree"])
+        spec_dir = worktree / "specs" / f"{record['specNumber']}-{record['featureSlug']}"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "spec.md").write_text(f"# {feature}\n", encoding="utf-8")
+        self.git(worktree, "add", "specs")
+        self.git(worktree, "commit", "-m", f"spec {record['specNumber']}: {feature}")
+        candidate_sha = self.head(worktree)
+        record["status"] = "REVIEW_APPROVED"
+        record["nextStage"] = "publication"
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        (record_path.with_name("candidate.json")).write_text(
+            json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": [f"specs/{record['specNumber']}-{record['featureSlug']}/spec.md"]}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (record_path.with_name("validation-runtime.json")).write_text(
+            json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (record_path.with_name("review-runtime.json")).write_text(
+            json.dumps({"status": "PASS", "decision": "Approved", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Approved", "stderr": "", "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record_path, record
+
 
 class TemporaryProject:
     def __init__(self, test, **kwargs):
@@ -878,12 +942,14 @@ class TemporaryProject:
 
 
 class FakePublisher:
-    def __init__(self, primary, *, remote_drift=False, remote_delete_failure=False):
+    def __init__(self, primary, *, remote_drift=False, remote_delete_failure=False, ready_failure_once=False):
         self.primary = Path(primary)
         self.remote_drift = remote_drift
         self.remote_delete_failure = remote_delete_failure
+        self.ready_failure_once = ready_failure_once
         self.calls = []
         self.pr = None
+        self.created_pr_count = 0
 
     def push(self, repo, branch):
         self.calls.append("push")
@@ -896,12 +962,20 @@ class FakePublisher:
 
     def create_or_get_draft_pr(self, repo, *, base, head, title, body):
         self.calls.append("create_pr")
+        if self.pr is not None:
+            return self.pr
         head_sha = self.remote_head(repo, head)
         self.pr = PullRequestInfo("1", "https://example.invalid/pr/1", base, head, head_sha, True, True)
+        self.created_pr_count += 1
         return self.pr
 
     def mark_ready(self, repo, number):
         self.calls.append("ready")
+        if self.ready_failure_once:
+            self.ready_failure_once = False
+            from ados.run_pipeline import PipelineViolation
+
+            return PipelineViolation("PR_READY_FAILED", "marking PR ready failed", {"number": number})
         if self.pr is not None:
             self.pr = PullRequestInfo(self.pr.number, self.pr.url, self.pr.base_branch, self.pr.head_branch, self.pr.head_sha, self.pr.mergeable, False)
         return None

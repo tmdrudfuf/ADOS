@@ -309,9 +309,9 @@ class RunService:
             violations.append(RunViolation(violation.code, violation.message, violation.evidence))
 
         spec_number = int(plan.spec_number)
-        if (project_path / "specs" / f"{plan.spec_number}-{plan.feature_slug}").exists():
+        if (project_path / "specs" / f"{plan.spec_number}-{plan.feature_slug}").exists() and resume is None:
             violations.append(_violation("SPEC_DIRECTORY_EXISTS", "requested Spec directory already exists", {"spec": plan.spec_number}))
-        if any(_spec_number(path.name) == spec_number for path in (project_path / "specs").glob("*") if path.is_dir()):
+        if any(_spec_number(path.name) == spec_number for path in (project_path / "specs").glob("*") if path.is_dir()) and resume is None:
             violations.append(_violation("SPEC_NUMBER_USED", "requested Spec number already has a directory", {"spec": plan.spec_number}))
         try:
             if self.git.branch_exists(project_path, plan.feature_branch) and resume is None:
