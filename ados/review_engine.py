@@ -166,7 +166,7 @@ def _verify_request(repository_path: Path, request: ReviewRequest) -> tuple[Revi
 
 def _git_ok(repository_path: Path, *args: str) -> bool:
     try:
-        completed = subprocess.run(("git", *args), cwd=repository_path, check=False, capture_output=True, text=True)
+        completed = subprocess.run(("git", *args), cwd=repository_path, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
     except (FileNotFoundError, OSError):
         return False
     return completed.returncode == 0

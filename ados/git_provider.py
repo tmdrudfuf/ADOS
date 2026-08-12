@@ -75,6 +75,8 @@ class GitRepositoryProvider:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except (FileNotFoundError, OSError):
             return ()
@@ -115,6 +117,8 @@ class GitRepositoryProvider:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError as exc:
             raise RepositoryProviderError("GIT_UNAVAILABLE", "git executable is unavailable") from exc
@@ -168,6 +172,8 @@ class GitRepositoryProvider:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError as exc:
             raise RepositoryProviderError("GIT_UNAVAILABLE", "git executable is unavailable") from exc

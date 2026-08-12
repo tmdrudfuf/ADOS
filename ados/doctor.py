@@ -280,7 +280,7 @@ def _extract_executable(command: str) -> str | None:
 def _safe_version_probe(executable: str, resolved: str) -> dict[str, str]:
     args = [resolved, "--version"]
     try:
-        completed = subprocess.run(args, capture_output=True, text=True, timeout=5, shell=False)
+        completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, shell=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return {"version_probe": "unavailable", "version_error": str(exc)}
     output = (completed.stdout or completed.stderr).strip().splitlines()

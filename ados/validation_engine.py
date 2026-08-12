@@ -64,12 +64,12 @@ class ValidationEngine:
         command_results: list[ValidationCommandResult] = []
         violations: list[ValidationViolation] = []
         for command in policy.validation.commands:
-            completed = subprocess.run(command, cwd=repo, shell=True, capture_output=True, text=True)
+            completed = subprocess.run(command, cwd=repo, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
             command_result = ValidationCommandResult(
                 command=command,
                 exit_code=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+                stdout=_bounded(completed.stdout),
+                stderr=_bounded(completed.stderr),
             )
             command_results.append(command_result)
             if completed.returncode != 0:
@@ -103,3 +103,11 @@ class ValidationEngine:
             commands=tuple(command_results),
             violations=tuple(violations),
         )
+
+
+def _bounded(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[:20_000]
