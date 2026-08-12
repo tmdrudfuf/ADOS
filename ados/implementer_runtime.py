@@ -21,7 +21,7 @@ from .repository_provider import RepositoryProviderError
 
 SAFE_TIMEOUT_MS = 300_000
 UNSAFE_TOKENS = ("&", "|", ";", "<", ">", "`", "$(", "\n", "\r")
-RESUMABLE_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}
+RESUMABLE_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "VALIDATION_FAILED"}
 
 
 @dataclass(frozen=True)
@@ -320,8 +320,7 @@ def _resolve_command(record: dict[str, Any], timeout_ms: int) -> ImplementerComm
 
 def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
     spec_path = Path(record["featureWorktree"]) / "specs" / f"{record['specNumber']}-{record['featureSlug']}"
-    return "\n".join(
-        [
+    lines = [
             "ADOS Implementer Handoff",
             "",
             f"Project: {record['projectId']}",
@@ -338,8 +337,25 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
             "",
             "Mutate only the feature worktree. Do not modify the primary repository.",
             "Do not run validation, start review, publish, merge, deploy, or mutate GitHub from this runtime.",
-        ]
-    )
+    ]
+    validation_failure = record.get("validationFailure")
+    if record.get("status") == "VALIDATION_FAILED" and isinstance(validation_failure, dict):
+        lines.extend(["", "Implementation recovery context:", f"Recovery stage: {validation_failure.get('recoveryStage', 'implementation_recovery')}", f"Candidate SHA: {validation_failure.get('candidateSha', '')}", f"Validation status: {validation_failure.get('status', '')}", f"HEAD before validation: {validation_failure.get('headBefore', '')}", f"HEAD after validation: {validation_failure.get('headAfter', '')}", "Failed validation commands:"])
+        commands = validation_failure.get("failedCommands", [])
+        if isinstance(commands, list):
+            for command in commands:
+                if not isinstance(command, dict):
+                    continue
+                lines.extend(
+                    [
+                        f"- command: {command.get('command', '')}",
+                        f"  exit code: {command.get('exitCode', '')}",
+                        f"  reason code: {command.get('reasonCode', '')}",
+                        f"  stdout: {command.get('stdout', '')}",
+                        f"  stderr: {command.get('stderr', '')}",
+                    ]
+                )
+    return "\n".join(lines)
 
 
 def _read_record(path: Path) -> dict[str, Any] | ImplementerViolation:

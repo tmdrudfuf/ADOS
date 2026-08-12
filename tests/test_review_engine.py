@@ -157,6 +157,8 @@ class ReviewEngineTests(unittest.TestCase):
         reviewer_call = [call for call in mocked.call_args_list if call.args[0][0] != "git"][0]
         self.assertEqual("PASS", result.status)
         self.assertIs(reviewer_call.kwargs["shell"], False)
+        self.assertEqual("utf-8", reviewer_call.kwargs["encoding"])
+        self.assertEqual("replace", reviewer_call.kwargs["errors"])
         self.assertEqual(fixture.repo.resolve(), reviewer_call.kwargs["cwd"])
 
     def test_unsafe_reviewer_command_blocks_before_spawn(self):

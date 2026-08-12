@@ -15,7 +15,7 @@ from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, 
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, transient_review_blocked_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider
@@ -372,6 +372,11 @@ class RunService:
         if record.status not in RESUMABLE_RUN_STATUSES:
             return None
         if record.status == "REVIEW_BLOCKED" and not _review_blocked_is_resumable(record_path):
+            return None
+        if record.status == "VALIDATION_FAILED" and validation_failed_evidence(
+            _read_mapping(record_path.with_name("candidate.json")),
+            _read_mapping(record_path.with_name("validation-runtime.json")),
+        ):
             return None
         cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE"}
         if (

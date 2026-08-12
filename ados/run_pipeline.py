@@ -286,13 +286,24 @@ class RunPipeline:
                 return resumed
         if record.get("status") == "REVIEW_BLOCKED":
             return self._resume_review(config, run_record_path, record, stages, timeout_ms)
+        if record.get("status") == "VALIDATION_FAILED":
+            candidate_artifact = _read_run_artifact(run_record_path, record, "candidate.json")
+            validation_artifact = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+            resumable = validation_failed_evidence(
+                candidate_artifact,
+                validation_artifact,
+            )
+            if resumable:
+                return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("validation_resume", "BLOCKED", {})]), record, violations=resumable)
+            _ensure_validation_failure_evidence(run_record_path, record, candidate_artifact, validation_artifact)
+            record = _read_json(run_record_path) or record
 
         bootstrap = self._bootstrap(config, record, run_record_path)
         stages.append(_stage("bootstrap", "PASS" if all(item.exit_code == 0 for item in bootstrap) else "BLOCKED", {"commands": str(len(bootstrap))}))
         if any(item.exit_code != 0 for item in bootstrap):
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
-        if record.get("status") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+        if record.get("status") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "VALIDATION_FAILED"}:
             implementer_result = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
             record = implementer_result.run_record or record
             stages.append(_stage("implementer", implementer_result.status, {}))
@@ -317,7 +328,7 @@ class RunPipeline:
             _write_json(run_record_path.with_name("validation-runtime.json"), validation_result.to_dict())
             stages.append(_stage("validation", validation_result.status, {"validated_sha": validation_result.head_after}))
             if validation_result.status != "PASS" or validation_result.head_before != validation_result.head_after:
-                _write_status(run_record_path, record, "VALIDATION_FAILED")
+                _write_validation_failure_status(run_record_path, record, candidate_result, validation_result)
                 return PipelineOutcome("VALIDATION_FAILED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, violations=tuple(_from_validation(item) for item in validation_result.violations))
 
             diff = _git_output(Path(record["featureWorktree"]), "diff", "--no-ext-diff", "--no-color", f"{record['authoritativeBaseSha']}..{candidate_result.candidate_sha}")
@@ -642,6 +653,64 @@ def _write_status(path: Path, record: dict[str, Any], status: str) -> None:
     updated = dict(record)
     updated["status"] = status
     updated["nextStage"] = _next_stage(status)
+    _clear_resolved_recovery_fields(updated, status)
+    _write_json(path, updated)
+
+
+def _write_validation_failure_status(path: Path, record: dict[str, Any], candidate: CandidatePreparationResult, validation: ValidationResult) -> None:
+    updated = dict(record)
+    updated["status"] = "VALIDATION_FAILED"
+    updated["nextStage"] = "implementation_recovery"
+    updated["validationFailure"] = _validation_failure_payload(path, candidate, validation)
+    _write_json(path, updated)
+
+
+def _validation_failure_payload(path: Path, candidate: CandidatePreparationResult, validation: ValidationResult) -> dict[str, Any]:
+    failed_commands = [
+        {
+            "command": command.command,
+            "exitCode": str(command.exit_code),
+            "reasonCode": "VALIDATION_COMMAND_FAILED",
+            "stdout": _bounded(command.stdout),
+            "stderr": _bounded(command.stderr),
+        }
+        for command in validation.commands
+        if command.exit_code != 0
+    ]
+    if validation.head_before != validation.head_after:
+        failed_commands.append(
+            {
+                "command": "HEAD",
+                "exitCode": "",
+                "reasonCode": "VALIDATION_HEAD_DRIFT",
+                "stdout": "",
+                "stderr": f"head_before={validation.head_before} head_after={validation.head_after}",
+            }
+        )
+    return {
+        "candidateSha": candidate.candidate_sha,
+        "headBefore": validation.head_before,
+        "headAfter": validation.head_after,
+        "status": validation.status,
+        "reasonCodes": [violation.code for violation in validation.violations],
+        "failedCommands": failed_commands,
+        "artifact": str(path.with_name("validation-runtime.json")),
+        "recoveryStage": "implementation_recovery",
+    }
+
+
+def _ensure_validation_failure_evidence(path: Path, record: dict[str, Any], candidate: Any, validation: Any) -> None:
+    candidate_result = _candidate_from_mapping(candidate)
+    validation_result = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+    if candidate_result is None or validation_result is None:
+        return
+    current = record.get("validationFailure")
+    if isinstance(current, dict) and current.get("candidateSha") == candidate_result.candidate_sha and current.get("failedCommands"):
+        return
+    updated = dict(record)
+    updated["status"] = "VALIDATION_FAILED"
+    updated["nextStage"] = "implementation_recovery"
+    updated["validationFailure"] = _validation_failure_payload(path, candidate_result, validation_result)
     _write_json(path, updated)
 
 
@@ -649,7 +718,15 @@ def _write_publication_status(path: Path, record: dict[str, Any], status: str) -
     updated = dict(record)
     updated["status"] = status
     updated["nextStage"] = _next_stage(status)
+    _clear_resolved_recovery_fields(updated, status)
     _write_json(path, updated)
+
+
+def _clear_resolved_recovery_fields(record: dict[str, Any], status: str) -> None:
+    if status != "VALIDATION_FAILED":
+        record.pop("validationFailure", None)
+    if status != "REVIEW_BLOCKED":
+        record.pop("reviewBlock", None)
 
 
 def _record_with_pr(record: dict[str, Any], pr: PullRequestInfo, remote_sha: str) -> dict[str, Any]:
@@ -875,6 +952,33 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
     return ()
 
 
+def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[PipelineViolation, ...]:
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("VALIDATION_RESUME_CANDIDATE_INVALID", "validation recovery requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("VALIDATION_RESUME_EVIDENCE_MISSING", "validation recovery requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "BLOCK":
+        return (_violation("VALIDATION_RESUME_STATE_INVALID", "validation recovery requires failed validation evidence", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "VALIDATION_RESUME_SHA_MISMATCH",
+                "validation recovery evidence does not match candidate",
+                {
+                    "candidate_sha": candidate_result.candidate_sha,
+                    "head_before": validation_result.head_before,
+                    "head_after": validation_result.head_after,
+                },
+            ),
+        )
+    failed = tuple(command for command in validation_result.commands if command.exit_code != 0)
+    if not failed and not validation_result.violations:
+        return (_violation("VALIDATION_RESUME_FAILURE_UNPROVEN", "validation recovery requires failed command or violation evidence", {}),)
+    return ()
+
+
 def _is_transient_review_block(review: ReviewResult) -> bool:
     codes = tuple(violation.code for violation in review.violations)
     if not codes:
@@ -944,7 +1048,11 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _bounded(value: str) -> str:
+def _bounded(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
     return value[:20_000]
 
 

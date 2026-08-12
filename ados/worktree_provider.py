@@ -49,6 +49,8 @@ class GitWorktreeProvider:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError as exc:
             raise RepositoryProviderError("GIT_UNAVAILABLE", "git executable is unavailable") from exc

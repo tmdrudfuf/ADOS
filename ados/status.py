@@ -355,6 +355,7 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
                 continue
             if isinstance(raw, dict) and raw.get("status"):
                 review_block = _review_block_evidence(raw, candidate)
+                validation_failure = _validation_failure_evidence(raw, candidate)
                 resumable = _active_run_resumable(candidate, str(raw.get("status", "")))
                 evidence = {
                     "run_id": str(raw.get("runId", "")),
@@ -364,6 +365,7 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
                     "resumable": str(resumable),
                 }
                 evidence.update(review_block)
+                evidence.update(validation_failure)
                 return evidence
     return {}
 
@@ -418,6 +420,43 @@ def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[st
         "review_block_transient": str(current_resumable),
         "resume_stage": "review" if current_resumable else "",
     }
+
+
+def _validation_failure_evidence(record: dict[str, Any], record_path: Path) -> dict[str, str]:
+    if str(record.get("status", "")) != "VALIDATION_FAILED":
+        return {}
+    validation_failure = record.get("validationFailure")
+    if not isinstance(validation_failure, dict):
+        validation_failure = {}
+    validation = _read_json_object(record_path.with_name("validation-runtime.json"))
+    commands = validation_failure.get("failedCommands", [])
+    if not isinstance(commands, list):
+        commands = []
+    if not commands and isinstance(validation, dict):
+        commands = [
+            {"command": item.get("command", ""), "exitCode": item.get("exit_code", "")}
+            for item in validation.get("commands", [])
+            if isinstance(item, dict) and _nonzero_exit(item.get("exit_code", 0))
+        ]
+    failed = ",".join(str(item.get("command", "")) for item in commands if isinstance(item, dict))
+    candidate_sha = str(validation_failure.get("candidateSha", ""))
+    if not candidate_sha:
+        candidate = _read_json_object(record_path.with_name("candidate.json"))
+        if isinstance(candidate, dict):
+            candidate_sha = str(candidate.get("candidate_sha", ""))
+    return {
+        "resume_stage": "implementation_recovery",
+        "candidate_sha": candidate_sha,
+        "failed_validation_commands": failed,
+        "validation_failure_artifact": str(record_path.with_name("validation-runtime.json")),
+    }
+
+
+def _nonzero_exit(value: Any) -> bool:
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:
