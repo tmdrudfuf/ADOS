@@ -436,15 +436,19 @@ class RunPipeline:
             return PipelineOutcome("READY_FOR_PUBLICATION", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact)
         push_violation = self.publisher.push(worktree, record["featureBranch"])
         if push_violation:
+            _write_publication_status(run_record_path, record, "READY_FOR_PUBLICATION")
             return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, violations=(push_violation,))
         remote_sha = self.publisher.remote_head(worktree, record["featureBranch"])
+        _write_publication_status(run_record_path, {**record, "remoteBranchHeadSha": remote_sha}, "READY_FOR_PUBLICATION")
         stages.append(_stage("push", "PASS" if remote_sha == candidate.candidate_sha else "BLOCKED", {"remote_head": remote_sha}))
         pr = self.publisher.create_or_get_draft_pr(worktree, base=config.default_branch, head=record["featureBranch"], title=_commit_message(record), body=f"ADOS run {record['runId']}\n\nValidated SHA: {candidate.candidate_sha}\nReview: {review.decision}")
         if isinstance(pr, PipelineViolation):
             return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, violations=(pr,))
+        _write_publication_status(run_record_path, _record_with_pr(record, pr, remote_sha), "PR_CREATED")
         ready_violation = self.publisher.mark_ready(worktree, pr.number)
         if ready_violation:
             return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, pull_request=pr, violations=(ready_violation,))
+        _write_publication_status(run_record_path, {**_record_with_pr(record, pr, remote_sha), "prReady": "true"}, "PR_READY")
         stages.append(_stage("pr", "READY", {"number": pr.number, "head_sha": pr.head_sha}))
         gate = self.publication.evaluate(
             policy=config.execution_policy,
@@ -482,21 +486,23 @@ class RunPipeline:
         stages.append(_stage("merge", merge.status, {"merge_commit": merge.merge_commit_sha}))
         if merge.status != "MERGED":
             return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, publication_gate=gate, pull_request=pr, merge=merge, violations=merge.violations)
+        _write_publication_status(run_record_path, {**_record_with_pr(record, pr, remote_sha), "mergeCommitSha": merge.merge_commit_sha}, "MERGED")
         primary_update_violations = _update_primary_main(Path(record["primaryRepository"]), config.default_branch)
         if primary_update_violations:
-            _write_status(run_record_path, record, "CLEANUP_INCOMPLETE")
-            return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, publication_gate=gate, pull_request=pr, merge=merge, violations=primary_update_violations)
+            _write_publication_status(run_record_path, {**_record_with_pr(record, pr, remote_sha), "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
+            primary_record = _archive_run_record(Path(record["primaryRepository"]), {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
+            return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, publication_gate=gate, pull_request=pr, merge=merge, violations=primary_update_violations)
         archive = _archive_evidence(Path(record["primaryRepository"]), record, candidate, validation, review, pr, merge)
         primary_record = _archive_run_record(Path(record["primaryRepository"]), {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "MERGED")
         remote_delete = self.publisher.delete_remote_branch(Path(record["primaryRepository"]), record["featureBranch"])
         if remote_delete:
-            _write_status(run_record_path, record, "CLEANUP_INCOMPLETE")
+            _write_publication_status(run_record_path, {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
             _write_status(primary_record, {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
             return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, publication_gate=gate, pull_request=pr, merge=merge, violations=(remote_delete,))
         cleanup = self._cleanup(config, record)
         stages.append(_stage("cleanup", cleanup.status, {"archive": str(archive)}))
         if cleanup.status != "PASS":
-            _write_status(run_record_path, record, "CLEANUP_INCOMPLETE")
+            _write_publication_status(run_record_path, {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
             _write_status(primary_record, {**record, "pullRequest": pr.number, "mergeCommitSha": merge.merge_commit_sha}, "CLEANUP_INCOMPLETE")
             return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, publication_gate=gate, pull_request=pr, merge=merge, cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
         local_delete = _run(("git", "branch", "-d", record["featureBranch"]), Path(record["primaryRepository"]))
@@ -547,11 +553,11 @@ class RunPipeline:
         return PipelineOutcome("COMPLETE", tuple([*stages, _stage("cleanup", "PASS", {})]), _read_json(canonical_record), cleanup=cleanup)
 
     def _resume_publication(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome | None:
-        candidate = _read_json(run_record_path.with_name("candidate.json"))
-        validation = _read_json(run_record_path.with_name("validation-runtime.json"))
-        review = _read_json(run_record_path.with_name("review-runtime.json"))
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
         if not isinstance(candidate, dict) or not isinstance(validation, dict) or not isinstance(review, dict):
-            return None
+            return PipelineOutcome("PUBLICATION_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {})]), record, violations=(_violation("PUBLICATION_RESUME_EVIDENCE_MISSING", "publication resume requires candidate, validation, and review evidence", {"run_record": str(run_record_path)}),))
         candidate_result = CandidatePreparationResult("COMMITTED", str(candidate.get("candidate_sha", "")), tuple(str(item) for item in candidate.get("changed_files", [])))
         validation_result = _validation_from_mapping(validation)
         review_result = _review_from_mapping(review)
@@ -561,7 +567,7 @@ class RunPipeline:
             if exact.status != "MATCH":
                 return PipelineOutcome("EXACT_HEAD_BLOCKED", tuple(stages), record, candidate=candidate_result, validation=validation_result, review=review_result, exact_head_gate=exact.to_dict(), violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in exact.violations))
             return self._publish(config, run_record_path, record, stages, (), None, candidate_result, validation_result, review_result, exact.to_dict())
-        return None
+        return PipelineOutcome("PUBLICATION_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {})]), record, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("PUBLICATION_RESUME_EVIDENCE_INVALID", "publication resume requires a committed candidate, passed validation, and approved review", {"candidate_status": candidate_result.status, "validation_status": validation_result.status, "review_decision": review_result.decision}),))
 
     def _resume_review(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage], timeout_ms: int) -> PipelineOutcome:
         candidate_raw = _read_json(run_record_path.with_name("candidate.json"))
@@ -639,6 +645,38 @@ def _write_status(path: Path, record: dict[str, Any], status: str) -> None:
     _write_json(path, updated)
 
 
+def _write_publication_status(path: Path, record: dict[str, Any], status: str) -> None:
+    updated = dict(record)
+    updated["status"] = status
+    updated["nextStage"] = _next_stage(status)
+    _write_json(path, updated)
+
+
+def _record_with_pr(record: dict[str, Any], pr: PullRequestInfo, remote_sha: str) -> dict[str, Any]:
+    return {
+        **record,
+        "remoteBranchHeadSha": remote_sha,
+        "pullRequest": pr.number,
+        "pullRequestUrl": pr.url,
+        "prBaseBranch": pr.base_branch,
+        "prHeadBranch": pr.head_branch,
+        "prHeadSha": pr.head_sha,
+        "prMergeable": str(pr.mergeable).lower(),
+        "prDraft": str(pr.draft).lower(),
+    }
+
+
+def _read_run_artifact(run_record_path: Path, record: dict[str, Any], filename: str) -> Any:
+    primary = run_record_path.with_name(filename)
+    value = _read_json(primary)
+    if value is not None:
+        return value
+    feature = Path(str(record.get("featureWorktree", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / filename
+    if feature == primary:
+        return None
+    return _read_json(feature)
+
+
 def _write_review_block_status(path: Path, record: dict[str, Any], review: ReviewResult, candidate: CandidatePreparationResult, validation: ValidationResult) -> None:
     transient = _is_transient_review_block(review)
     reason_code = _review_block_reason_code(review)
@@ -671,6 +709,10 @@ def _next_stage(status: str) -> str:
         "READY_FOR_REVIEW": "review",
         "REVIEW_APPROVED": "publication",
         "REVIEW_CHANGES_REQUESTED": "implementation_recovery",
+        "READY_FOR_PUBLICATION": "publication",
+        "PR_CREATED": "publication",
+        "PR_READY": "publication",
+        "MERGED": "cleanup",
         "CLEANUP_INCOMPLETE": "cleanup",
         "COMPLETE": "complete",
     }.get(status, "recovery")
