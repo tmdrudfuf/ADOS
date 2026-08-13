@@ -14,6 +14,7 @@ from ados.run_command import RunRequest, RunService
 from ados.run_pipeline import PipelineViolation, PullRequestInfo, RunPipeline
 from ados.project_config import load_project_config
 from ados.status import StatusRequest, StatusService
+from ados.worktree_lifecycle import WorktreeLifecycleResult, WorktreeViolation
 
 
 class CliRunTests(unittest.TestCase):
@@ -407,6 +408,100 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("IDLE", status.status)
         self.assertEqual("001", status.spec.evidence["latest_merged_spec"])
         self.assertEqual(["push", "create_pr", "ready", "refresh_pr", "merge", "delete_remote"], publisher.calls)
+
+    def test_no_change_run_terminates_before_review_and_publication(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            publisher = FakePublisher(fixture.repo)
+            before_head = self.head(fixture.repo)
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Already satisfied", None, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            after_head = self.head(fixture.repo)
+
+        self.assertEqual("NO_CHANGES", result.status)
+        self.assertEqual(before_head, after_head)
+        self.assertIsNone(result.pipeline_result.validation)
+        self.assertIsNone(result.pipeline_result.review)
+        self.assertEqual([], publisher.calls)
+        self.assertFalse(Path(result.plan.feature_worktree).exists())
+        self.assertEqual("IDLE", status.status)
+        self.assertEqual("None", status.spec.evidence["active_spec"])
+
+    def test_no_change_run_does_not_increment_latest_merged_spec(self):
+        with self.project(specs=[91], implementer_mode="no_change") as fixture:
+            self.write_archive(fixture.repo, spec="091-previous", merge_commit=self.head(fixture.repo))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "No merge evidence", 92, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("NO_CHANGES", result.status)
+        self.assertEqual("091", status.spec.evidence["latest_merged_spec"])
+        self.assertEqual("None", status.spec.evidence["active_spec"])
+
+    def test_existing_review_blocked_no_change_run_finalizes_without_review_or_pr(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            publisher = FakePublisher(fixture.repo)
+            record_path, record = self.create_durable_run(fixture, "Legacy no delta", 92, "REVIEW_BLOCKED")
+            base = record["authoritativeBaseSha"]
+            record["nextStage"] = "recovery"
+            record["reviewBlock"] = {"reasonCode": "REVIEW_DECISION_UNAVAILABLE", "transient": False}
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": base, "changed_files": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": base, "head_after": base, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "", "reviewed_sha": base, "exit_code": 0, "stdout": "", "stderr": "", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            status_before = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Legacy no delta", 92, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("no_changes", status_before.workflow.evidence["resume_stage"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("NO_CHANGES", result.status)
+        self.assertEqual([], publisher.calls)
+        self.assertFalse(Path(record["featureWorktree"]).exists())
+        self.assertEqual("IDLE", status.status)
+
+    def test_review_decision_unavailable_with_real_delta_remains_blocked(self):
+        with self.project() as fixture:
+            publisher = FakePublisher(fixture.repo)
+            record_path, record = self.create_durable_run(fixture, "Real delta unavailable", 92, "REVIEW_BLOCKED")
+            worktree = Path(record["featureWorktree"])
+            (worktree / "feature.txt").write_text("delta\n", encoding="utf-8")
+            self.git(worktree, "add", "feature.txt")
+            self.git(worktree, "commit", "-m", "real delta")
+            candidate = self.head(worktree)
+            record["nextStage"] = "recovery"
+            record["reviewBlock"] = {"reasonCode": "REVIEW_DECISION_UNAVAILABLE", "transient": False}
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": candidate, "changed_files": ["feature.txt"]}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": candidate, "head_after": candidate, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "", "reviewed_sha": candidate, "exit_code": 0, "stdout": "", "stderr": "", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Real delta unavailable", 92, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+        self.assertEqual([], publisher.calls)
+
+    def test_dirty_legacy_no_change_evidence_blocks(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            record_path, record = self.create_durable_run(fixture, "Dirty no delta", 92, "REVIEW_BLOCKED")
+            base = record["authoritativeBaseSha"]
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": base, "changed_files": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": base, "head_after": base, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            (Path(record["featureWorktree"]) / "scratch.txt").write_text("ambiguous\n", encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty no delta", 92, fixture.config))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("NO_CHANGE_WORKTREE_DIRTY", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_no_change_cleanup_resume_is_idempotent(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            lifecycle = FailingOnceLifecycle()
+            service = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo), lifecycle=lifecycle), lifecycle=lifecycle)
+            first = service.run(RunRequest(fixture.repo, "Cleanup retry no delta", 92, fixture.config))
+            second = service.run(RunRequest(fixture.repo, "Cleanup retry no delta", 92, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("NO_CHANGES_CLEANUP_INCOMPLETE", first.status)
+        self.assertEqual("NO_CHANGES", second.status)
+        self.assertEqual("IDLE", status.status)
 
     def test_bootstrap_runs_before_validation(self):
         with self.project() as fixture:
@@ -1099,6 +1194,7 @@ class CliRunTests(unittest.TestCase):
                     "counter.write_text(str(value + 1), encoding='utf-8')\n"
                     "Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
                 ),
+                "no_change": "print('already satisfied')\n",
             }
             runner.write_text(scripts[implementer_mode], encoding="utf-8")
             implementer = f'"{sys.executable}" "{runner}"'
@@ -1333,3 +1429,23 @@ class FakePublisher:
 
     def head(self, repo):
         return subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+
+class FailingOnceLifecycle:
+    def __init__(self):
+        self.inner = run_pipeline.WorktreeLifecycleEngine()
+        self.remove_calls = 0
+
+    def create(self, *, policy, request):
+        return self.inner.create(policy=policy, request=request)
+
+    def remove(self, *, policy, request):
+        self.remove_calls += 1
+        if self.remove_calls == 1:
+            return WorktreeLifecycleResult(
+                "remove",
+                "BLOCK",
+                (WorktreeViolation("TEST_CLEANUP_FAILURE", "synthetic cleanup failure", {"worktree_path": str(request.worktree_path)}),),
+                (),
+            )
+        return self.inner.remove(policy=policy, request=request)

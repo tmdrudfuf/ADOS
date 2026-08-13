@@ -38,6 +38,7 @@ PIPELINE_READY_STATUSES = {
     "PR_READY",
     "MERGED",
     "CLEANUP_INCOMPLETE",
+    "NO_CHANGES_CLEANUP_INCOMPLETE",
 }
 
 TRANSIENT_REVIEW_FAILURE_CODES = {
@@ -287,6 +288,8 @@ class RunPipeline:
         if not isinstance(record, dict):
             return PipelineOutcome("BLOCKED", (_stage("record", "BLOCKED", {}),), {}, violations=(_violation("RUN_RECORD_INVALID", "run record is unavailable", {"path": str(run_record_path)}),))
 
+        if record.get("status") == "NO_CHANGES_CLEANUP_INCOMPLETE":
+            return self._resume_no_changes_cleanup(config, run_record_path, record, stages)
         if record.get("status") in {"MERGED", "CLEANUP_INCOMPLETE"}:
             return self._resume_cleanup(config, run_record_path, record, stages)
         if record.get("status") in {"REVIEW_APPROVED", "READY_FOR_PUBLICATION", "PR_CREATED", "PR_READY"}:
@@ -331,6 +334,8 @@ class RunPipeline:
             stages.append(_stage("candidate", candidate_result.status, {"candidate_sha": candidate_result.candidate_sha, "round": str(round_number)}))
             if candidate_result.status == "BLOCKED":
                 return PipelineOutcome("CANDIDATE_BLOCKED", tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, violations=candidate_result.violations)
+            if candidate_result.status == "NO_CHANGES":
+                return self._finalize_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate_result)
             _write_status(run_record_path, record, "READY_FOR_VALIDATION")
 
             validation_result = self.validation.run(policy=config.execution_policy, repository_path=Path(record["featureWorktree"]))
@@ -439,7 +444,38 @@ class RunPipeline:
         except RepositoryProviderError as exc:
             return CandidatePreparationResult("BLOCKED", "", changed, (_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
         _write_json(Path(record["featureWorktree"]) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "candidate.json", {"status": "COMMITTED", "candidate_sha": head, "changed_files": list(changed)})
+        no_delta = _no_change_violations(self.git, worktree, record, head)
+        if not no_delta:
+            _write_json(Path(record["featureWorktree"]) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "candidate.json", {"status": "NO_CHANGES", "candidate_sha": head, "changed_files": list(changed)})
+            return CandidatePreparationResult("NO_CHANGES", head, changed)
         return CandidatePreparationResult("COMMITTED", head, changed)
+
+    def _finalize_no_changes(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        implementer_result: ImplementerRuntimeOutcome | None,
+        candidate: CandidatePreparationResult,
+    ) -> PipelineOutcome:
+        violations = _no_change_violations(self.git, Path(record["featureWorktree"]), record, candidate.candidate_sha)
+        if violations:
+            _write_status(run_record_path, record, "CANDIDATE_BLOCKED")
+            return PipelineOutcome("CANDIDATE_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, violations=violations)
+        no_change_archive = _archive_no_change(Path(record["primaryRepository"]), record, candidate)
+        primary_record = _archive_run_record(Path(record["primaryRepository"]), {**record, "noChangeArchive": str(no_change_archive)}, "NO_CHANGES_CLEANUP_INCOMPLETE")
+        cleanup = self._cleanup(config, record)
+        stages.append(_stage("cleanup", cleanup.status, {"archive": str(no_change_archive)}))
+        if cleanup.status != "PASS":
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
+        local_delete = _run(("git", "branch", "-d", record["featureBranch"]), Path(record["primaryRepository"]))
+        if local_delete.returncode != 0 and "not found" not in (local_delete.stderr + local_delete.stdout).lower():
+            violation = _violation("LOCAL_BRANCH_DELETE_FAILED", "local no-change feature branch deletion failed", {"stderr": local_delete.stderr})
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup, violations=(violation,))
+        _write_status(primary_record, {**record, "noChangeArchive": str(no_change_archive)}, "NO_CHANGES")
+        return PipelineOutcome("NO_CHANGES", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup)
 
     def _publish(
         self,
@@ -592,6 +628,32 @@ class RunPipeline:
         _write_status(canonical_record, record, "COMPLETE")
         return PipelineOutcome("COMPLETE", tuple([*stages, _stage("cleanup", "PASS", {})]), _read_json(canonical_record), cleanup=cleanup)
 
+    def _resume_no_changes_cleanup(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome:
+        canonical_record = _canonical_run_record_path(Path(record["primaryRepository"]), record)
+        existing_canonical = _read_json(canonical_record)
+        if isinstance(existing_canonical, dict):
+            record = {**record, **existing_canonical}
+        candidate = _candidate_from_mapping(_read_run_artifact(run_record_path, record, "candidate.json")) or CandidatePreparationResult("NO_CHANGES", str(record.get("candidateSha", "")), ())
+        violations = _no_change_violations(self.git, Path(record["featureWorktree"]), record, candidate.candidate_sha)
+        if Path(record["featureWorktree"]).exists() and violations:
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple([*stages, _stage("no_changes", "BLOCKED", {})]), record, candidate=candidate, violations=violations)
+        archive = Path(str(record.get("noChangeArchive", "")))
+        if not archive.exists():
+            archive = _archive_no_change(Path(record["primaryRepository"]), record, candidate)
+        cleanup: WorktreeLifecycleResult | None = None
+        if Path(record["featureWorktree"]).exists():
+            cleanup = self._cleanup(config, record)
+            stages.append(_stage("cleanup", cleanup.status, {"archive": str(archive)}))
+            if cleanup.status != "PASS":
+                _write_status(canonical_record, {**record, "noChangeArchive": str(archive)}, "NO_CHANGES_CLEANUP_INCOMPLETE")
+                return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(canonical_record), candidate=candidate, cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
+        local_delete = _run(("git", "branch", "-d", record["featureBranch"]), Path(record["primaryRepository"]))
+        if local_delete.returncode != 0 and "not found" not in (local_delete.stderr + local_delete.stdout).lower():
+            _write_status(canonical_record, {**record, "noChangeArchive": str(archive)}, "NO_CHANGES_CLEANUP_INCOMPLETE")
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(canonical_record), candidate=candidate, cleanup=cleanup, violations=(_violation("LOCAL_BRANCH_DELETE_FAILED", "local no-change feature branch deletion failed", {"stderr": local_delete.stderr}),))
+        _write_status(canonical_record, {**record, "noChangeArchive": str(archive)}, "NO_CHANGES")
+        return PipelineOutcome("NO_CHANGES", tuple([*stages, _stage("cleanup", "PASS", {"archive": str(archive)})]), _read_json(canonical_record), candidate=candidate, cleanup=cleanup)
+
     def _resume_publication(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome | None:
         candidate = _read_run_artifact(run_record_path, record, "candidate.json")
         validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
@@ -613,6 +675,12 @@ class RunPipeline:
         candidate_raw = _read_json(run_record_path.with_name("candidate.json"))
         validation_raw = _read_json(run_record_path.with_name("validation-runtime.json"))
         review_raw = _read_json(run_record_path.with_name("review-runtime.json"))
+        legacy_no_change = _legacy_no_change_violations(self.git, Path(record["featureWorktree"]), record, candidate_raw, validation_raw)
+        if legacy_no_change is not None:
+            if legacy_no_change:
+                return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("no_change_recovery", "BLOCKED", {})]), record, violations=legacy_no_change)
+            candidate = _candidate_from_mapping(candidate_raw) or CandidatePreparationResult("NO_CHANGES", str(record.get("authoritativeBaseSha", "")), ())
+            return self._finalize_no_changes(config, run_record_path, record, [*stages, _stage("no_change_recovery", "PASS", {"candidate_sha": candidate.candidate_sha})], (), None, CandidatePreparationResult("NO_CHANGES", candidate.candidate_sha, candidate.changed_files))
         resumable = transient_review_blocked_evidence(candidate_raw, validation_raw, review_raw)
         if resumable:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
@@ -932,7 +1000,76 @@ def _next_stage(status: str) -> str:
         "MERGED": "cleanup",
         "CLEANUP_INCOMPLETE": "cleanup",
         "COMPLETE": "complete",
+        "NO_CHANGES_CLEANUP_INCOMPLETE": "cleanup",
+        "NO_CHANGES": "complete",
     }.get(status, "recovery")
+
+
+def _no_change_violations(git: GitRepositoryProvider, worktree: Path, record: dict[str, Any], candidate_sha: str) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+    base_sha = str(record.get("authoritativeBaseSha", ""))
+    if not candidate_sha or not base_sha:
+        return (_violation("NO_CHANGE_SHA_MISSING", "no-change detection requires candidate and base SHA", {"candidate_sha": candidate_sha, "base_sha": base_sha}),)
+    try:
+        status = git.status(worktree)
+        current_head = git.current_head(worktree)
+        branch = git.current_branch(worktree)
+    except RepositoryProviderError as exc:
+        return (_violation(exc.code, exc.message, {"worktree": str(worktree)}),)
+    if branch != str(record.get("featureBranch", "")):
+        violations.append(_violation("NO_CHANGE_BRANCH_MISMATCH", "no-change cleanup requires the recorded feature branch", {"expected": str(record.get("featureBranch", "")), "actual": branch}))
+    if current_head != candidate_sha:
+        violations.append(_violation("NO_CHANGE_HEAD_MISMATCH", "no-change cleanup requires HEAD to match candidate", {"current_head": current_head, "candidate_sha": candidate_sha}))
+    if status.staged or status.dirty_tracked or status.untracked:
+        violations.append(_violation("NO_CHANGE_WORKTREE_DIRTY", "no-change cleanup requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}))
+    if candidate_sha != base_sha:
+        violations.append(_violation("NO_CHANGE_CANDIDATE_DIFFERS_FROM_BASE", "candidate SHA differs from authoritative base", {"candidate_sha": candidate_sha, "base_sha": base_sha}))
+    ahead = _run(("git", "rev-list", "--count", f"{base_sha}..{candidate_sha}"), worktree)
+    if ahead.returncode != 0:
+        violations.append(_violation("NO_CHANGE_REV_LIST_FAILED", "no-change rev-list proof failed", {"stderr": ahead.stderr}))
+    elif ahead.stdout.strip() != "0":
+        violations.append(_violation("NO_CHANGE_COMMITS_AHEAD", "candidate has commits ahead of authoritative base", {"count": ahead.stdout.strip()}))
+    diff = _run(("git", "diff", "--quiet", f"{base_sha}..{candidate_sha}"), worktree)
+    if diff.returncode not in {0, 1}:
+        violations.append(_violation("NO_CHANGE_DIFF_FAILED", "no-change diff proof failed", {"stderr": diff.stderr}))
+    elif diff.returncode == 1:
+        violations.append(_violation("NO_CHANGE_DIFF_NOT_EMPTY", "candidate diff against authoritative base is not empty", {}))
+    return tuple(violations)
+
+
+def _legacy_no_change_violations(git: GitRepositoryProvider, worktree: Path, record: dict[str, Any], candidate_raw: Any, validation_raw: Any) -> tuple[PipelineViolation, ...] | None:
+    if str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return None
+    candidate = _candidate_from_mapping(candidate_raw)
+    if candidate is None:
+        return None
+    base_sha = str(record.get("authoritativeBaseSha", ""))
+    if candidate.candidate_sha != base_sha:
+        return None
+    if isinstance(validation_raw, dict):
+        validation = _validation_from_mapping(validation_raw)
+        if validation.head_before != candidate.candidate_sha or validation.head_after != candidate.candidate_sha:
+            return (_violation("NO_CHANGE_VALIDATION_SHA_MISMATCH", "legacy no-change validation evidence does not match candidate", {"candidate_sha": candidate.candidate_sha, "head_before": validation.head_before, "head_after": validation.head_after}),)
+    return _no_change_violations(git, worktree, record, candidate.candidate_sha)
+
+
+def _archive_no_change(primary: Path, record: dict[str, Any], candidate: CandidatePreparationResult) -> Path:
+    archive = primary / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-no-change-evidence.json"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        archive,
+        {
+            "spec": f"{record['specNumber']}-{record['featureSlug']}",
+            "run_id": str(record.get("runId", "")),
+            "status": "NO_CHANGES",
+            "candidate_sha": candidate.candidate_sha,
+            "authoritative_base_sha": str(record.get("authoritativeBaseSha", "")),
+            "changed_files": list(candidate.changed_files),
+            "publication": "not_started",
+            "merge_commit": "",
+        },
+    )
+    return archive
 
 
 def _archive_evidence(primary: Path, record: dict[str, Any], candidate: CandidatePreparationResult, validation: ValidationResult, review: ReviewResult, pr: PullRequestInfo, merge: MergeResult) -> Path:
