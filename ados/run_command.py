@@ -378,7 +378,7 @@ class RunService:
             _read_mapping(record_path.with_name("validation-runtime.json")),
         ):
             return None
-        cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE"}
+        cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE", "NO_CHANGES_CLEANUP_INCOMPLETE"}
         if (
             (record.run_id != expected.run_id and not cleanup_resume)
             or record.project_id != expected.project_id
@@ -455,11 +455,33 @@ def _read_mapping(path: Path) -> dict[str, Any] | None:
 
 
 def _review_blocked_is_resumable(record_path: Path) -> bool:
+    record = _read_mapping(record_path)
+    candidate = _read_mapping(record_path.with_name("candidate.json"))
+    validation = _read_mapping(record_path.with_name("validation-runtime.json"))
+    if _legacy_no_change_shape(record, candidate, validation):
+        return True
     return not transient_review_blocked_evidence(
-        _read_mapping(record_path.with_name("candidate.json")),
-        _read_mapping(record_path.with_name("validation-runtime.json")),
+        candidate,
+        validation,
         _read_mapping(record_path.with_name("review-runtime.json")),
     )
+
+
+def _legacy_no_change_shape(record: dict[str, Any] | None, candidate: dict[str, Any] | None, validation: dict[str, Any] | None) -> bool:
+    if not isinstance(record, dict) or str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return False
+    if not isinstance(candidate, dict):
+        return False
+    candidate_sha = str(candidate.get("candidate_sha") or candidate.get("candidateSha") or "")
+    base_sha = str(record.get("authoritativeBaseSha", ""))
+    if not candidate_sha or candidate_sha != base_sha:
+        return False
+    if isinstance(validation, dict):
+        return (
+            str(validation.get("head_before", "")) == candidate_sha
+            and str(validation.get("head_after", "")) == candidate_sha
+        )
+    return True
 
 
 def _violation(code: str, message: str, evidence: dict[str, str]) -> RunViolation:

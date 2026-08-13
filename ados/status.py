@@ -386,11 +386,18 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
         "PR_READY",
         "MERGED",
         "CLEANUP_INCOMPLETE",
+        "NO_CHANGES_CLEANUP_INCOMPLETE",
     }
     if status in resumable_statuses:
         return True
     if status != "REVIEW_BLOCKED":
         return False
+    if _legacy_no_change_shape(
+        _read_json_object(record_path),
+        _read_json_object(record_path.with_name("candidate.json")),
+        _read_json_object(record_path.with_name("validation-runtime.json")),
+    ):
+        return True
     return not transient_review_blocked_evidence(
         _read_json_object(record_path.with_name("candidate.json")),
         _read_json_object(record_path.with_name("validation-runtime.json")),
@@ -398,17 +405,36 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
     )
 
 
+def _legacy_no_change_shape(record: dict[str, Any] | None, candidate: dict[str, Any] | None, validation: dict[str, Any] | None) -> bool:
+    if not isinstance(record, dict) or str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return False
+    if not isinstance(candidate, dict):
+        return False
+    candidate_sha = str(candidate.get("candidate_sha") or candidate.get("candidateSha") or "")
+    base_sha = str(record.get("authoritativeBaseSha", ""))
+    if not candidate_sha or candidate_sha != base_sha:
+        return False
+    if isinstance(validation, dict):
+        return str(validation.get("head_before", "")) == candidate_sha and str(validation.get("head_after", "")) == candidate_sha
+    return True
+
+
 def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[str, str]:
     if str(record.get("status", "")) != "REVIEW_BLOCKED":
         return {}
     current_resumable = _active_run_resumable(record_path, "REVIEW_BLOCKED")
+    no_change_resumable = _legacy_no_change_shape(
+        record,
+        _read_json_object(record_path.with_name("candidate.json")),
+        _read_json_object(record_path.with_name("validation-runtime.json")),
+    )
     block = record.get("reviewBlock")
     if isinstance(block, dict):
         reason = str(block.get("reasonCode", ""))
         return {
             "review_block_reason": reason,
-            "review_block_transient": str(current_resumable),
-            "resume_stage": "review" if current_resumable else "",
+            "review_block_transient": str(current_resumable and not no_change_resumable),
+            "resume_stage": "no_changes" if no_change_resumable else "review" if current_resumable else "",
         }
     review = _read_json_object(record_path.with_name("review-runtime.json"))
     if not isinstance(review, dict):
@@ -417,8 +443,8 @@ def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[st
     codes = ",".join(str(item.get("code", "")) for item in violations if isinstance(item, dict))
     return {
         "review_block_reason": codes or "Unknown",
-        "review_block_transient": str(current_resumable),
-        "resume_stage": "review" if current_resumable else "",
+        "review_block_transient": str(current_resumable and not no_change_resumable),
+        "resume_stage": "no_changes" if no_change_resumable else "review" if current_resumable else "",
     }
 
 
