@@ -129,13 +129,18 @@ class ReviewEngine:
 
 def parse_review_decision(output: str) -> str:
     for line in output.splitlines():
-        normalized = re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", line).strip()
+        normalized = _strip_decision_markup(line)
         normalized = re.sub(r"^Decision:\s*", "", normalized).strip()
+        normalized = _strip_decision_markup(normalized)
         if normalized == "Approved":
             return "Approved"
         if normalized == "Changes Requested":
             return "Changes Requested"
     return "Unavailable"
+
+
+def _strip_decision_markup(value: str) -> str:
+    return re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", value).strip()
 
 
 def _prompt(request: ReviewRequest) -> str:
