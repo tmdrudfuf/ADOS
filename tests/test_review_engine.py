@@ -38,6 +38,9 @@ class ReviewEngineTests(unittest.TestCase):
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
+    def test_parse_decision_prefix_with_markdown_decision(self):
+        self.assertEqual("Approved", parse_review_decision("Decision: **Approved**"))
+
     def test_unknown_output_is_unavailable(self):
         self.assertEqual("Unavailable", parse_review_decision("Looks fine"))
 
@@ -66,12 +69,21 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual("BLOCK", result.status)
         self.assertEqual("REVIEW_DECISION_UNAVAILABLE", result.violations[0].code)
 
+    def test_review_engine_accepts_markdown_decision_prefix(self):
+        with self.project() as fixture:
+            command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", decision="Decision: **Approved**")}"'
+            result = ReviewEngine().run(policy=self.policy(command), request=self.request(fixture.repo, candidate_sha=fixture.candidate, base_sha=fixture.base, scope="scope"))
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual("Approved", result.decision)
+
     def test_review_engine_blocks_on_nonzero_exit(self):
         with self.project() as fixture:
-            command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", exit_code=2)}"'
+            command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", decision="Maybe", exit_code=2)}"'
             result = ReviewEngine().run(policy=self.policy(command), request=self.request(fixture.repo, candidate_sha=fixture.candidate, base_sha=fixture.base, scope="scope"))
 
         self.assertEqual("BLOCK", result.status)
+        self.assertEqual("Unavailable", result.decision)
         self.assertEqual("REVIEWER_COMMAND_FAILED", result.violations[0].code)
 
     def test_review_runs_in_target_repo_not_launch_cwd(self):
