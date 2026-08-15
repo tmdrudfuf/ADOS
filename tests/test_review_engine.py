@@ -41,8 +41,44 @@ class ReviewEngineTests(unittest.TestCase):
     def test_parse_decision_prefix_with_markdown_decision(self):
         self.assertEqual("Approved", parse_review_decision("Decision: **Approved**"))
 
+    def test_parse_decision_prefix_with_markdown_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("Decision: **Changes Requested**"))
+
+    def test_parse_review_heading_approved(self):
+        self.assertEqual("Approved", parse_review_decision("## Review: Approved"))
+
+    def test_parse_review_heading_markdown_approved(self):
+        self.assertEqual("Approved", parse_review_decision("## Review: **Approved**"))
+
+    def test_parse_review_prefix_approved(self):
+        self.assertEqual("Approved", parse_review_decision("Review: Approved"))
+
+    def test_parse_review_prefix_markdown_approved(self):
+        self.assertEqual("Approved", parse_review_decision("Review: **Approved**"))
+
+    def test_parse_review_heading_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("## Review: Changes Requested"))
+
+    def test_parse_review_heading_markdown_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("## Review: **Changes Requested**"))
+
+    def test_parse_plain_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("Changes Requested"))
+
     def test_unknown_output_is_unavailable(self):
         self.assertEqual("Unavailable", parse_review_decision("Looks fine"))
+
+    def test_prose_containing_approved_is_unavailable(self):
+        self.assertEqual(
+            "Unavailable",
+            parse_review_decision("The previous review was Approved, but this candidate has blocking findings."),
+        )
+
+    def test_conflicting_explicit_decisions_are_unavailable(self):
+        self.assertEqual(
+            "Unavailable",
+            parse_review_decision("## Review: Approved\nDecision: Changes Requested"),
+        )
 
     def test_review_engine_approved(self):
         with self.project() as fixture:
@@ -69,9 +105,26 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual("BLOCK", result.status)
         self.assertEqual("REVIEW_DECISION_UNAVAILABLE", result.violations[0].code)
 
+    def test_review_engine_blocks_on_malformed_successful_output(self):
+        with self.project() as fixture:
+            command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", decision="The candidate was Approved before, but not now.")}"'
+            result = ReviewEngine().run(policy=self.policy(command), request=self.request(fixture.repo, candidate_sha=fixture.candidate, base_sha=fixture.base, scope="scope"))
+
+        self.assertEqual("BLOCK", result.status)
+        self.assertEqual("Unavailable", result.decision)
+        self.assertEqual("REVIEW_DECISION_UNAVAILABLE", result.violations[0].code)
+
     def test_review_engine_accepts_markdown_decision_prefix(self):
         with self.project() as fixture:
             command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", decision="Decision: **Approved**")}"'
+            result = ReviewEngine().run(policy=self.policy(command), request=self.request(fixture.repo, candidate_sha=fixture.candidate, base_sha=fixture.base, scope="scope"))
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual("Approved", result.decision)
+
+    def test_review_engine_accepts_review_heading_decision(self):
+        with self.project() as fixture:
+            command = f'"{sys.executable}" "{self.reviewer_script(fixture.root / "reviewer.py", decision="## Review: Approved")}"'
             result = ReviewEngine().run(policy=self.policy(command), request=self.request(fixture.repo, candidate_sha=fixture.candidate, base_sha=fixture.base, scope="scope"))
 
         self.assertEqual("PASS", result.status)
