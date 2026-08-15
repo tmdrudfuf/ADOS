@@ -128,19 +128,32 @@ class ReviewEngine:
 
 
 def parse_review_decision(output: str) -> str:
+    decisions: list[str] = []
     for line in output.splitlines():
-        normalized = _strip_decision_markup(line)
-        normalized = re.sub(r"^Decision:\s*", "", normalized).strip()
-        normalized = _strip_decision_markup(normalized)
-        if normalized == "Approved":
-            return "Approved"
-        if normalized == "Changes Requested":
-            return "Changes Requested"
+        normalized = _normalize_decision_line(line)
+        if normalized in {"Approved", "Changes Requested"}:
+            decisions.append(normalized)
+
+    unique_decisions = set(decisions)
+    if len(unique_decisions) == 1:
+        return decisions[0]
     return "Unavailable"
 
 
 def _strip_decision_markup(value: str) -> str:
     return re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", value).strip()
+
+
+def _normalize_decision_line(line: str) -> str:
+    normalized = _strip_decision_markup(line.strip())
+    normalized = re.sub(r"^(?:Decision|Review):\s*", "", normalized, flags=re.IGNORECASE).strip()
+    normalized = _strip_decision_markup(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized.lower() == "approved":
+        return "Approved"
+    if normalized.lower() == "changes requested":
+        return "Changes Requested"
+    return normalized
 
 
 def _prompt(request: ReviewRequest) -> str:
