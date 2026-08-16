@@ -35,17 +35,49 @@ class ReviewEngineTests(unittest.TestCase):
     def test_parse_approved_with_markdown_and_whitespace(self):
         self.assertEqual("Approved", parse_review_decision("  **Approved**  "))
 
+    def test_parse_approved_with_single_marker_markdown(self):
+        self.assertEqual("Approved", parse_review_decision("*Approved*"))
+        self.assertEqual("Approved", parse_review_decision("_Approved_"))
+
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
     def test_parse_decision_prefix_with_markdown_decision(self):
         self.assertEqual("Approved", parse_review_decision("Decision: **Approved**"))
 
+    def test_parse_markdown_decision_label_approved(self):
+        self.assertEqual("Approved", parse_review_decision("**Decision**: Approved"))
+
+    def test_parse_markdown_decision_label_markdown_approved(self):
+        self.assertEqual("Approved", parse_review_decision("**Decision**: **Approved**"))
+
+    def test_parse_decision_prefix_with_single_marker_markdown(self):
+        self.assertEqual("Approved", parse_review_decision("Decision: *Approved*"))
+
+    def test_parse_decision_prefix_with_stray_edge_markers(self):
+        self.assertEqual("Approved", parse_review_decision("Decision: Approved**"))
+        self.assertEqual("Approved", parse_review_decision("**Decision: Approved"))
+
+    def test_parse_markdown_decision_label_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("**Decision**: Changes Requested"))
+
+    def test_parse_markdown_decision_label_markdown_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("**Decision**: **Changes Requested**"))
+
     def test_parse_decision_prefix_with_markdown_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("Decision: **Changes Requested**"))
 
     def test_parse_review_heading_approved(self):
         self.assertEqual("Approved", parse_review_decision("## Review: Approved"))
+
+    def test_parse_review_heading_markdown_label_approved(self):
+        self.assertEqual("Approved", parse_review_decision("## **Review**: Approved"))
+
+    def test_parse_review_heading_markdown_label_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("## **Review**: Changes Requested"))
+
+    def test_parse_review_heading_with_single_marker_markdown(self):
+        self.assertEqual("Approved", parse_review_decision("## Review: *Approved*"))
 
     def test_parse_review_heading_markdown_approved(self):
         self.assertEqual("Approved", parse_review_decision("## Review: **Approved**"))
