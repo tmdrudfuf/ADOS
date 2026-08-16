@@ -39,6 +39,10 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual("Approved", parse_review_decision("*Approved*"))
         self.assertEqual("Approved", parse_review_decision("_Approved_"))
 
+    def test_parse_approved_with_terminal_period(self):
+        self.assertEqual("Approved", parse_review_decision("Approved."))
+        self.assertEqual("Approved", parse_review_decision("Decision: Approved."))
+
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
@@ -96,6 +100,10 @@ class ReviewEngineTests(unittest.TestCase):
 
     def test_parse_plain_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("Changes Requested"))
+
+    def test_parse_changes_requested_with_terminal_period(self):
+        self.assertEqual("Changes Requested", parse_review_decision("Changes Requested."))
+        self.assertEqual("Changes Requested", parse_review_decision("Review: Changes Requested."))
 
     def test_unknown_output_is_unavailable(self):
         self.assertEqual("Unavailable", parse_review_decision("Looks fine"))
