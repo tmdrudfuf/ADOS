@@ -141,12 +141,29 @@ def parse_review_decision(output: str) -> str:
 
 
 def _strip_decision_markup(value: str) -> str:
-    return re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", value).strip()
+    return re.sub(r"^[#>\s-]+|[\s:]+$", "", value).strip()
+
+
+def _strip_edge_emphasis_markers(value: str) -> str:
+    return re.sub(r"^[*_]+|[*_]+$", "", value).strip()
+
+
+def _strip_markdown_emphasis(value: str) -> str:
+    normalized = value.strip()
+    previous = None
+    while previous != normalized:
+        previous = normalized
+        normalized = re.sub(r"(^|[\s:])(?:\*\*|__|\*|_)([^*_]+?)(?:\*\*|__|\*|_)($|[\s:])", r"\1\2\3", normalized).strip()
+    return normalized
 
 
 def _normalize_decision_line(line: str) -> str:
     normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
     normalized = re.sub(r"^(?:Decision|Review):\s*", "", normalized, flags=re.IGNORECASE).strip()
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
     normalized = _strip_decision_markup(normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if normalized.lower() == "approved":
