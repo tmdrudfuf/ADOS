@@ -148,6 +148,10 @@ def _strip_edge_emphasis_markers(value: str) -> str:
     return re.sub(r"^[*_]+|[*_]+$", "", value).strip()
 
 
+def _strip_terminal_decision_period(value: str) -> str:
+    return re.sub(r"\.$", "", value).strip()
+
+
 def _strip_markdown_emphasis(value: str) -> str:
     normalized = value.strip()
     previous = None
@@ -166,6 +170,7 @@ def _normalize_decision_line(line: str) -> str:
     normalized = _strip_edge_emphasis_markers(normalized)
     normalized = _strip_decision_markup(normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = _strip_terminal_decision_period(normalized)
     if normalized.lower() == "approved":
         return "Approved"
     if normalized.lower() == "changes requested":
