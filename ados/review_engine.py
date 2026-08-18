@@ -129,7 +129,13 @@ class ReviewEngine:
 
 def parse_review_decision(output: str) -> str:
     decisions: list[str] = []
-    for line in output.splitlines():
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if _is_decision_section_heading(line):
+            section_decision = _decision_from_section_value(_next_non_empty_line(lines, index + 1))
+            if section_decision in {"Approved", "Changes Requested"}:
+                decisions.append(section_decision)
+            continue
         normalized = _normalize_decision_line(line)
         if normalized in {"Approved", "Changes Requested"}:
             decisions.append(normalized)
@@ -140,15 +146,70 @@ def parse_review_decision(output: str) -> str:
     return "Unavailable"
 
 
+def _next_non_empty_line(lines: list[str], start: int) -> str:
+    for line in lines[start:]:
+        if line.strip():
+            return line
+    return ""
+
+
+def _is_decision_section_heading(line: str) -> bool:
+    normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.lower() == "decision"
+
+
+def _decision_from_section_value(line: str) -> str:
+    normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    match = re.match(
+        r"^(approved|changes requested)(?:\s*(?:[.!?:;]|--|—|-)\s*.*)?$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "Unavailable"
+    token = match.group(1).lower()
+    if token == "approved":
+        return "Approved"
+    return "Changes Requested"
+
+
 def _strip_decision_markup(value: str) -> str:
-    return re.sub(r"^[#>*_\s-]+|[*_\s:]+$", "", value).strip()
+    return re.sub(r"^[#>\s-]+|[\s:]+$", "", value).strip()
+
+
+def _strip_edge_emphasis_markers(value: str) -> str:
+    return re.sub(r"^[*_]+|[*_]+$", "", value).strip()
+
+
+def _strip_terminal_decision_period(value: str) -> str:
+    return re.sub(r"\.$", "", value).strip()
+
+
+def _strip_markdown_emphasis(value: str) -> str:
+    normalized = value.strip()
+    previous = None
+    while previous != normalized:
+        previous = normalized
+        normalized = re.sub(r"(^|[\s:])(?:\*\*|__|\*|_)([^*_]+?)(?:\*\*|__|\*|_)($|[\s:])", r"\1\2\3", normalized).strip()
+    return normalized
 
 
 def _normalize_decision_line(line: str) -> str:
     normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
     normalized = re.sub(r"^(?:Decision|Review):\s*", "", normalized, flags=re.IGNORECASE).strip()
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
     normalized = _strip_decision_markup(normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = _strip_terminal_decision_period(normalized)
     if normalized.lower() == "approved":
         return "Approved"
     if normalized.lower() == "changes requested":
