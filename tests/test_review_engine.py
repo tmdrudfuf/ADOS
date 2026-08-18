@@ -43,6 +43,24 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual("Approved", parse_review_decision("Approved."))
         self.assertEqual("Approved", parse_review_decision("Decision: Approved."))
 
+    def test_parse_decision_section_approved(self):
+        self.assertEqual("Approved", parse_review_decision("### Decision\n\nApproved"))
+
+    def test_parse_decision_section_markdown_approved(self):
+        self.assertEqual("Approved", parse_review_decision("### Decision\n\n**Approved**"))
+
+    def test_parse_decision_section_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("### Decision\n\nChanges Requested"))
+
+    def test_parse_decision_section_markdown_changes_requested(self):
+        self.assertEqual("Changes Requested", parse_review_decision("### Decision\n\n**Changes Requested**"))
+
+    def test_parse_decision_section_changes_requested_with_explanation(self):
+        self.assertEqual(
+            "Changes Requested",
+            parse_review_decision("### Decision\n\n**Changes Requested** — the candidate still writes during idle frames."),
+        )
+
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
@@ -118,6 +136,12 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual(
             "Unavailable",
             parse_review_decision("## Review: Approved\nDecision: Changes Requested"),
+        )
+
+    def test_conflicting_decision_section_is_unavailable(self):
+        self.assertEqual(
+            "Unavailable",
+            parse_review_decision("### Decision\n\nApproved\n\nDecision: Changes Requested"),
         )
 
     def test_review_engine_approved(self):

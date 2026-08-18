@@ -129,7 +129,13 @@ class ReviewEngine:
 
 def parse_review_decision(output: str) -> str:
     decisions: list[str] = []
-    for line in output.splitlines():
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if _is_decision_section_heading(line):
+            section_decision = _decision_from_section_value(_next_non_empty_line(lines, index + 1))
+            if section_decision in {"Approved", "Changes Requested"}:
+                decisions.append(section_decision)
+            continue
         normalized = _normalize_decision_line(line)
         if normalized in {"Approved", "Changes Requested"}:
             decisions.append(normalized)
@@ -138,6 +144,39 @@ def parse_review_decision(output: str) -> str:
     if len(unique_decisions) == 1:
         return decisions[0]
     return "Unavailable"
+
+
+def _next_non_empty_line(lines: list[str], start: int) -> str:
+    for line in lines[start:]:
+        if line.strip():
+            return line
+    return ""
+
+
+def _is_decision_section_heading(line: str) -> bool:
+    normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.lower() == "decision"
+
+
+def _decision_from_section_value(line: str) -> str:
+    normalized = _strip_decision_markup(line.strip())
+    normalized = _strip_markdown_emphasis(normalized)
+    normalized = _strip_edge_emphasis_markers(normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    match = re.match(
+        r"^(approved|changes requested)(?:\s*(?:[.!?:;]|--|—|-)\s*.*)?$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "Unavailable"
+    token = match.group(1).lower()
+    if token == "approved":
+        return "Approved"
+    return "Changes Requested"
 
 
 def _strip_decision_markup(value: str) -> str:
