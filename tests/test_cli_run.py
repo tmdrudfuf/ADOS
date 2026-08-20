@@ -643,6 +643,163 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("1", bootstrap_count)
         self.assertEqual("1", reviewer_count)
 
+    def test_validation_failure_adopts_clean_new_worktree_head_without_implementer(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('manual-fix.txt').exists():\n"
+                "    sys.exit(6)\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Manual validation recovery", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-manual-validation-recovery" / "ados-run.json"
+            failed_candidate = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))["candidate_sha"]
+            (worktree / "manual-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-fix.txt")
+            self.git(worktree, "commit", "-m", "manual validation recovery")
+            adopted_candidate = self.head(worktree)
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Manual validation recovery", None, fixture.config))
+
+            stages = [stage.id for stage in second.pipeline_result.stages]
+            adoption = second.pipeline_result.run_record.get("recoveryCandidateAdoption", {})
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("VALIDATION_FAILED", first.status)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertIn("recovery_candidate_adoption", stages)
+        self.assertNotIn("implementer_fix", stages)
+        self.assertEqual(adopted_candidate, second.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(adopted_candidate, second.pipeline_result.validation.head_after)
+        self.assertEqual(adopted_candidate, second.pipeline_result.review.reviewed_sha)
+        self.assertEqual(failed_candidate, adoption["previousFailedCandidateSha"])
+        self.assertEqual(adopted_candidate, adoption["adoptedCandidateSha"])
+        self.assertEqual(["manual-fix.txt"], adoption["adoptedChangedFiles"])
+        self.assertEqual(("manual-fix.txt",), second.pipeline_result.candidate.changed_files)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("1", reviewer_count)
+
+    def test_adopted_validation_recovery_candidate_can_fail_validation(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validator = fixture.root / "validator.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('never-present.txt').exists():\n"
+                "    sys.exit(6)\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Manual bad recovery", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            (worktree / "manual-still-bad.txt").write_text("still bad\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-still-bad.txt")
+            self.git(worktree, "commit", "-m", "manual bad recovery")
+            adopted_candidate = self.head(worktree)
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Manual bad recovery", None, fixture.config))
+
+            stages = [stage.id for stage in second.pipeline_result.stages]
+            adoption = second.pipeline_result.run_record.get("recoveryCandidateAdoption", {})
+            adopted_candidate_artifact = json.loads((worktree / ".agent-workflow" / "runs" / "001-manual-bad-recovery" / "candidate.json").read_text(encoding="utf-8"))
+            previous_candidate_artifact_exists = Path(adoption["previousCandidateArtifact"]).exists()
+            previous_validation_artifact_exists = Path(adoption["previousValidationArtifact"]).exists()
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("VALIDATION_FAILED", second.status)
+        self.assertIn("recovery_candidate_adoption", stages)
+        self.assertEqual(adopted_candidate, second.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(adopted_candidate, second.pipeline_result.validation.head_after)
+        self.assertEqual(["manual-still-bad.txt"], adopted_candidate_artifact["changed_files"])
+        self.assertTrue(previous_candidate_artifact_exists)
+        self.assertTrue(previous_validation_artifact_exists)
+        self.assertIsNone(second.pipeline_result.review)
+        self.assertEqual("1", implementer_count)
+
+    def test_validation_recovery_adoption_blocks_dirty_new_head(self):
+        with self.project(implementer_mode="count") as fixture:
+            validator = fixture.root / "validator.py"
+            validator.write_text("import sys\nsys.exit(6)\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty manual recovery", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            (worktree / "manual.txt").write_text("manual\n", encoding="utf-8")
+            self.git(worktree, "add", "manual.txt")
+            self.git(worktree, "commit", "-m", "manual recovery")
+            (worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty manual recovery", None, fixture.config))
+
+        self.assertEqual("VALIDATION_FAILED", second.status)
+        self.assertIn("RECOVERY_ADOPTION_WORKTREE_DIRTY", {violation.code for violation in second.pipeline_result.violations})
+
+    def test_validation_recovery_adoption_blocks_wrong_branch(self):
+        with self.project(implementer_mode="count") as fixture:
+            validator = fixture.root / "validator.py"
+            validator.write_text("import sys\nsys.exit(6)\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Wrong branch manual recovery", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-wrong-branch-manual-recovery" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            candidate_artifact = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))
+            validation_artifact = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+            (worktree / "manual.txt").write_text("manual\n", encoding="utf-8")
+            self.git(worktree, "add", "manual.txt")
+            self.git(worktree, "commit", "-m", "manual recovery")
+            self.git(worktree, "checkout", "-b", "unexpected-recovery-branch")
+
+            config = load_project_config(fixture.config)
+            adoption = RunPipeline(publisher=FakePublisher(fixture.repo))._adopt_validation_recovery_candidate(
+                config,
+                record_path,
+                record,
+                candidate_artifact,
+                validation_artifact,
+                [],
+            )
+
+        self.assertEqual("VALIDATION_FAILED", adoption.status)
+        self.assertIn("RECOVERY_ADOPTION_BRANCH_MISMATCH", {violation.code for violation in adoption.violations})
+
     def test_legacy_validation_failure_status_reports_artifact_commands(self):
         with self.project() as fixture:
             record_path, record = self.create_durable_run(fixture, "Legacy validation failure", 1, "VALIDATION_FAILED")
