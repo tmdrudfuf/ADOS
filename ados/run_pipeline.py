@@ -309,6 +309,12 @@ class RunPipeline:
                 return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("validation_resume", "BLOCKED", {})]), record, violations=resumable)
             _ensure_validation_failure_evidence(run_record_path, record, candidate_artifact, validation_artifact)
             record = _read_json(run_record_path) or record
+            adoption = self._adopt_validation_recovery_candidate(config, run_record_path, record, candidate_artifact, validation_artifact, stages)
+            if isinstance(adoption, PipelineOutcome):
+                return adoption
+            if adoption is not None:
+                record, candidate_artifact = adoption
+                stages.append(_stage("recovery_candidate_adoption", "PASS", {"candidate_sha": str(candidate_artifact.get("candidate_sha", ""))}))
 
         bootstrap = self._bootstrap(config, record, run_record_path)
         stages.append(_stage("bootstrap", "PASS" if all(item.exit_code == 0 for item in bootstrap) else "BLOCKED", {"commands": str(len(bootstrap))}))
@@ -432,6 +438,10 @@ class RunPipeline:
         except RepositoryProviderError as exc:
             return CandidatePreparationResult("BLOCKED", "", (), (_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
         changed = tuple(status.staged + status.dirty_tracked + status.untracked)
+        if not changed:
+            adopted_candidate = _adopted_candidate_from_record(record, status.head)
+            if adopted_candidate is not None:
+                return adopted_candidate
         if changed:
             add = _run(("git", "add", "-A"), worktree)
             if add.returncode != 0:
@@ -653,6 +663,117 @@ class RunPipeline:
             return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(canonical_record), candidate=candidate, cleanup=cleanup, violations=(_violation("LOCAL_BRANCH_DELETE_FAILED", "local no-change feature branch deletion failed", {"stderr": local_delete.stderr}),))
         _write_status(canonical_record, {**record, "noChangeArchive": str(archive)}, "NO_CHANGES")
         return PipelineOutcome("NO_CHANGES", tuple([*stages, _stage("cleanup", "PASS", {"archive": str(archive)})]), _read_json(canonical_record), candidate=candidate, cleanup=cleanup)
+
+    def _adopt_validation_recovery_candidate(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        candidate_artifact: Any,
+        validation_artifact: Any,
+        stages: list[PipelineStage],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | PipelineOutcome | None:
+        failed_candidate = _candidate_from_mapping(candidate_artifact)
+        validation = _validation_from_mapping(validation_artifact) if isinstance(validation_artifact, dict) else None
+        if failed_candidate is None or validation is None:
+            return None
+        required = ("featureWorktree", "featureBranch", "primaryRepository", "authoritativeBaseSha", "runId")
+        missing = [key for key in required if not isinstance(record.get(key), str) or not record.get(key)]
+        if missing:
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {})]),
+                record,
+                violations=tuple(_violation("RECOVERY_ADOPTION_RECORD_INVALID", "run record is missing required recovery adoption field", {"field": key}) for key in missing),
+            )
+
+        worktree = Path(record["featureWorktree"])
+        try:
+            status = self.git.status(worktree)
+            current_head = self.git.current_head(worktree)
+            branch = self.git.current_branch(worktree)
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+
+        if current_head == failed_candidate.candidate_sha:
+            return None
+        if branch != record["featureBranch"]:
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {"branch": branch})]),
+                record,
+                violations=(_violation("RECOVERY_ADOPTION_BRANCH_MISMATCH", "validation recovery candidate adoption requires the expected feature branch", {"expected": str(record["featureBranch"]), "actual": branch}),),
+            )
+        if status.staged or status.dirty_tracked or status.untracked:
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {})]),
+                record,
+                violations=(_violation("RECOVERY_ADOPTION_WORKTREE_DIRTY", "validation recovery candidate adoption requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),),
+            )
+
+        guardian = self.guardian.audit(
+            policy=config.execution_policy,
+            repository_path=Path(record["primaryRepository"]),
+            expected_repository_path=config.primary_repository_path,
+            expected_branch=config.default_branch,
+            allowed_local_paths=config.allowed_primary_local_paths,
+        )
+        if guardian.status == "BLOCK":
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {})]),
+                record,
+                violations=tuple(PipelineViolation(f"PRIMARY_{item.code}", item.message, item.evidence) for item in guardian.violations),
+            )
+
+        try:
+            if not self.git.is_ancestor(worktree, str(record["authoritativeBaseSha"]), current_head):
+                return PipelineOutcome(
+                    "VALIDATION_FAILED",
+                    tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    violations=(_violation("RECOVERY_ADOPTION_BASE_STALE", "recovery candidate does not descend from recorded authoritative base", {"base": str(record["authoritativeBaseSha"]), "current_head": current_head}),),
+                )
+            if not self.git.is_ancestor(worktree, failed_candidate.candidate_sha, current_head):
+                return PipelineOutcome(
+                    "VALIDATION_FAILED",
+                    tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    violations=(_violation("RECOVERY_ADOPTION_LINEAGE_MISMATCH", "recovery candidate does not descend from failed candidate", {"failed_candidate_sha": failed_candidate.candidate_sha, "current_head": current_head}),),
+                )
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("recovery_candidate_adoption", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+
+        changed_files = tuple(_git_output(worktree, "diff", "--name-only", f"{failed_candidate.candidate_sha}..{current_head}").splitlines())
+        candidate_archive = run_record_path.with_name(f"candidate-before-recovery-adoption-{failed_candidate.candidate_sha[:12]}.json")
+        validation_archive = run_record_path.with_name(f"validation-runtime-before-recovery-adoption-{failed_candidate.candidate_sha[:12]}.json")
+        _write_json(candidate_archive, candidate_artifact)
+        _write_json(validation_archive, validation_artifact)
+        adoption = {
+            "status": "ADOPTED",
+            "runId": str(record["runId"]),
+            "previousFailedCandidateSha": failed_candidate.candidate_sha,
+            "adoptedCandidateSha": current_head,
+            "adoptedChangedFiles": list(changed_files),
+            "featureBranch": str(record["featureBranch"]),
+            "featureWorktree": str(worktree),
+            "authoritativeBaseSha": str(record["authoritativeBaseSha"]),
+            "reason": "clean_new_head_on_expected_validation_recovery_worktree",
+            "previousValidationStatus": validation.status,
+            "previousCandidateArtifact": str(candidate_archive),
+            "previousValidationArtifact": str(validation_archive),
+        }
+        candidate = {"status": "COMMITTED", "candidate_sha": current_head, "changed_files": list(changed_files)}
+        _write_json(run_record_path.with_name("recovery-candidate-adoption.json"), adoption)
+        _write_json(run_record_path.with_name("candidate.json"), candidate)
+        updated = dict(record)
+        updated["status"] = "READY_FOR_VALIDATION"
+        updated["nextStage"] = "validation"
+        updated["recoveryCandidateAdoption"] = adoption
+        _clear_resolved_recovery_fields(updated, "READY_FOR_VALIDATION")
+        _write_json(run_record_path, updated)
+        return updated, candidate
 
     def _resume_publication(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome | None:
         candidate = _read_run_artifact(run_record_path, record, "candidate.json")
@@ -1230,6 +1351,18 @@ def _candidate_from_mapping(raw: Any) -> CandidatePreparationResult | None:
     if not candidate_sha:
         return None
     return CandidatePreparationResult(str(raw.get("status", "")), candidate_sha, tuple(str(item) for item in changed_files))
+
+
+def _adopted_candidate_from_record(record: dict[str, Any], current_head: str) -> CandidatePreparationResult | None:
+    adoption = record.get("recoveryCandidateAdoption")
+    if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
+        return None
+    if str(adoption.get("adoptedCandidateSha", "")) != current_head:
+        return None
+    changed_files = adoption.get("adoptedChangedFiles", [])
+    if not isinstance(changed_files, list):
+        return None
+    return CandidatePreparationResult("COMMITTED", current_head, tuple(str(item) for item in changed_files))
 
 
 def _review_from_mapping(raw: dict[str, Any]) -> ReviewResult:
