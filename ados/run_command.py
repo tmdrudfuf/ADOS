@@ -15,7 +15,7 @@ from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, 
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider
@@ -458,12 +458,12 @@ def _review_blocked_is_resumable(record_path: Path) -> bool:
     record = _read_mapping(record_path)
     candidate = _read_mapping(record_path.with_name("candidate.json"))
     validation = _read_mapping(record_path.with_name("validation-runtime.json"))
+    review = _read_mapping(record_path.with_name("review-runtime.json"))
     if _legacy_no_change_shape(record, candidate, validation):
         return True
-    return not transient_review_blocked_evidence(
-        candidate,
-        validation,
-        _read_mapping(record_path.with_name("review-runtime.json")),
+    return (
+        not transient_review_blocked_evidence(candidate, validation, review)
+        or not review_changes_requested_evidence(candidate, validation, review)
     )
 
 

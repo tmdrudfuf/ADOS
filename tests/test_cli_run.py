@@ -909,6 +909,128 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("2", reviewer_count)
         self.assertEqual(candidate_before, second.pipeline_result.review.reviewed_sha)
 
+    def test_review_changes_requested_block_adopts_clean_new_worktree_head_without_implementer(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validation_counter = fixture.root / "validation-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{validation_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Manual review recovery", 1)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            adopted_candidate = self.head(worktree)
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Manual review recovery", 1, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            adoption = result.pipeline_result.run_record.get("reviewChangesRecoveryAdoption", {})
+
+        self.assertEqual("REVIEW_BLOCKED", status.workflow.evidence["run_status"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", status.workflow.evidence["review_block_reason"])
+        self.assertEqual("False", status.workflow.evidence["review_block_transient"])
+        self.assertEqual("implementation_recovery", status.workflow.evidence["resume_stage"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("ADOPTED", adoption["status"])
+        self.assertEqual("SKIPPED", next(stage.status for stage in result.pipeline_result.stages if stage.id == "implementer"))
+        self.assertEqual(reviewed_candidate, adoption["previousReviewedCandidateSha"])
+        self.assertEqual(adopted_candidate, adoption["adoptedCandidateSha"])
+        self.assertEqual(["manual-review-fix.txt"], adoption["adoptedChangedFiles"])
+        self.assertEqual(adopted_candidate, result.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(adopted_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(adopted_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertIn("previousReviewArtifact", adoption)
+        self.assertFalse(implementer_counter.exists())
+        self.assertEqual(1, len(result.pipeline_result.validation.commands))
+        self.assertIn("validator.py", result.pipeline_result.validation.commands[0].command)
+        self.assertEqual("Approved", result.pipeline_result.review.decision)
+        self.assertEqual("Approved\n", result.pipeline_result.review.stdout)
+
+    def test_review_changes_requested_block_reruns_review_when_head_unchanged(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            _record_path, _record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Unchanged review recovery", 1)
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Unchanged review recovery", 1, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertNotIn("review_changes_recovery_adoption", stages)
+        self.assertIn("review", stages)
+        self.assertEqual(reviewed_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual("Approved", result.pipeline_result.review.decision)
+        self.assertEqual("Approved\n", result.pipeline_result.review.stdout)
+
+    def test_review_changes_requested_recovery_blocks_dirty_new_head(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Dirty review recovery", 1)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            (worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review recovery", 1, fixture.config))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_RESUME_WORKTREE_DIRTY", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_review_changes_requested_recovery_blocks_wrong_branch(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Wrong branch review recovery", 1)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            self.git(worktree, "checkout", "-b", "unexpected-review-recovery")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Wrong branch review recovery", 1, fixture.config))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
     def test_review_blocked_incomplete_output_without_structural_reason_does_not_resume(self):
         with self.project(implementer_mode="count") as fixture:
             validation_counter = fixture.root / "validation-count.txt"
@@ -1430,6 +1552,48 @@ class CliRunTests(unittest.TestCase):
         record_path.parent.mkdir(parents=True)
         record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
         return record_path, record
+
+    def create_review_changes_requested_blocked_run(self, fixture, feature, spec):
+        record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_BLOCKED")
+        worktree = Path(record["featureWorktree"])
+        spec_dir = worktree / "specs" / f"{record['specNumber']}-{record['featureSlug']}"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "spec.md").write_text(f"# {feature}\n", encoding="utf-8")
+        (worktree / "implementation.txt").write_text("implemented\n", encoding="utf-8")
+        self.git(worktree, "add", "specs", "implementation.txt")
+        self.git(worktree, "commit", "-m", f"spec {record['specNumber']}: {feature}")
+        candidate_sha = self.head(worktree)
+        record["status"] = "REVIEW_BLOCKED"
+        record["nextStage"] = "recovery"
+        record["reviewBlock"] = {
+            "status": "PASS",
+            "decision": "Changes Requested",
+            "reasonCode": "REVIEW_BLOCK_UNCLASSIFIED",
+            "reasonCodes": [],
+            "transient": False,
+            "resumeStage": "",
+            "reviewer": record["reviewer"],
+            "candidateSha": candidate_sha,
+            "validatedSha": candidate_sha,
+            "baseSha": record["authoritativeBaseSha"],
+            "reviewedSha": candidate_sha,
+            "exitCode": 0,
+            "timedOut": False,
+        }
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        record_path.with_name("candidate.json").write_text(
+            json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": [f"specs/{record['specNumber']}-{record['featureSlug']}/spec.md", "implementation.txt"]}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        record_path.with_name("validation-runtime.json").write_text(
+            json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        record_path.with_name("review-runtime.json").write_text(
+            json.dumps({"status": "PASS", "decision": "Changes Requested", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Changes Requested", "stderr": "", "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record_path, record, candidate_sha
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
