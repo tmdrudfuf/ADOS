@@ -1023,6 +1023,90 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(adopted_candidate, second.pipeline_result.review.reviewed_sha)
         self.assertEqual("Approved", second.pipeline_result.review.decision)
 
+    def test_review_changes_requested_resume_admission_survives_primary_base_drift(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Drifted base review recovery", 1)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            adopted_candidate = self.head(worktree)
+            (fixture.repo / "main-drift.txt").write_text("main moved\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "main-drift.txt")
+            self.git(fixture.repo, "commit", "-m", "advance main")
+            self.git(fixture.repo, "update-ref", "refs/remotes/origin/main", self.head(fixture.repo))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Drifted base review recovery", 1, fixture.config))
+            codes = self.codes(result)
+
+        self.assertEqual("REVIEW_BLOCKED", status.workflow.evidence["run_status"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", codes)
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", codes)
+        self.assertNotIn("WORKTREE_PATH_EXISTS", codes)
+        self.assertNotIn("CONFLICTING_WORKTREE", codes)
+        self.assertEqual(adopted_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(adopted_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual("Approved", result.pipeline_result.review.decision)
+        self.assertIn("PR_BASE_SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_non_resumable_review_block_with_primary_base_drift_still_conflicts(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Drifted base blocked recovery", 1)
+            record["reviewBlock"]["reasonCode"] = "REVIEW_DECISION_UNAVAILABLE"
+            record["reviewBlock"]["decision"] = "Unavailable"
+            record["reviewBlock"].pop("blockCause", None)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            (fixture.repo / "main-drift.txt").write_text("main moved\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "main-drift.txt")
+            self.git(fixture.repo, "commit", "-m", "advance main")
+            self.git(fixture.repo, "update-ref", "refs/remotes/origin/main", self.head(fixture.repo))
+
+            result = RunService().run(RunRequest(fixture.repo, "Drifted base blocked recovery", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+        self.assertIn("FEATURE_BRANCH_EXISTS", self.codes(result))
+        self.assertIn("WORKTREE_PATH_EXISTS", self.codes(result))
+        self.assertIn("CONFLICTING_WORKTREE", self.codes(result))
+
+    def test_same_base_run_id_mismatch_does_not_resume(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Mismatched run identity", 1)
+            record["runId"] = "different-run-id"
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService().run(RunRequest(fixture.repo, "Mismatched run identity", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_auto_spec_resume_admission_survives_primary_base_drift(self):
+        with self.project(specs=[1], implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Auto drifted base review recovery", None)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            (fixture.repo / "main-drift.txt").write_text("main moved\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "main-drift.txt")
+            self.git(fixture.repo, "commit", "-m", "advance main")
+            self.git(fixture.repo, "update-ref", "refs/remotes/origin/main", self.head(fixture.repo))
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Auto drifted base review recovery", None, fixture.config))
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("002", result.plan.spec_number)
+        self.assertEqual(record["runId"], result.run_record.run_id)
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertEqual("Approved", result.pipeline_result.review.decision)
+        self.assertIn("PR_BASE_SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+
     def test_review_changes_requested_block_reruns_review_when_head_unchanged(self):
         with self.project(implementer_mode="count") as fixture:
             reviewer_counter = fixture.root / "review-count.txt"
