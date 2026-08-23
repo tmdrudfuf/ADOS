@@ -369,7 +369,7 @@ class RunPipeline:
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
             side_effect_violations = _isolate_review_artifacts(Path(record["featureWorktree"]), run_record_path, record, review_scope, candidate_result.candidate_sha, review_artifact_snapshot)
             if side_effect_violations:
-                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result, block_violations=side_effect_violations, block_cause="review_side_effect")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=side_effect_violations)
             stages.append(_stage("review", review_result.decision, {"reviewed_sha": review_result.reviewed_sha, "round": str(round_number)}))
             if review_result.status != "PASS":
@@ -379,11 +379,11 @@ class RunPipeline:
                 _write_status(run_record_path, record, "REVIEW_APPROVED")
                 break
             if review_result.decision != "Changes Requested":
-                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result, block_violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),), block_cause="review_decision_unavailable")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
             if round_number == max_rounds:
-                _write_status(run_record_path, record, "REVIEW_CHANGES_REQUESTED")
-                return PipelineOutcome("REVIEW_CHANGES_REQUESTED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_MAX_ROUNDS_EXCEEDED", "review changes requested after max rounds", {"max_rounds": str(max_rounds)}),))
+                _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
+                return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_MAX_ROUNDS_EXCEEDED", "review changes requested after max rounds", {"max_rounds": str(max_rounds)}),))
             _write_status(run_record_path, record, "READY_FOR_IMPLEMENTATION")
             implementer_result = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
             record = implementer_result.run_record or _read_json(run_record_path)
@@ -804,7 +804,9 @@ class RunPipeline:
             return self._finalize_no_changes(config, run_record_path, record, [*stages, _stage("no_change_recovery", "PASS", {"candidate_sha": candidate.candidate_sha})], (), None, CandidatePreparationResult("NO_CHANGES", candidate.candidate_sha, candidate.changed_files))
         resumable = transient_review_blocked_evidence(candidate_raw, validation_raw, review_raw)
         if resumable:
-            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
+            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw)
+            if changes_requested_resume:
+                return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
 
         candidate = _candidate_from_mapping(candidate_raw)
         validation = _validation_from_mapping(validation_raw) if isinstance(validation_raw, dict) else None
@@ -823,6 +825,13 @@ class RunPipeline:
         if status.staged or status.dirty_tracked or status.untracked:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_WORKTREE_DIRTY", "review resume requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),))
         if current_head != candidate.candidate_sha:
+            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw)
+            if not changes_requested_resume:
+                adoption = self._adopt_review_changes_recovery_candidate(config, run_record_path, record, candidate_raw, validation_raw, review_raw, candidate, validation, current_head, branch, status, stages)
+                if isinstance(adoption, PipelineOutcome):
+                    return adoption
+                stages.append(_stage("review_changes_recovery_adoption", "PASS", {"candidate_sha": str(adoption.get("candidate_sha", ""))}))
+                return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {"current_head": current_head})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_SHA_MISMATCH", "review resume HEAD does not match validated candidate", {"current_head": current_head, "candidate_sha": candidate.candidate_sha}),))
 
         diff = _git_output(worktree, "diff", "--no-ext-diff", "--no-color", f"{record['authoritativeBaseSha']}..{candidate.candidate_sha}")
@@ -843,7 +852,7 @@ class RunPipeline:
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
         side_effect_violations = _isolate_review_artifacts(worktree, run_record_path, record, review_scope, candidate.candidate_sha, review_artifact_snapshot)
         if side_effect_violations:
-            _write_review_block_status(run_record_path, record, review, candidate, validation)
+            _write_review_block_status(run_record_path, record, review, candidate, validation, block_violations=side_effect_violations, block_cause="review_side_effect")
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=side_effect_violations)
         stages.append(_stage("review", review.decision, {"reviewed_sha": review.reviewed_sha, "resumed": "true"}))
         if review.status != "PASS":
@@ -853,7 +862,7 @@ class RunPipeline:
             _write_status(run_record_path, record, "READY_FOR_IMPLEMENTATION")
             return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
         if review.decision != "Approved":
-            _write_review_block_status(run_record_path, record, review, candidate, validation)
+            _write_review_block_status(run_record_path, record, review, candidate, validation, block_violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),), block_cause="review_decision_unavailable")
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
         _write_status(run_record_path, record, "REVIEW_APPROVED")
         exact = self.exact_head.verify(repository_path=worktree, approved_review_sha=review.reviewed_sha, validated_sha=validation.head_after)
@@ -861,6 +870,125 @@ class RunPipeline:
         if exact.status != "MATCH":
             return PipelineOutcome("EXACT_HEAD_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, exact_head_gate=exact.to_dict(), violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in exact.violations))
         return self._publish(config, run_record_path, record, stages, (), None, candidate, validation, review, exact.to_dict())
+
+    def _adopt_review_changes_recovery_candidate(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        candidate_artifact: Any,
+        validation_artifact: Any,
+        review_artifact: Any,
+        blocked_candidate: CandidatePreparationResult,
+        blocked_validation: ValidationResult,
+        current_head: str,
+        branch: str,
+        status: Any,
+        stages: list[PipelineStage],
+    ) -> dict[str, Any] | PipelineOutcome:
+        required = ("featureWorktree", "featureBranch", "primaryRepository", "authoritativeBaseSha", "runId")
+        missing = [key for key in required if not isinstance(record.get(key), str) or not record.get(key)]
+        if missing:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {})]),
+                record,
+                candidate=blocked_candidate,
+                validation=blocked_validation,
+                violations=tuple(_violation("REVIEW_RECOVERY_ADOPTION_RECORD_INVALID", "run record is missing required recovery adoption field", {"field": key}) for key in missing),
+            )
+
+        worktree = Path(record["featureWorktree"])
+        if branch != record["featureBranch"]:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {"branch": branch})]),
+                record,
+                candidate=blocked_candidate,
+                validation=blocked_validation,
+                violations=(_violation("REVIEW_RECOVERY_ADOPTION_BRANCH_MISMATCH", "review recovery candidate adoption requires the expected feature branch", {"expected": str(record["featureBranch"]), "actual": branch}),),
+            )
+        if status.staged or status.dirty_tracked or status.untracked:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {})]),
+                record,
+                candidate=blocked_candidate,
+                validation=blocked_validation,
+                violations=(_violation("REVIEW_RECOVERY_ADOPTION_WORKTREE_DIRTY", "review recovery candidate adoption requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),),
+            )
+
+        guardian = self.guardian.audit(
+            policy=config.execution_policy,
+            repository_path=Path(record["primaryRepository"]),
+            expected_repository_path=config.primary_repository_path,
+            expected_branch=config.default_branch,
+            allowed_local_paths=config.allowed_primary_local_paths,
+        )
+        if guardian.status == "BLOCK":
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {})]),
+                record,
+                candidate=blocked_candidate,
+                validation=blocked_validation,
+                violations=tuple(PipelineViolation(f"PRIMARY_{item.code}", item.message, item.evidence) for item in guardian.violations),
+            )
+
+        try:
+            if not self.git.is_ancestor(worktree, str(record["authoritativeBaseSha"]), current_head):
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    candidate=blocked_candidate,
+                    validation=blocked_validation,
+                    violations=(_violation("REVIEW_RECOVERY_ADOPTION_BASE_STALE", "review recovery candidate does not descend from recorded authoritative base", {"base": str(record["authoritativeBaseSha"]), "current_head": current_head}),),
+                )
+            if not self.git.is_ancestor(worktree, blocked_candidate.candidate_sha, current_head):
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    candidate=blocked_candidate,
+                    validation=blocked_validation,
+                    violations=(_violation("REVIEW_RECOVERY_ADOPTION_LINEAGE_MISMATCH", "review recovery candidate does not descend from reviewed candidate", {"reviewed_candidate_sha": blocked_candidate.candidate_sha, "current_head": current_head}),),
+                )
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_changes_recovery_adoption", "BLOCKED", {})]), record, candidate=blocked_candidate, validation=blocked_validation, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+
+        changed_files = tuple(_git_output(worktree, "diff", "--name-only", f"{blocked_candidate.candidate_sha}..{current_head}").splitlines())
+        candidate_archive = run_record_path.with_name(f"candidate-before-review-recovery-adoption-{blocked_candidate.candidate_sha[:12]}.json")
+        validation_archive = run_record_path.with_name(f"validation-runtime-before-review-recovery-adoption-{blocked_candidate.candidate_sha[:12]}.json")
+        review_archive = run_record_path.with_name(f"review-runtime-before-review-recovery-adoption-{blocked_candidate.candidate_sha[:12]}.json")
+        _write_json(candidate_archive, candidate_artifact)
+        _write_json(validation_archive, validation_artifact)
+        _write_json(review_archive, review_artifact)
+        adoption = {
+            "status": "ADOPTED",
+            "runId": str(record["runId"]),
+            "previousReviewedCandidateSha": blocked_candidate.candidate_sha,
+            "previousValidatedSha": blocked_validation.head_after,
+            "adoptedCandidateSha": current_head,
+            "adoptedChangedFiles": list(changed_files),
+            "featureBranch": str(record["featureBranch"]),
+            "featureWorktree": str(worktree),
+            "authoritativeBaseSha": str(record["authoritativeBaseSha"]),
+            "reason": "clean_new_head_after_changes_requested_review",
+            "previousCandidateArtifact": str(candidate_archive),
+            "previousValidationArtifact": str(validation_archive),
+            "previousReviewArtifact": str(review_archive),
+        }
+        candidate = {"status": "COMMITTED", "candidate_sha": current_head, "changed_files": list(changed_files)}
+        _write_json(run_record_path.with_name("review-changes-recovery-adoption.json"), adoption)
+        _write_json(run_record_path.with_name("candidate.json"), candidate)
+        updated = dict(record)
+        updated["status"] = "READY_FOR_VALIDATION"
+        updated["nextStage"] = "validation"
+        updated["reviewChangesRecoveryAdoption"] = adoption
+        _clear_resolved_recovery_fields(updated, "READY_FOR_VALIDATION")
+        _write_json(run_record_path, updated)
+        return candidate
 
 
 def _run(args: tuple[str, ...], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -1083,19 +1211,32 @@ def _read_run_artifact(run_record_path: Path, record: dict[str, Any], filename: 
     return _read_json(feature)
 
 
-def _write_review_block_status(path: Path, record: dict[str, Any], review: ReviewResult, candidate: CandidatePreparationResult, validation: ValidationResult) -> None:
+def _write_review_block_status(
+    path: Path,
+    record: dict[str, Any],
+    review: ReviewResult,
+    candidate: CandidatePreparationResult,
+    validation: ValidationResult,
+    *,
+    block_violations: tuple[PipelineViolation, ...] = (),
+    block_cause: str = "",
+) -> None:
     transient = _is_transient_review_block(review)
-    reason_code = _review_block_reason_code(review)
+    reason_code = _review_block_reason_code(review, block_violations)
+    changes_requested = reason_code == "REVIEW_CHANGES_REQUESTED"
+    reason_codes = [violation.code for violation in block_violations] if block_violations else [violation.code for violation in review.violations]
+    durable_cause = block_cause or ("review_decision" if changes_requested else "review_runtime")
     updated = dict(record)
     updated["status"] = "REVIEW_BLOCKED"
-    updated["nextStage"] = "review" if transient else "recovery"
+    updated["nextStage"] = "review" if transient else "implementation_recovery" if changes_requested else "recovery"
     updated["reviewBlock"] = {
         "status": review.status,
         "decision": review.decision,
         "reasonCode": reason_code,
-        "reasonCodes": [violation.code for violation in review.violations],
+        "reasonCodes": reason_codes,
+        "blockCause": durable_cause,
         "transient": transient,
-        "resumeStage": "review" if transient else "",
+        "resumeStage": "review" if transient else "implementation_recovery" if changes_requested else "",
         "reviewer": str(record.get("reviewer", "")),
         "candidateSha": candidate.candidate_sha,
         "validatedSha": validation.head_after,
@@ -1354,15 +1495,17 @@ def _candidate_from_mapping(raw: Any) -> CandidatePreparationResult | None:
 
 
 def _adopted_candidate_from_record(record: dict[str, Any], current_head: str) -> CandidatePreparationResult | None:
-    adoption = record.get("recoveryCandidateAdoption")
-    if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
-        return None
-    if str(adoption.get("adoptedCandidateSha", "")) != current_head:
-        return None
-    changed_files = adoption.get("adoptedChangedFiles", [])
-    if not isinstance(changed_files, list):
-        return None
-    return CandidatePreparationResult("COMMITTED", current_head, tuple(str(item) for item in changed_files))
+    for key in ("reviewChangesRecoveryAdoption", "recoveryCandidateAdoption"):
+        adoption = record.get(key)
+        if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
+            continue
+        if str(adoption.get("adoptedCandidateSha", "")) != current_head:
+            continue
+        changed_files = adoption.get("adoptedChangedFiles", [])
+        if not isinstance(changed_files, list):
+            continue
+        return CandidatePreparationResult("COMMITTED", current_head, tuple(str(item) for item in changed_files))
+    return None
 
 
 def _review_from_mapping(raw: dict[str, Any]) -> ReviewResult:
@@ -1427,6 +1570,73 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
     return ()
 
 
+def review_changes_requested_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    durable = _review_changes_requested_durable_block(record)
+    if durable:
+        return durable
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("REVIEW_CHANGES_RECOVERY_CANDIDATE_INVALID", "Changes Requested recovery requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_VALIDATION_MISSING", "Changes Requested recovery requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "PASS":
+        return (_violation("REVIEW_CHANGES_RECOVERY_VALIDATION_NOT_PASSED", "Changes Requested recovery requires previously passed validation", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_CHANGES_RECOVERY_VALIDATION_SHA_MISMATCH",
+                "Changes Requested recovery validation evidence does not match candidate",
+                {
+                    "candidate_sha": candidate_result.candidate_sha,
+                    "head_before": validation_result.head_before,
+                    "head_after": validation_result.head_after,
+                },
+            ),
+        )
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_REVIEW_EVIDENCE_MISSING", "Changes Requested recovery requires review evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "PASS" or review_result.decision != "Changes Requested":
+        return (
+            _violation(
+                "REVIEW_CHANGES_RECOVERY_REVIEW_STATE_INVALID",
+                "Changes Requested recovery requires a successful Changes Requested review",
+                {"status": review_result.status, "decision": review_result.decision},
+            ),
+        )
+    if review_result.reviewed_sha != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_CHANGES_RECOVERY_REVIEW_SHA_MISMATCH",
+                "Changes Requested recovery review evidence does not match candidate",
+                {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
+            ),
+        )
+    return ()
+
+
+def _review_changes_requested_durable_block(record: Any) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_RECORD_MISSING", "Changes Requested recovery requires durable run evidence", {}),)
+    if str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return (_violation("REVIEW_CHANGES_RECOVERY_STATUS_INVALID", "Changes Requested recovery requires REVIEW_BLOCKED durable state", {"status": str(record.get("status", ""))}),)
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_BLOCK_MISSING", "Changes Requested recovery requires review block evidence", {}),)
+    reason = str(block.get("reasonCode", ""))
+    cause = str(block.get("blockCause", ""))
+    if reason == "REVIEW_CHANGES_REQUESTED" and cause == "review_decision":
+        return ()
+    return (
+        _violation(
+            "REVIEW_CHANGES_RECOVERY_BLOCK_CAUSE_UNSAFE",
+            "Changes Requested recovery requires a durable review-decision block cause",
+            {"reasonCode": reason, "blockCause": cause},
+        ),
+    )
+
+
 def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[PipelineViolation, ...]:
     candidate_result = _candidate_from_mapping(candidate)
     if candidate_result is None or candidate_result.status != "COMMITTED":
@@ -1463,7 +1673,11 @@ def _is_transient_review_block(review: ReviewResult) -> bool:
     return False
 
 
-def _review_block_reason_code(review: ReviewResult) -> str:
+def _review_block_reason_code(review: ReviewResult, block_violations: tuple[PipelineViolation, ...] = ()) -> str:
+    if block_violations:
+        return block_violations[0].code
+    if review.status == "PASS" and review.decision == "Changes Requested":
+        return "REVIEW_CHANGES_REQUESTED"
     if _is_transient_review_block(review):
         codes = tuple(violation.code for violation in review.violations)
         return codes[0] if codes else "REVIEWER_UNAVAILABLE"

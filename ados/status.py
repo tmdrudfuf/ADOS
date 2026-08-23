@@ -13,7 +13,7 @@ from .git_provider import GitRepositoryProvider, MergedPullRequest
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import transient_review_blocked_evidence
+from .run_pipeline import review_changes_requested_evidence, transient_review_blocked_evidence
 from .worktree_classification import branch_spec_number, classify_worktree
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
 
@@ -398,10 +398,12 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
         _read_json_object(record_path.with_name("validation-runtime.json")),
     ):
         return True
-    return not transient_review_blocked_evidence(
-        _read_json_object(record_path.with_name("candidate.json")),
-        _read_json_object(record_path.with_name("validation-runtime.json")),
-        _read_json_object(record_path.with_name("review-runtime.json")),
+    candidate = _read_json_object(record_path.with_name("candidate.json"))
+    validation = _read_json_object(record_path.with_name("validation-runtime.json"))
+    review = _read_json_object(record_path.with_name("review-runtime.json"))
+    return (
+        not transient_review_blocked_evidence(candidate, validation, review)
+        or not review_changes_requested_evidence(_read_json_object(record_path), candidate, validation, review)
     )
 
 
@@ -431,10 +433,21 @@ def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[st
     block = record.get("reviewBlock")
     if isinstance(block, dict):
         reason = str(block.get("reasonCode", ""))
+        block_transient = str(block.get("transient", "False"))
+        resume_stage = str(block.get("resumeStage", ""))
+        candidate = _read_json_object(record_path.with_name("candidate.json"))
+        validation = _read_json_object(record_path.with_name("validation-runtime.json"))
+        review = _read_json_object(record_path.with_name("review-runtime.json"))
+        changes_requested_resumable = current_resumable and not review_changes_requested_evidence(record, candidate, validation, review)
+        if changes_requested_resumable:
+            if reason in {"", "REVIEW_BLOCK_UNCLASSIFIED"}:
+                reason = "REVIEW_CHANGES_REQUESTED"
+            if not resume_stage:
+                resume_stage = "implementation_recovery"
         return {
             "review_block_reason": reason,
-            "review_block_transient": str(current_resumable and not no_change_resumable),
-            "resume_stage": "no_changes" if no_change_resumable else "review" if current_resumable else "",
+            "review_block_transient": block_transient if current_resumable and not no_change_resumable else "False",
+            "resume_stage": "no_changes" if no_change_resumable else resume_stage if current_resumable else "",
         }
     review = _read_json_object(record_path.with_name("review-runtime.json"))
     if not isinstance(review, dict):
