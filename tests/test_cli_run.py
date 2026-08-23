@@ -940,6 +940,12 @@ class CliRunTests(unittest.TestCase):
             )
             record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Manual review recovery", 1)
             worktree = Path(record["featureWorktree"])
+            record["recoveryCandidateAdoption"] = {
+                "status": "ADOPTED",
+                "adoptedCandidateSha": reviewed_candidate,
+                "adoptedChangedFiles": ["stale-validation-recovery.txt"],
+            }
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
             (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
             self.git(worktree, "add", "manual-review-fix.txt")
             self.git(worktree, "commit", "-m", "manual review recovery")
@@ -963,6 +969,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(adopted_candidate, adoption["adoptedCandidateSha"])
         self.assertEqual(["manual-review-fix.txt"], adoption["adoptedChangedFiles"])
         self.assertEqual(adopted_candidate, result.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(("manual-review-fix.txt",), result.pipeline_result.candidate.changed_files)
         self.assertEqual(adopted_candidate, result.pipeline_result.validation.head_after)
         self.assertEqual(adopted_candidate, result.pipeline_result.review.reviewed_sha)
         self.assertIn("previousReviewArtifact", adoption)
@@ -971,6 +978,50 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("validator.py", result.pipeline_result.validation.commands[0].command)
         self.assertEqual("Approved", result.pipeline_result.review.decision)
         self.assertEqual("Approved\n", result.pipeline_result.review.stdout)
+
+    def test_review_changes_requested_block_from_max_rounds_is_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Changes Requested' if value == 0 else 'Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            config = json.loads(fixture.config.read_text(encoding="utf-8"))
+            config["execution_policy"]["review"]["max_rounds"] = 1
+            fixture.config.write_text(json.dumps(config), encoding="utf-8")
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Max round review recovery", 1, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-max-round-review-recovery" / "ados-run.json"
+            blocked_record = json.loads(record_path.read_text(encoding="utf-8"))
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            adopted_candidate = self.head(worktree)
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Max round review recovery", 1, fixture.config))
+            adoption = second.pipeline_result.run_record.get("reviewChangesRecoveryAdoption", {})
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", blocked_record["reviewBlock"]["reasonCode"])
+        self.assertEqual("review_decision", blocked_record["reviewBlock"]["blockCause"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual(adopted_candidate, adoption["adoptedCandidateSha"])
+        self.assertEqual(adopted_candidate, second.pipeline_result.validation.head_after)
+        self.assertEqual(adopted_candidate, second.pipeline_result.review.reviewed_sha)
+        self.assertEqual("Approved", second.pipeline_result.review.decision)
 
     def test_review_changes_requested_block_reruns_review_when_head_unchanged(self):
         with self.project(implementer_mode="count") as fixture:
@@ -1324,6 +1375,98 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("archived", generated_payload["artifacts"][0]["status"])
         self.assertEqual("Approved review evidence", generated_content)
 
+    def test_changes_requested_review_side_effect_reason_is_not_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Review side effect recovery", 1)
+            record["reviewBlock"]["reasonCode"] = "REVIEW_SIDE_EFFECT_UNEXPECTED"
+            record["reviewBlock"]["reasonCodes"] = ["REVIEW_SIDE_EFFECT_UNEXPECTED"]
+            record["reviewBlock"]["blockCause"] = "review_side_effect"
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Review side effect recovery", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("REVIEW_SIDE_EFFECT_UNEXPECTED", status.workflow.evidence["review_block_reason"])
+        self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_changes_requested_reason_without_explicit_cause_is_not_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Missing cause review recovery", 1)
+            record["reviewBlock"]["reasonCode"] = "REVIEW_CHANGES_REQUESTED"
+            record["reviewBlock"].pop("blockCause", None)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Missing cause review recovery", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", status.workflow.evidence["review_block_reason"])
+        self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_legacy_unclassified_changes_requested_block_is_not_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Legacy unclassified review recovery", 1)
+            record["reviewBlock"]["reasonCode"] = "REVIEW_BLOCK_UNCLASSIFIED"
+            record["reviewBlock"]["resumeStage"] = ""
+            record["reviewBlock"].pop("blockCause", None)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-review-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-review-fix.txt")
+            self.git(worktree, "commit", "-m", "manual review recovery")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy unclassified review recovery", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("REVIEW_BLOCK_UNCLASSIFIED", status.workflow.evidence["review_block_reason"])
+        self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_changes_requested_dirty_review_side_effect_is_not_resumable(self):
+        with self.project() as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "Path('review-side-effect.txt').write_text('dirty', encoding='utf-8')\n"
+                "print('Changes Requested')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review side effect", 1, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-dirty-review-side-effect" / "ados-run.json"
+            blocked_record = json.loads(record_path.read_text(encoding="utf-8"))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review side effect", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", blocked_record["reviewBlock"]["reasonCode"])
+        self.assertEqual("review_side_effect", blocked_record["reviewBlock"]["blockCause"])
+        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", second.status)
+        self.assertFalse(second.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+
     def test_cleanup_resume_retries_primary_update_before_complete(self):
         with self.project() as fixture:
             blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
@@ -1568,10 +1711,11 @@ class CliRunTests(unittest.TestCase):
         record["reviewBlock"] = {
             "status": "PASS",
             "decision": "Changes Requested",
-            "reasonCode": "REVIEW_BLOCK_UNCLASSIFIED",
+            "reasonCode": "REVIEW_CHANGES_REQUESTED",
             "reasonCodes": [],
+            "blockCause": "review_decision",
             "transient": False,
-            "resumeStage": "",
+            "resumeStage": "implementation_recovery",
             "reviewer": record["reviewer"],
             "candidateSha": candidate_sha,
             "validatedSha": candidate_sha,

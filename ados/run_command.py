@@ -463,7 +463,7 @@ def _review_blocked_is_resumable(record_path: Path) -> bool:
         return True
     return (
         not transient_review_blocked_evidence(candidate, validation, review)
-        or not review_changes_requested_evidence(candidate, validation, review)
+        or not review_changes_requested_evidence(record, candidate, validation, review)
     )
 
 
