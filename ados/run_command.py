@@ -248,7 +248,6 @@ class RunService:
                     and record.project_id == config.project_id
                     and Path(record.primary_repository).resolve() == project_path
                     and record.feature_slug == slug
-                    and (record.authoritative_base_sha == base_head or record.status in {"MERGED", "CLEANUP_INCOMPLETE"})
                     and record.execution_policy_version == config.execution_policy.schema_version
                 ):
                     matches.add(int(record.spec_number))
@@ -380,12 +379,11 @@ class RunService:
             return None
         cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE", "NO_CHANGES_CLEANUP_INCOMPLETE"}
         if (
-            (record.run_id != expected.run_id and not cleanup_resume)
+            (record.run_id != expected.run_id and record.authoritative_base_sha == expected.authoritative_base_sha and not cleanup_resume)
             or record.project_id != expected.project_id
             or Path(record.primary_repository).resolve() != Path(expected.primary_repository).resolve()
             or record.spec_number != expected.spec_number
             or record.feature_slug != expected.feature_slug
-            or (record.authoritative_base_sha != expected.authoritative_base_sha and not cleanup_resume)
             or record.feature_branch != expected.feature_branch
             or Path(record.feature_worktree).resolve() != Path(expected.feature_worktree).resolve()
             or record.execution_policy_version != expected.execution_policy_version
