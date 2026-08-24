@@ -24,6 +24,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertTrue(dataclasses.is_dataclass(policy))
         self.assertEqual("merge", policy.publication.merge_strategy)
         self.assertEqual(("git diff --check",), policy.validation.commands)
+        self.assertEqual(1_800_000, policy.validation.timeout_ms)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             policy.schema_version = "2"
 
@@ -49,6 +50,19 @@ class ExecutionPolicyTests(unittest.TestCase):
         policy = load_execution_policy("tests/fixtures/execution-policy.valid.json")
 
         self.assertEqual("1", policy.schema_version)
+
+    def test_validation_timeout_is_optional_and_positive_when_present(self):
+        raw = self.valid_mapping()
+        raw["execution_policy"]["validation"]["timeout_ms"] = 1234
+        policy = ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual(1234, policy.validation.timeout_ms)
+
+        raw["execution_policy"]["validation"]["timeout_ms"] = 0
+        with self.assertRaises(PolicyValidationError) as context:
+            ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual("POLICY_INVALID_VALIDATION_TIMEOUT_MS", context.exception.code)
 
 
 if __name__ == "__main__":

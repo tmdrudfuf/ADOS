@@ -555,6 +555,38 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("VALIDATION_FAILED", result.status)
         self.assertIsNone(result.pipeline_result.review)
 
+    def test_validation_timeout_persists_evidence_and_does_not_review(self):
+        with self.project() as fixture:
+            reviewer_marker = fixture.root / "review-ran.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                f"from pathlib import Path\nPath(r'{reviewer_marker}').write_text('reviewed', encoding='utf-8')\nprint('Approved')\n",
+                encoding="utf-8",
+            )
+            config = json.loads(fixture.config.read_text(encoding="utf-8"))
+            config["roles"]["reviewer"] = f'"{sys.executable}" "{reviewer}"'
+            config["execution_policy"]["review"]["reviewer"] = f'"{sys.executable}" "{reviewer}"'
+            config["execution_policy"]["validation"] = {
+                "commands": [f'"{sys.executable}" -c "import time; print(\'validation started\', flush=True); time.sleep(30)"'],
+                "timeout_ms": 200,
+            }
+            fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Validation timeout", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-validation-timeout" / "ados-run.json"
+            validation_artifact = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+            run_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIsNone(result.pipeline_result.review)
+        self.assertFalse(reviewer_marker.exists())
+        self.assertEqual("BLOCK", validation_artifact["status"])
+        self.assertTrue(validation_artifact["commands"][0]["timed_out"])
+        self.assertIn("validation started", validation_artifact["commands"][0]["stdout"])
+        self.assertEqual("VALIDATION_COMMAND_TIMED_OUT", validation_artifact["violations"][0]["code"])
+        self.assertEqual("VALIDATION_COMMAND_TIMED_OUT", run_record["validationFailure"]["failedCommands"][0]["reasonCode"])
+        self.assertEqual("validation-runtime.json", Path(run_record["validationFailure"]["artifact"]).name)
+
     def test_validation_failure_persists_evidence_and_resumes_implementation_recovery(self):
         with self.project() as fixture:
             implementer_counter = fixture.root / "implementer-count.txt"
