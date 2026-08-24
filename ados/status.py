@@ -403,7 +403,7 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
     review = _read_json_object(record_path.with_name("review-runtime.json"))
     return (
         not transient_review_blocked_evidence(candidate, validation, review)
-        or not review_changes_requested_evidence(_read_json_object(record_path), candidate, validation, review)
+        or not review_changes_requested_evidence(_read_json_object(record_path), candidate, validation, review, record_path)
     )
 
 
@@ -438,7 +438,7 @@ def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[st
         candidate = _read_json_object(record_path.with_name("candidate.json"))
         validation = _read_json_object(record_path.with_name("validation-runtime.json"))
         review = _read_json_object(record_path.with_name("review-runtime.json"))
-        changes_requested_resumable = current_resumable and not review_changes_requested_evidence(record, candidate, validation, review)
+        changes_requested_resumable = current_resumable and not review_changes_requested_evidence(record, candidate, validation, review, record_path)
         if changes_requested_resumable:
             if reason in {"", "REVIEW_BLOCK_UNCLASSIFIED"}:
                 reason = "REVIEW_CHANGES_REQUESTED"

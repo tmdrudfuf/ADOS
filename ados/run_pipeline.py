@@ -804,7 +804,7 @@ class RunPipeline:
             return self._finalize_no_changes(config, run_record_path, record, [*stages, _stage("no_change_recovery", "PASS", {"candidate_sha": candidate.candidate_sha})], (), None, CandidatePreparationResult("NO_CHANGES", candidate.candidate_sha, candidate.changed_files))
         resumable = transient_review_blocked_evidence(candidate_raw, validation_raw, review_raw)
         if resumable:
-            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw)
+            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
             if changes_requested_resume:
                 return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
 
@@ -825,7 +825,7 @@ class RunPipeline:
         if status.staged or status.dirty_tracked or status.untracked:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_WORKTREE_DIRTY", "review resume requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),))
         if current_head != candidate.candidate_sha:
-            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw)
+            changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
             if not changes_requested_resume:
                 adoption = self._adopt_review_changes_recovery_candidate(config, run_record_path, record, candidate_raw, validation_raw, review_raw, candidate, validation, current_head, branch, status, stages)
                 if isinstance(adoption, PipelineOutcome):
@@ -1570,8 +1570,8 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
     return ()
 
 
-def review_changes_requested_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
-    durable = _review_changes_requested_durable_block(record)
+def review_changes_requested_evidence(record: Any, candidate: Any, validation: Any, review: Any, record_path: Path | None = None) -> tuple[PipelineViolation, ...]:
+    durable = _review_changes_requested_durable_block(record, record_path)
     if durable:
         return durable
     candidate_result = _candidate_from_mapping(candidate)
@@ -1613,10 +1613,13 @@ def review_changes_requested_evidence(record: Any, candidate: Any, validation: A
                 {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
             ),
         )
+    block_sha = _review_changes_requested_block_sha_evidence(record, candidate_result, validation_result, review_result)
+    if block_sha:
+        return block_sha
     return ()
 
 
-def _review_changes_requested_durable_block(record: Any) -> tuple[PipelineViolation, ...]:
+def _review_changes_requested_durable_block(record: Any, record_path: Path | None = None) -> tuple[PipelineViolation, ...]:
     if not isinstance(record, dict):
         return (_violation("REVIEW_CHANGES_RECOVERY_RECORD_MISSING", "Changes Requested recovery requires durable run evidence", {}),)
     if str(record.get("status", "")) != "REVIEW_BLOCKED":
@@ -1628,6 +1631,28 @@ def _review_changes_requested_durable_block(record: Any) -> tuple[PipelineViolat
     cause = str(block.get("blockCause", ""))
     if reason == "REVIEW_CHANGES_REQUESTED" and cause == "review_decision":
         return ()
+    if _legacy_review_changes_requested_block(block):
+        if record_path is None:
+            return (_violation("REVIEW_CHANGES_RECOVERY_LEGACY_ARTIFACT_EVIDENCE_MISSING", "legacy Changes Requested recovery requires durable artifact path evidence", {}),)
+        generated = record_path.with_name("review-generated-artifacts.json")
+        artifacts = record_path.with_name("review-artifacts")
+        if generated.exists():
+            return (
+                _violation(
+                    "REVIEW_CHANGES_RECOVERY_LEGACY_REVIEW_ARTIFACTS_PRESENT",
+                    "legacy Changes Requested recovery is blocked by generated review artifact evidence",
+                    {"artifact": str(generated)},
+                ),
+            )
+        if artifacts.exists():
+            return (
+                _violation(
+                    "REVIEW_CHANGES_RECOVERY_LEGACY_REVIEW_ARTIFACTS_PRESENT",
+                    "legacy Changes Requested recovery is blocked by review artifact directory evidence",
+                    {"artifact": str(artifacts)},
+                ),
+            )
+        return ()
     return (
         _violation(
             "REVIEW_CHANGES_RECOVERY_BLOCK_CAUSE_UNSAFE",
@@ -1635,6 +1660,48 @@ def _review_changes_requested_durable_block(record: Any) -> tuple[PipelineViolat
             {"reasonCode": reason, "blockCause": cause},
         ),
     )
+
+
+def _legacy_review_changes_requested_block(block: dict[str, Any]) -> bool:
+    return (
+        str(block.get("status", "")) == "PASS"
+        and str(block.get("decision", "")) == "Changes Requested"
+        and str(block.get("reasonCode", "")) == "REVIEW_BLOCK_UNCLASSIFIED"
+        and str(block.get("blockCause", "")) == ""
+        and block.get("reasonCodes", []) == []
+        and str(block.get("exitCode", "0")) == "0"
+        and str(block.get("transient", "False")) == "False"
+    )
+
+
+def _review_changes_requested_block_sha_evidence(
+    record: Any,
+    candidate: CandidatePreparationResult,
+    validation: ValidationResult,
+    review: ReviewResult,
+) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict):
+        return ()
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return ()
+    mismatches: dict[str, str] = {}
+    candidate_sha = str(block.get("candidateSha", ""))
+    validated_sha = str(block.get("validatedSha", ""))
+    reviewed_sha = str(block.get("reviewedSha", ""))
+    if candidate_sha and candidate_sha != candidate.candidate_sha:
+        mismatches["candidateSha"] = candidate_sha
+    if validated_sha and validated_sha != validation.head_after:
+        mismatches["validatedSha"] = validated_sha
+    if reviewed_sha and reviewed_sha != review.reviewed_sha:
+        mismatches["reviewedSha"] = reviewed_sha
+    if mismatches:
+        evidence = dict(mismatches)
+        evidence["candidate_sha"] = candidate.candidate_sha
+        evidence["validated_sha"] = validation.head_after
+        evidence["reviewed_sha"] = review.reviewed_sha
+        return (_violation("REVIEW_CHANGES_RECOVERY_BLOCK_SHA_MISMATCH", "Changes Requested recovery review block SHA evidence does not match candidate artifacts", evidence),)
+    return ()
 
 
 def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[PipelineViolation, ...]:
