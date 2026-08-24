@@ -22,7 +22,7 @@ from .publication_engine import PublicationEngine, PublicationEvidence, Publicat
 from .repository_provider import RepositoryProviderError
 from .review_engine import ReviewEngine, ReviewRequest, ReviewResult, ReviewViolation
 from .validation_engine import ValidationCommandResult, ValidationEngine, ValidationResult, ValidationViolation
-from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
+from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult, WorktreeViolation
 
 
 UNSAFE_TOKENS = ("&", "|", ";", "<", ">", "`", "$(", "\n", "\r")
@@ -602,6 +602,89 @@ class RunPipeline:
             ),
         )
 
+    def _cleanup_resume_worktree(self, config: ProjectConfig, record: dict[str, Any]) -> WorktreeLifecycleResult:
+        if not config.execution_policy.cleanup.autonomous:
+            return WorktreeLifecycleResult(
+                "remove",
+                "BLOCK",
+                (
+                    WorktreeViolation(
+                        "CLEANUP_AUTONOMY_DISABLED",
+                        "execution policy does not allow autonomous cleanup",
+                        {"autonomous": str(config.execution_policy.cleanup.autonomous)},
+                    ),
+                ),
+                (),
+            )
+
+        provider = getattr(self.lifecycle, "provider", None)
+        if provider is None:
+            return self._cleanup(config, record)
+
+        primary = Path(record["primaryRepository"])
+        expected_path = Path(record["featureWorktree"]).resolve()
+        expected_branch = str(record["featureBranch"])
+        try:
+            records = provider.list_worktrees(primary)
+        except RepositoryProviderError as exc:
+            return WorktreeLifecycleResult(
+                "remove",
+                "BLOCK",
+                (WorktreeViolation(exc.code, exc.message, {"primary_repository_path": str(primary)}),),
+                (),
+            )
+
+        for worktree in records:
+            if worktree.path == expected_path:
+                if worktree.branch != expected_branch:
+                    return WorktreeLifecycleResult(
+                        "remove",
+                        "BLOCK",
+                        (
+                            WorktreeViolation(
+                                "WORKTREE_BRANCH_MISMATCH",
+                                "worktree branch does not match expected branch",
+                                {"expected": expected_branch, "actual": worktree.branch},
+                            ),
+                        ),
+                        (
+                            {"key": "worktree_path", "value": str(worktree.path)},
+                            {"key": "branch", "value": worktree.branch},
+                            {"key": "head", "value": worktree.head},
+                        ),
+                    )
+                return self._cleanup(config, record)
+
+        for worktree in records:
+            if worktree.branch == expected_branch:
+                return WorktreeLifecycleResult(
+                    "remove",
+                    "BLOCK",
+                    (
+                        WorktreeViolation(
+                            "WORKTREE_BRANCH_OWNED_BY_ANOTHER_WORKTREE",
+                            "expected feature branch is checked out by another worktree",
+                            {
+                                "expected_worktree_path": str(expected_path),
+                                "actual_worktree_path": str(worktree.path),
+                                "branch": expected_branch,
+                            },
+                        ),
+                    ),
+                    (),
+                )
+
+        return WorktreeLifecycleResult(
+            "remove",
+            "PASS",
+            (),
+            (
+                {"key": "worktree_path", "value": str(expected_path)},
+                {"key": "branch", "value": expected_branch},
+                {"key": "status", "value": "already_removed"},
+            ),
+        )
+
     def _resume_cleanup(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome:
         canonical_record = _canonical_run_record_path(Path(record["primaryRepository"]), record)
         existing_canonical = _read_json(canonical_record)
@@ -625,12 +708,11 @@ class RunPipeline:
             _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
             return PipelineOutcome("CLEANUP_INCOMPLETE", tuple([*stages, _stage("remote_branch_delete", "BLOCKED", {})]), _read_json(canonical_record), violations=(remote_delete,))
         cleanup: WorktreeLifecycleResult | None = None
-        if Path(record["featureWorktree"]).exists():
-            cleanup = self._cleanup(config, record)
-            stages.append(_stage("cleanup", cleanup.status, {}))
-            if cleanup.status != "PASS":
-                _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
-                return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(canonical_record), cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
+        cleanup = self._cleanup_resume_worktree(config, record)
+        stages.append(_stage("cleanup", cleanup.status, {}))
+        if cleanup.status != "PASS":
+            _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
+            return PipelineOutcome("CLEANUP_INCOMPLETE", tuple(stages), _read_json(canonical_record), cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
         local_delete = _run(("git", "branch", "-d", record["featureBranch"]), Path(record["primaryRepository"]))
         if local_delete.returncode != 0 and "not found" not in (local_delete.stderr + local_delete.stdout).lower():
             _write_status(canonical_record, record, "CLEANUP_INCOMPLETE")
