@@ -1102,13 +1102,14 @@ def _validation_failure_payload(path: Path, candidate: CandidatePreparationResul
     failed_commands = [
         {
             "command": command.command,
-            "exitCode": str(command.exit_code),
-            "reasonCode": "VALIDATION_COMMAND_FAILED",
+            "exitCode": "" if command.exit_code is None else str(command.exit_code),
+            "reasonCode": "VALIDATION_COMMAND_TIMED_OUT" if command.timed_out else "VALIDATION_COMMAND_FAILED",
             "stdout": _bounded(command.stdout),
             "stderr": _bounded(command.stderr),
+            "timedOut": str(command.timed_out).lower(),
         }
         for command in validation.commands
-        if command.exit_code != 0
+        if command.timed_out or command.exit_code != 0
     ]
     if validation.head_before != validation.head_after:
         failed_commands.append(
@@ -1549,9 +1550,10 @@ def _validation_from_mapping(raw: dict[str, Any]) -> ValidationResult:
     commands = tuple(
         ValidationCommandResult(
             command=str(item.get("command", "")),
-            exit_code=int(item.get("exit_code", 0)),
+            exit_code=_optional_int(item.get("exit_code")),
             stdout=str(item.get("stdout", "")),
             stderr=str(item.get("stderr", "")),
+            timed_out=bool(item.get("timed_out", item.get("timedOut", False))),
         )
         for item in raw.get("commands", [])
         if isinstance(item, dict)
@@ -1562,6 +1564,15 @@ def _validation_from_mapping(raw: dict[str, Any]) -> ValidationResult:
         if isinstance(item, dict)
     )
     return ValidationResult(str(raw.get("status", "")), str(raw.get("head_before", "")), str(raw.get("head_after", "")), commands, violations)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _candidate_from_mapping(raw: Any) -> CandidatePreparationResult | None:

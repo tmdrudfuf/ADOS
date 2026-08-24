@@ -48,6 +48,7 @@ class GuardianPolicy:
 @dataclass(frozen=True)
 class ValidationPolicy:
     commands: tuple[str, ...]
+    timeout_ms: int
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class ExecutionPolicy:
 
         validation = _require_mapping(root, "validation", "POLICY_MISSING_VALIDATION")
         commands = _require_string_sequence(validation, "commands", "POLICY_INVALID_VALIDATION_COMMANDS")
+        timeout_ms = _optional_positive_int(validation, "timeout_ms", "POLICY_INVALID_VALIDATION_TIMEOUT_MS", 1_800_000)
 
         return cls(
             schema_version=schema_version,
@@ -91,7 +93,7 @@ class ExecutionPolicy:
             review=ReviewPolicy(reviewer=reviewer, max_rounds=max_rounds),
             cleanup=CleanupPolicy(autonomous=autonomous),
             guardian=GuardianPolicy(stop_on_uncertain=stop_on_uncertain),
-            validation=ValidationPolicy(commands=tuple(commands)),
+            validation=ValidationPolicy(commands=tuple(commands), timeout_ms=timeout_ms),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +137,15 @@ def _require_positive_int(raw: Mapping[str, Any], key: str, code: str) -> int:
     value = raw.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise PolicyValidationError(code, f"{key} must be a positive integer")
+    return value
+
+
+def _optional_positive_int(raw: Mapping[str, Any], key: str, code: str, default: int) -> int:
+    value = raw.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise PolicyValidationError(code, f"{key} must be a positive integer when provided")
     return value
 
 
