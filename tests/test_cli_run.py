@@ -1390,6 +1390,84 @@ class CliRunTests(unittest.TestCase):
         self.assertFalse(worktree_exists_after_resume)
         self.assertIn("delete_remote", second_publisher.calls)
 
+    def test_cleanup_resume_treats_unregistered_expected_worktree_as_already_removed(self):
+        with self.project() as fixture:
+            failed_once = {"value": False}
+            original_run = run_pipeline._run
+
+            def fail_first_local_branch_delete(args, cwd):
+                if args[:3] == ("git", "branch", "-d") and not failed_once["value"]:
+                    failed_once["value"] = True
+                    return subprocess.CompletedProcess(args, 1, "", "synthetic branch delete interruption")
+                return original_run(args, cwd)
+
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_first_local_branch_delete):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry after removed worktree", None, fixture.config))
+            worktree_path = Path(first.plan.feature_worktree)
+            worktree_path.mkdir()
+            (worktree_path / "leftover.txt").write_text("not a registered git worktree\n", encoding="utf-8")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry after removed worktree", None, fixture.config))
+            branch_list = self.git(fixture.repo, "branch", "--list", "codex/001-retry-after-removed-worktree").stdout
+            worktrees = self.git(fixture.repo, "worktree", "list", "--porcelain").stdout
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertIn("LOCAL_BRANCH_DELETE_FAILED", {violation.code for violation in first.pipeline_result.violations})
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("", branch_list.strip())
+        self.assertNotIn(str(worktree_path), worktrees)
+
+    def test_cleanup_resume_blocks_when_expected_path_registered_to_another_branch(self):
+        with self.project() as fixture:
+            failed_once = {"value": False}
+            original_run = run_pipeline._run
+
+            def fail_first_local_branch_delete(args, cwd):
+                if args[:3] == ("git", "branch", "-d") and not failed_once["value"]:
+                    failed_once["value"] = True
+                    return subprocess.CompletedProcess(args, 1, "", "synthetic branch delete interruption")
+                return original_run(args, cwd)
+
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_first_local_branch_delete):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Path reused by other branch", None, fixture.config))
+            worktree_path = Path(first.plan.feature_worktree)
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/unrelated-cleanup-path", str(worktree_path), "HEAD")
+            try:
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Path reused by other branch", None, fixture.config))
+            finally:
+                self.git(fixture.repo, "worktree", "remove", str(worktree_path))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("CLEANUP_INCOMPLETE", second.status)
+        self.assertIn("WORKTREE_BRANCH_MISMATCH", {violation.code for violation in second.pipeline_result.violations})
+
+    def test_cleanup_resume_blocks_when_feature_branch_owned_by_another_worktree(self):
+        with self.project() as fixture:
+            failed_once = {"value": False}
+            original_run = run_pipeline._run
+
+            def fail_first_local_branch_delete(args, cwd):
+                if args[:3] == ("git", "branch", "-d") and not failed_once["value"]:
+                    failed_once["value"] = True
+                    return subprocess.CompletedProcess(args, 1, "", "synthetic branch delete interruption")
+                return original_run(args, cwd)
+
+            with mock.patch("ados.run_pipeline._run", side_effect=fail_first_local_branch_delete):
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Branch owned elsewhere", None, fixture.config))
+            other_worktree = fixture.root / "other-owner"
+            self.git(fixture.repo, "worktree", "add", str(other_worktree), "codex/001-branch-owned-elsewhere")
+            try:
+                second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Branch owned elsewhere", None, fixture.config))
+            finally:
+                self.git(fixture.repo, "worktree", "remove", str(other_worktree))
+
+        self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertFalse(second.resumed)
+        self.assertEqual("BLOCKED", second.status)
+        self.assertIn("CONFLICTING_WORKTREE", self.codes(second))
+
     def test_dry_run_still_has_zero_mutations_with_pipeline_available(self):
         with self.project() as fixture:
             before = self.snapshot(fixture.repo)
