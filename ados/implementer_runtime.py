@@ -355,6 +355,28 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                         f"  stderr: {command.get('stderr', '')}",
                     ]
                 )
+    implementation_failure = record.get("implementationFailure")
+    if isinstance(implementation_failure, dict):
+        lines.extend(
+            [
+                "",
+                "Implementation failure recovery context:",
+                f"Recovery stage: {implementation_failure.get('recoveryStage', 'implementation_recovery')}",
+                f"Previous status: {implementation_failure.get('status', '')}",
+                f"Exit code: {implementation_failure.get('exitCode', '')}",
+                f"Timed out: {implementation_failure.get('timedOut', '')}",
+                f"HEAD before implementer: {implementation_failure.get('headBefore', '')}",
+                f"HEAD after implementer: {implementation_failure.get('headAfter', '')}",
+                f"Changed files: {', '.join(implementation_failure.get('changedFiles', [])) if isinstance(implementation_failure.get('changedFiles'), list) else ''}",
+                "Previous stdout:",
+                str(implementation_failure.get("stdout", "")),
+                "Previous stderr:",
+                str(implementation_failure.get("stderr", "")),
+                "",
+                "Continue or repair the existing feature work in this same worktree and branch.",
+                "Do not discard partial legitimate work unless it is clearly wrong for this feature.",
+            ]
+        )
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(
