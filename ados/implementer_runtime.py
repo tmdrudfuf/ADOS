@@ -355,6 +355,22 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                         f"  stderr: {command.get('stderr', '')}",
                     ]
                 )
+    no_change_recovery = record.get("noChangeRecovery")
+    if isinstance(no_change_recovery, dict):
+        lines.extend(
+            [
+                "",
+                "NO_CHANGES recovery context:",
+                "Your previous NO_CHANGES result was independently rejected.",
+                f"Verifier decision: {no_change_recovery.get('verifierDecision', '')}",
+                f"Verifier SHA: {no_change_recovery.get('verifierSha', '')}",
+                "Missing seam evidence:",
+                str(no_change_recovery.get("verifierOutput", "")),
+                "",
+                "Implement the missing capability in this same feature worktree and branch.",
+                "Do not create another Spec, branch, worktree, PR, or merge.",
+            ]
+        )
     return "\n".join(lines)
 
 

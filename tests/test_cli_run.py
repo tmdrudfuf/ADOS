@@ -411,6 +411,9 @@ class CliRunTests(unittest.TestCase):
 
     def test_no_change_run_terminates_before_review_and_publication(self):
         with self.project(implementer_mode="no_change") as fixture:
+            verifier = fixture.root / "no-change-verifier.py"
+            verifier.write_text("print('NO_CHANGES_VERIFIED')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="no_change", reviewer=f'"{sys.executable}" "{verifier}"')
             publisher = FakePublisher(fixture.repo)
             before_head = self.head(fixture.repo)
             result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Already satisfied", None, fixture.config))
@@ -421,6 +424,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(before_head, after_head)
         self.assertIsNone(result.pipeline_result.validation)
         self.assertIsNone(result.pipeline_result.review)
+        self.assertEqual("NO_CHANGES_VERIFIED", result.pipeline_result.no_change_verification.decision)
         self.assertEqual([], publisher.calls)
         self.assertFalse(Path(result.plan.feature_worktree).exists())
         self.assertEqual("IDLE", status.status)
@@ -428,6 +432,9 @@ class CliRunTests(unittest.TestCase):
 
     def test_no_change_run_does_not_increment_latest_merged_spec(self):
         with self.project(specs=[91], implementer_mode="no_change") as fixture:
+            verifier = fixture.root / "no-change-verifier.py"
+            verifier.write_text("print('NO_CHANGES_VERIFIED')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="no_change", reviewer=f'"{sys.executable}" "{verifier}"')
             self.write_archive(fixture.repo, spec="091-previous", merge_commit=self.head(fixture.repo))
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "No merge evidence", 92, fixture.config))
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
@@ -435,6 +442,82 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("NO_CHANGES", result.status)
         self.assertEqual("091", status.spec.evidence["latest_merged_spec"])
         self.assertEqual("None", status.spec.evidence["active_spec"])
+
+    def test_false_no_changes_invokes_recovery_implementer_and_continues_pipeline(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            verifier = fixture.root / "verifier.py"
+            implementer = fixture.root / "implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "handoff = __import__('sys').stdin.read()\n"
+                "if 'NO_CHANGES recovery context:' in handoff:\n"
+                "    Path('feature.txt').write_text('implemented after verifier rejection', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            verifier.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{fixture.root / 'verifier-count.txt'}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('FEATURE_MISSING' if value == 0 else 'Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"', reviewer=f'"{sys.executable}" "{verifier}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "False no changes", None, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-false-no-changes" / "ados-run.json").read_text(encoding="utf-8"))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("no_change_verification", stages)
+        self.assertIn("no_change_recovery_implementer", stages)
+        self.assertEqual("2", implementer_count)
+        self.assertEqual("FEATURE_MISSING", record["noChangeAdjudicationAttempts"][0]["verifierDecision"])
+        self.assertEqual(result.pipeline_result.candidate.candidate_sha, result.pipeline_result.validation.head_after)
+        self.assertEqual(result.pipeline_result.candidate.candidate_sha, result.pipeline_result.review.reviewed_sha)
+
+    def test_no_change_verifier_ambiguous_blocks_without_publication(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            verifier = fixture.root / "ambiguous-verifier.py"
+            verifier.write_text("print('This might already exist')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="no_change", reviewer=f'"{sys.executable}" "{verifier}"')
+            publisher = FakePublisher(fixture.repo)
+
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Ambiguous no changes", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-ambiguous-no-changes" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("NO_CHANGES_AMBIGUOUS", result.status)
+        self.assertEqual([], publisher.calls)
+        self.assertEqual("NO_CHANGES_AMBIGUOUS", record["noChangeAdjudicationBlock"]["reasonCode"])
+
+    def test_repeated_false_no_changes_reaches_configured_bound(self):
+        with self.project(implementer_mode="no_change") as fixture:
+            verifier = fixture.root / "missing-verifier.py"
+            verifier.write_text("print('FEATURE_MISSING')\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="no_change",
+                reviewer=f'"{sys.executable}" "{verifier}"',
+                validation_max_recovery_rounds=1,
+            )
+            config = json.loads(fixture.config.read_text(encoding="utf-8"))
+            config["execution_policy"]["validation"]["max_no_change_recovery_rounds"] = 1
+            fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Repeated false no changes", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-repeated-false-no-changes" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("NO_CHANGES_AMBIGUOUS", result.status)
+        self.assertEqual(2, len(record["noChangeAdjudicationAttempts"]))
+        self.assertEqual("NO_CHANGE_RECOVERY_MAX_ROUNDS_EXCEEDED", record["noChangeAdjudicationBlock"]["reasonCode"])
 
     def test_existing_review_blocked_no_change_run_finalizes_without_review_or_pr(self):
         with self.project(implementer_mode="no_change") as fixture:
@@ -493,6 +576,9 @@ class CliRunTests(unittest.TestCase):
 
     def test_no_change_cleanup_resume_is_idempotent(self):
         with self.project(implementer_mode="no_change") as fixture:
+            verifier = fixture.root / "no-change-verifier.py"
+            verifier.write_text("print('NO_CHANGES_VERIFIED')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="no_change", reviewer=f'"{sys.executable}" "{verifier}"')
             lifecycle = FailingOnceLifecycle()
             service = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo), lifecycle=lifecycle), lifecycle=lifecycle)
             first = service.run(RunRequest(fixture.repo, "Cleanup retry no delta", 92, fixture.config))
@@ -997,6 +1083,75 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(final_candidate, result.pipeline_result.review.reviewed_sha)
         self.assertEqual(final_candidate, result.pipeline_result.exact_head_gate["current_head_sha"])
         self.assertNotEqual(completed_record["validationRecoveryAttempts"][0]["failedCandidateSha"], final_candidate)
+
+    def test_false_no_changes_validation_recovery_and_review_fix_compose_to_final_head(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "reviewer-count.txt"
+            implementer = fixture.root / "implementer-composed-recovery.py"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer-and-verifier.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "handoff = sys.stdin.read()\n"
+                "if value == 1:\n"
+                "    Path('implementation-after-no-change.txt').write_text('candidate B', encoding='utf-8')\n"
+                "elif value == 2:\n"
+                "    Path('validation-fix.txt').write_text('candidate C', encoding='utf-8')\n"
+                "elif value == 3:\n"
+                "    Path('review-fix.txt').write_text('candidate D', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('validation-fix.txt').exists():\n"
+                "    sys.exit(9)\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('FEATURE_MISSING')\n"
+                "elif value == 1:\n"
+                "    print('Changes Requested')\n"
+                "else:\n"
+                "    print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Composed no change recovery", None, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            final_candidate = result.pipeline_result.candidate.candidate_sha
+            completed_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-composed-no-change-recovery" / "ados-run.json").read_text(encoding="utf-8"))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("no_change_verification", stages)
+        self.assertIn("no_change_recovery_implementer", stages)
+        self.assertIn("validation_recovery_implementer", stages)
+        self.assertIn("implementer_fix", stages)
+        self.assertEqual("4", implementer_count)
+        self.assertEqual("3", reviewer_count)
+        self.assertEqual("FEATURE_MISSING", completed_record["noChangeAdjudicationAttempts"][0]["verifierDecision"])
+        self.assertEqual(final_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(final_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual(final_candidate, result.pipeline_result.exact_head_gate["current_head_sha"])
 
     def test_review_blocked_transient_failure_resumes_at_review_and_completes(self):
         with self.project(implementer_mode="count") as fixture:
