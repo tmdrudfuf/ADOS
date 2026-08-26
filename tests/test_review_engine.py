@@ -123,6 +123,18 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual("Changes Requested", parse_review_decision("Changes Requested."))
         self.assertEqual("Changes Requested", parse_review_decision("Review: Changes Requested."))
 
+    def test_parse_changes_requested_with_inline_explanation_suffix(self):
+        self.assertEqual(
+            "Changes Requested",
+            parse_review_decision("Changes Requested -- startExternalProjectAdosExecution lacks an in-flight guard."),
+        )
+
+    def test_parse_approved_with_inline_explanation_suffix(self):
+        self.assertEqual(
+            "Approved",
+            parse_review_decision("Approved -- no blocking issues found."),
+        )
+
     def test_unknown_output_is_unavailable(self):
         self.assertEqual("Unavailable", parse_review_decision("Looks fine"))
 
@@ -136,6 +148,12 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual(
             "Unavailable",
             parse_review_decision("## Review: Approved\nDecision: Changes Requested"),
+        )
+
+    def test_conflicting_inline_suffix_decisions_are_unavailable(self):
+        self.assertEqual(
+            "Unavailable",
+            parse_review_decision("Changes Requested -- blocking issue found.\nApproved -- no issues found."),
         )
 
     def test_conflicting_decision_section_is_unavailable(self):
