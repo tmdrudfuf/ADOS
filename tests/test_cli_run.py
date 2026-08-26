@@ -551,9 +551,18 @@ class CliRunTests(unittest.TestCase):
             config["execution_policy"]["validation"]["commands"] = ["python -c \"import sys; sys.exit(4)\""]
             fixture.config.write_text(json.dumps(config), encoding="utf-8")
             result = RunService().run(RunRequest(fixture.repo, "Validation fails", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-validation-fails" / "ados-run.json"
+            run_record = json.loads(record_path.read_text(encoding="utf-8"))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
 
         self.assertEqual("VALIDATION_FAILED", result.status)
         self.assertIsNone(result.pipeline_result.review)
+        self.assertIn("VALIDATION_RECOVERY_NO_CHANGES", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual("human_intervention", run_record["nextStage"])
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", run_record["validationRecoveryBlock"]["reasonCode"])
+        self.assertEqual(1, len(run_record["validationRecoveryAttempts"]))
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", status.workflow.evidence["validation_recovery_block_reason"])
 
     def test_validation_timeout_persists_evidence_and_does_not_review(self):
         with self.project() as fixture:
@@ -587,7 +596,50 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("VALIDATION_COMMAND_TIMED_OUT", run_record["validationFailure"]["failedCommands"][0]["reasonCode"])
         self.assertEqual("validation-runtime.json", Path(run_record["validationFailure"]["artifact"]).name)
 
-    def test_validation_failure_persists_evidence_and_resumes_implementation_recovery(self):
+    def test_validation_recovery_reaches_configured_maximum_and_blocks_review(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_marker = fixture.root / "review-ran.txt"
+            implementer = fixture.root / "implementer-new-candidate.py"
+            validator = fixture.root / "validator-always-fails.py"
+            reviewer = fixture.root / "reviewer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path(f'candidate-{value + 1}.txt').write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            reviewer.write_text(
+                f"from pathlib import Path\nPath(r'{reviewer_marker}').write_text('reviewed', encoding='utf-8')\nprint('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+                validation_max_recovery_rounds=2,
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Bounded validation recovery", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-bounded-validation-recovery" / "ados-run.json"
+            run_record = json.loads(record_path.read_text(encoding="utf-8"))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_ran = reviewer_marker.exists()
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIsNone(result.pipeline_result.review)
+        self.assertFalse(reviewer_ran)
+        self.assertEqual("3", implementer_count)
+        self.assertEqual(2, len(run_record["validationRecoveryAttempts"]))
+        self.assertEqual("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", run_record["validationRecoveryBlock"]["reasonCode"])
+        self.assertIn("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in result.pipeline_result.violations})
+
+    def test_validation_failure_invokes_automatic_recovery_before_review(self):
         with self.project() as fixture:
             implementer_counter = fixture.root / "implementer-count.txt"
             bootstrap_counter = fixture.root / "bootstrap-count.txt"
@@ -642,35 +694,26 @@ class CliRunTests(unittest.TestCase):
                 validation_commands=[f'"{sys.executable}" "{validator}"'],
             )
             first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Validation recovery", None, fixture.config))
-            worktree = Path(first.run_record.feature_worktree)
-            record_path = worktree / ".agent-workflow" / "runs" / "001-validation-recovery" / "ados-run.json"
-            failed_record = json.loads(record_path.read_text(encoding="utf-8"))
-            failed_validation = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
-            candidate_before = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))["candidate_sha"]
-            status_after_failure = StatusService().run(StatusRequest(fixture.repo, fixture.config))
-            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Validation recovery", None, fixture.config))
             completed_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-validation-recovery" / "ados-run.json").read_text(encoding="utf-8"))
-            candidate_after = second.pipeline_result.candidate.candidate_sha
+            candidate_after = first.pipeline_result.candidate.candidate_sha
+            recovery_attempt = completed_record["validationRecoveryAttempts"][0]
             implementer_count = implementer_counter.read_text(encoding="utf-8")
             bootstrap_count = bootstrap_counter.read_text(encoding="utf-8")
             reviewer_count = reviewer_counter.read_text(encoding="utf-8")
 
-        self.assertEqual("VALIDATION_FAILED", first.status)
-        self.assertEqual("implementation_recovery", failed_record["nextStage"])
-        self.assertEqual(candidate_before, failed_record["validationFailure"]["candidateSha"])
-        self.assertEqual(candidate_before, failed_validation["head_before"])
-        self.assertEqual(candidate_before, failed_validation["head_after"])
-        self.assertEqual("VALIDATION_COMMAND_FAILED", failed_record["validationFailure"]["failedCommands"][0]["reasonCode"])
-        self.assertEqual("6", failed_record["validationFailure"]["failedCommands"][0]["exitCode"])
-        self.assertIn("validator stdout", failed_record["validationFailure"]["failedCommands"][0]["stdout"])
-        self.assertIn("validator stderr", failed_record["validationFailure"]["failedCommands"][0]["stderr"])
-        self.assertEqual("implementation_recovery", status_after_failure.workflow.evidence["resume_stage"])
-        self.assertEqual(candidate_before, status_after_failure.workflow.evidence["candidate_sha"])
-        self.assertIn("validator.py", status_after_failure.workflow.evidence["failed_validation_commands"])
-        self.assertTrue(second.resumed)
-        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("COMPLETE", first.status)
         self.assertNotIn("validationFailure", completed_record)
-        self.assertNotEqual(candidate_before, candidate_after)
+        self.assertEqual("RECOVERY_CANDIDATE_RECORDED", recovery_attempt["status"])
+        self.assertEqual("BLOCK", recovery_attempt["failedValidationStatus"])
+        self.assertEqual(["VALIDATION_COMMAND_FAILED"], recovery_attempt["failedCommandCodes"])
+        self.assertEqual("VALIDATION_COMMAND_FAILED", recovery_attempt["failedCommands"][0]["reasonCode"])
+        self.assertIn("validator stdout", recovery_attempt["failedCommands"][0]["stdout"])
+        self.assertIn("validator stderr", recovery_attempt["failedCommands"][0]["stderr"])
+        self.assertNotEqual(recovery_attempt["failedCandidateSha"], candidate_after)
+        self.assertEqual(candidate_after, recovery_attempt["recoveryCandidateSha"])
+        self.assertIn("validation_recovery_implementer", [stage.id for stage in first.pipeline_result.stages])
+        self.assertEqual(candidate_after, first.pipeline_result.validation.head_after)
+        self.assertEqual(candidate_after, first.pipeline_result.review.reviewed_sha)
         self.assertEqual("2", implementer_count)
         self.assertEqual("1", bootstrap_count)
         self.assertEqual("1", reviewer_count)
@@ -730,7 +773,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(adopted_candidate, adoption["adoptedCandidateSha"])
         self.assertEqual(["manual-fix.txt"], adoption["adoptedChangedFiles"])
         self.assertEqual(("manual-fix.txt",), second.pipeline_result.candidate.changed_files)
-        self.assertEqual("1", implementer_count)
+        self.assertEqual("2", implementer_count)
         self.assertEqual("1", reviewer_count)
 
     def test_adopted_validation_recovery_candidate_can_fail_validation(self):
@@ -774,7 +817,7 @@ class CliRunTests(unittest.TestCase):
         self.assertTrue(previous_candidate_artifact_exists)
         self.assertTrue(previous_validation_artifact_exists)
         self.assertIsNone(second.pipeline_result.review)
-        self.assertEqual("1", implementer_count)
+        self.assertEqual("3", implementer_count)
 
     def test_validation_recovery_adoption_blocks_dirty_new_head(self):
         with self.project(implementer_mode="count") as fixture:
@@ -894,6 +937,66 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("COMPLETE", result.status)
         self.assertEqual("2", review_count)
         self.assertIn("implementer_fix", [stage.id for stage in result.pipeline_result.stages])
+
+    def test_validation_recovery_then_review_changes_requested_uses_final_exact_head(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            implementer = fixture.root / "implementer-validation-then-review.py"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    Path('implementation.txt').write_text('implemented', encoding='utf-8')\n"
+                "elif value == 1:\n"
+                "    Path('validation-fix.txt').write_text('fixed validation', encoding='utf-8')\n"
+                "else:\n"
+                "    Path('review-fix.txt').write_text('fixed review', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('validation-fix.txt').exists():\n"
+                "    sys.exit(8)\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Changes Requested' if value == 0 else 'Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Validation and review recovery", None, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            final_candidate = result.pipeline_result.candidate.candidate_sha
+            completed_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-validation-and-review-recovery" / "ados-run.json").read_text(encoding="utf-8"))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("validation_recovery_implementer", stages)
+        self.assertIn("implementer_fix", stages)
+        self.assertEqual("3", implementer_count)
+        self.assertEqual("2", reviewer_count)
+        self.assertEqual(final_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(final_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual(final_candidate, result.pipeline_result.exact_head_gate["current_head_sha"])
+        self.assertNotEqual(completed_record["validationRecoveryAttempts"][0]["failedCandidateSha"], final_candidate)
 
     def test_review_blocked_transient_failure_resumes_at_review_and_completes(self):
         with self.project(implementer_mode="count") as fixture:
@@ -1900,7 +2003,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -1946,6 +2049,8 @@ class CliRunTests(unittest.TestCase):
                 "validation": {"commands": list(validation_commands or ["git diff --check"])},
             },
         }
+        if validation_max_recovery_rounds is not None:
+            config["execution_policy"]["validation"]["max_recovery_rounds"] = validation_max_recovery_rounds
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config), encoding="utf-8")
         return path

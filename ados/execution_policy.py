@@ -49,6 +49,7 @@ class GuardianPolicy:
 class ValidationPolicy:
     commands: tuple[str, ...]
     timeout_ms: int
+    max_recovery_rounds: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ class ExecutionPolicy:
         validation = _require_mapping(root, "validation", "POLICY_MISSING_VALIDATION")
         commands = _require_string_sequence(validation, "commands", "POLICY_INVALID_VALIDATION_COMMANDS")
         timeout_ms = _optional_positive_int(validation, "timeout_ms", "POLICY_INVALID_VALIDATION_TIMEOUT_MS", 1_800_000)
+        max_recovery_rounds = _optional_positive_int(validation, "max_recovery_rounds", "POLICY_INVALID_VALIDATION_MAX_RECOVERY_ROUNDS", 3)
 
         return cls(
             schema_version=schema_version,
@@ -93,7 +95,7 @@ class ExecutionPolicy:
             review=ReviewPolicy(reviewer=reviewer, max_rounds=max_rounds),
             cleanup=CleanupPolicy(autonomous=autonomous),
             guardian=GuardianPolicy(stop_on_uncertain=stop_on_uncertain),
-            validation=ValidationPolicy(commands=tuple(commands), timeout_ms=timeout_ms),
+            validation=ValidationPolicy(commands=tuple(commands), timeout_ms=timeout_ms, max_recovery_rounds=max_recovery_rounds),
         )
 
     def to_dict(self) -> dict[str, Any]:
