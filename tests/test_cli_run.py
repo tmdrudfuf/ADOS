@@ -1999,6 +1999,101 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertFalse(result.resumed)
 
+    def test_parser_failed_changes_requested_output_is_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Parser failed review recovery", 1)
+            record["reviewBlock"].update(
+                {
+                    "status": "BLOCK",
+                    "decision": "Unavailable",
+                    "reasonCode": "REVIEW_DECISION_UNAVAILABLE",
+                    "reasonCodes": ["REVIEW_DECISION_UNAVAILABLE"],
+                    "blockCause": "review_runtime",
+                    "resumeStage": "",
+                }
+            )
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "BLOCK",
+                        "decision": "Unavailable",
+                        "reviewed_sha": reviewed_candidate,
+                        "exit_code": 0,
+                        "stdout": "Changes Requested -- the candidate needs a recovery fix.",
+                        "stderr": "",
+                        "violations": [{"code": "REVIEW_DECISION_UNAVAILABLE", "message": "reviewer output did not contain a supported decision", "evidence": {}}],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-parser-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-parser-fix.txt")
+            self.git(worktree, "commit", "-m", "manual parser recovery")
+            adopted_candidate = self.head(worktree)
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Parser failed review recovery", 1, fixture.config))
+            codes = self.codes(result)
+
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("REVIEW_DECISION_UNAVAILABLE", status.workflow.evidence["review_block_reason"])
+        self.assertEqual("implementation_recovery", status.workflow.evidence["resume_stage"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", codes)
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", codes)
+        self.assertNotIn("WORKTREE_PATH_EXISTS", codes)
+        self.assertNotIn("CONFLICTING_WORKTREE", codes)
+        self.assertEqual(reviewed_candidate, result.pipeline_result.run_record["reviewChangesRecoveryAdoption"]["previousReviewedCandidateSha"])
+        self.assertEqual(adopted_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(adopted_candidate, result.pipeline_result.review.reviewed_sha)
+
+    def test_parser_failed_ambiguous_output_is_not_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Parser ambiguous review recovery", 1)
+            record["reviewBlock"].update(
+                {
+                    "status": "BLOCK",
+                    "decision": "Unavailable",
+                    "reasonCode": "REVIEW_DECISION_UNAVAILABLE",
+                    "reasonCodes": ["REVIEW_DECISION_UNAVAILABLE"],
+                    "blockCause": "review_runtime",
+                    "resumeStage": "",
+                }
+            )
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "BLOCK",
+                        "decision": "Unavailable",
+                        "reviewed_sha": reviewed_candidate,
+                        "exit_code": 0,
+                        "stdout": "The previous review was Approved, but this candidate has blockers.",
+                        "stderr": "",
+                        "violations": [{"code": "REVIEW_DECISION_UNAVAILABLE", "message": "reviewer output did not contain a supported decision", "evidence": {}}],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual-parser-fix.txt").write_text("fixed\n", encoding="utf-8")
+            self.git(worktree, "add", "manual-parser-fix.txt")
+            self.git(worktree, "commit", "-m", "manual parser recovery")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Parser ambiguous review recovery", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
     def test_changes_requested_dirty_review_side_effect_is_not_resumable(self):
         with self.project() as fixture:
             reviewer = fixture.root / "reviewer.py"

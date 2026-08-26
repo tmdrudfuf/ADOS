@@ -21,7 +21,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
 from .publication_engine import PublicationEngine, PublicationEvidence, PublicationGateResult
 from .repository_provider import RepositoryProviderError
-from .review_engine import ReviewEngine, ReviewRequest, ReviewResult, ReviewViolation
+from .review_engine import ReviewEngine, ReviewRequest, ReviewResult, ReviewViolation, parse_review_decision
 from .validation_engine import ValidationCommandResult, ValidationEngine, ValidationResult, ValidationViolation
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult, WorktreeViolation
 
@@ -1991,9 +1991,8 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
 
 
 def review_changes_requested_evidence(record: Any, candidate: Any, validation: Any, review: Any, record_path: Path | None = None) -> tuple[PipelineViolation, ...]:
-    durable = _review_changes_requested_durable_block(record, record_path)
-    if durable:
-        return durable
+    if not isinstance(record, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_RECORD_MISSING", "Changes Requested recovery requires durable run evidence", {}),)
     candidate_result = _candidate_from_mapping(candidate)
     if candidate_result is None or candidate_result.status != "COMMITTED":
         return (_violation("REVIEW_CHANGES_RECOVERY_CANDIDATE_INVALID", "Changes Requested recovery requires committed candidate evidence", {}),)
@@ -2016,6 +2015,12 @@ def review_changes_requested_evidence(record: Any, candidate: Any, validation: A
         )
     if not isinstance(review, dict):
         return (_violation("REVIEW_CHANGES_RECOVERY_REVIEW_EVIDENCE_MISSING", "Changes Requested recovery requires review evidence", {}),)
+    parser_failed = _parser_failed_changes_requested_evidence(record, candidate_result, validation_result, review, record_path)
+    if not parser_failed:
+        return ()
+    durable = _review_changes_requested_durable_block(record, record_path)
+    if durable:
+        return durable
     review_result = _review_from_mapping(review)
     if review_result.status != "PASS" or review_result.decision != "Changes Requested":
         return (
@@ -2037,6 +2042,49 @@ def review_changes_requested_evidence(record: Any, candidate: Any, validation: A
     if block_sha:
         return block_sha
     return ()
+
+
+def _parser_failed_changes_requested_evidence(
+    record: Any,
+    candidate: CandidatePreparationResult,
+    validation: ValidationResult,
+    review: Any,
+    record_path: Path | None = None,
+) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_RECORD_MISSING", "Changes Requested recovery requires durable run evidence", {}),)
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_REVIEW_EVIDENCE_MISSING", "Changes Requested recovery requires review evidence", {}),)
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_CHANGES_RECOVERY_BLOCK_MISSING", "Changes Requested recovery requires review block evidence", {}),)
+    if str(block.get("reasonCode", "")) != "REVIEW_DECISION_UNAVAILABLE":
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REASON_MISMATCH", "parser-failed Changes Requested recovery requires REVIEW_DECISION_UNAVAILABLE", {}),)
+    if str(block.get("decision", "")) != "Unavailable" or str(block.get("status", "")) != "BLOCK":
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_BLOCK_STATE_INVALID", "parser-failed Changes Requested recovery requires unavailable blocked durable state", {}),)
+    if str(block.get("blockCause", "")) not in {"", "review_runtime", "review_decision_unavailable"}:
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_CAUSE_UNSAFE", "parser-failed Changes Requested recovery requires parser decision block cause", {"blockCause": str(block.get("blockCause", ""))}),)
+    if block.get("reasonCodes", []) not in ([], ["REVIEW_DECISION_UNAVAILABLE"]):
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REASON_CODES_UNSAFE", "parser-failed Changes Requested recovery requires only decision-unavailable reason codes", {}),)
+    if str(block.get("exitCode", "0")) != "0" or str(block.get("transient", "False")) != "False" or str(block.get("timedOut", "False")) != "False":
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_PROCESS_UNSAFE", "parser-failed Changes Requested recovery requires successful non-transient reviewer process evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "BLOCK" or review_result.decision != "Unavailable":
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REVIEW_STATE_INVALID", "parser-failed Changes Requested recovery requires unavailable blocked review evidence", {"status": review_result.status, "decision": review_result.decision}),)
+    if review_result.exit_code != 0 or review_result.stderr or review_result.reviewed_sha != candidate.candidate_sha:
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REVIEW_PROCESS_UNSAFE", "parser-failed Changes Requested recovery requires successful matching review evidence", {"reviewed_sha": review_result.reviewed_sha, "candidate_sha": candidate.candidate_sha}),)
+    codes = tuple(violation.code for violation in review_result.violations)
+    if codes != ("REVIEW_DECISION_UNAVAILABLE",):
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REVIEW_CODES_UNSAFE", "parser-failed Changes Requested recovery requires only REVIEW_DECISION_UNAVAILABLE review violation", {"codes": ",".join(codes)}),)
+    if parse_review_decision(review_result.stdout) != "Changes Requested":
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_DECISION_UNPROVEN", "current parser does not classify the historical review output as Changes Requested", {}),)
+    if record_path is None:
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_ARTIFACT_EVIDENCE_MISSING", "parser-failed Changes Requested recovery requires durable artifact path evidence", {}),)
+    generated = record_path.with_name("review-generated-artifacts.json")
+    artifacts = record_path.with_name("review-artifacts")
+    if generated.exists() or artifacts.exists():
+        return (_violation("REVIEW_CHANGES_RECOVERY_PARSER_FAILURE_REVIEW_ARTIFACTS_PRESENT", "parser-failed Changes Requested recovery is blocked by review artifact evidence", {}),)
+    return _review_changes_requested_block_sha_evidence(record, candidate, validation, review_result)
 
 
 def _review_changes_requested_durable_block(record: Any, record_path: Path | None = None) -> tuple[PipelineViolation, ...]:
