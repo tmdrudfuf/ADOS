@@ -136,7 +136,7 @@ def parse_review_decision(output: str) -> str:
             if section_decision in {"Approved", "Changes Requested"}:
                 decisions.append(section_decision)
             continue
-        normalized = _normalize_decision_line(line)
+        normalized = _normalize_decision_line(line, allow_suffix=True)
         if normalized in {"Approved", "Changes Requested"}:
             decisions.append(normalized)
 
@@ -200,7 +200,7 @@ def _strip_markdown_emphasis(value: str) -> str:
     return normalized
 
 
-def _normalize_decision_line(line: str) -> str:
+def _normalize_decision_line(line: str, *, allow_suffix: bool = False) -> str:
     normalized = _strip_decision_markup(line.strip())
     normalized = _strip_markdown_emphasis(normalized)
     normalized = _strip_edge_emphasis_markers(normalized)
@@ -210,6 +210,14 @@ def _normalize_decision_line(line: str) -> str:
     normalized = _strip_decision_markup(normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     normalized = _strip_terminal_decision_period(normalized)
+    if allow_suffix:
+        match = re.match(
+            r"^(approved|changes requested)(?:\s*(?:[.!?:;]|--|\u2014|-)\s*.*)?$",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return "Approved" if match.group(1).lower() == "approved" else "Changes Requested"
     if normalized.lower() == "approved":
         return "Approved"
     if normalized.lower() == "changes requested":
