@@ -64,7 +64,7 @@ class CliRunTests(unittest.TestCase):
             self.git(fixture.repo, "worktree", "remove", str(worktree))
 
         self.assertEqual("BLOCKED", result.status)
-        self.assertIn("CONFLICTING_WORKTREE", self.codes(result))
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
     def test_dirty_primary_blocks_before_mutation(self):
         with self.project() as fixture:
@@ -395,6 +395,146 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual(1, code)
         self.assertEqual("IMPLEMENTATION_TIMED_OUT", json.loads(stdout)["status"])
+
+    def test_implementer_failure_retries_and_continues_to_validation(self):
+        with self.project() as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "flaky-implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "handoff = sys.stdin.read()\n"
+                "if value == 0:\n"
+                "    print('temporary implementer failure', file=sys.stderr)\n"
+                "    sys.exit(9)\n"
+                "assert 'Implementation failure recovery context:' in handoff\n"
+                "Path('implementation.txt').write_text('implemented after retry', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Flaky implementer", None, fixture.config))
+            record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-flaky-implementer" / "ados-run.json").read_text(encoding="utf-8"))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            implementer_count = counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("implementation_recovery_implementer", stages)
+        self.assertEqual("2", implementer_count)
+        self.assertEqual(1, len(record["implementationRecoveryAttempts"]))
+        self.assertEqual("IMPLEMENTATION_FAILED", record["implementationRecoveryAttempts"][0]["priorStatus"])
+        self.assertEqual(result.pipeline_result.candidate.candidate_sha, result.pipeline_result.validation.head_after)
+
+    def test_implementer_timeout_recovery_records_timeout_evidence(self):
+        with self.project() as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "timeout-then-success.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys, time\n"
+                f"counter = Path(r'{counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('before timeout')\n"
+                "    time.sleep(5)\n"
+                "Path('implementation.txt').write_text('implemented after timeout', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Timeout implementer", None, fixture.config, implementer_timeout_ms=100))
+            record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-timeout-implementer" / "ados-run.json").read_text(encoding="utf-8"))
+            attempt = record["implementationRecoveryAttempts"][0]
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("IMPLEMENTATION_TIMED_OUT", attempt["priorStatus"])
+        self.assertEqual("true", attempt["priorTimedOut"])
+
+    def test_repeated_implementer_failure_reaches_configured_bound(self):
+        with self.project(implementer_mode="failure", implementation_max_recovery_rounds=1) as fixture:
+            publisher = FakePublisher(fixture.repo)
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Always failing implementer", None, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-always-failing-implementer" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual([], publisher.calls)
+        self.assertEqual(1, len(record["implementationRecoveryAttempts"]))
+        self.assertEqual("IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED", record["implementationRecoveryBlock"]["reasonCode"])
+        self.assertIsNone(result.pipeline_result.validation)
+
+    def test_partial_implementation_changes_survive_retry(self):
+        with self.project() as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "partial-then-success.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    Path('partial.txt').write_text('partial work', encoding='utf-8')\n"
+                "    sys.exit(8)\n"
+                "Path('final.txt').write_text(Path('partial.txt').read_text(encoding='utf-8') + ' completed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Partial implementer", None, fixture.config))
+            record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-partial-implementer" / "ados-run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("partial.txt", record["implementationRecoveryAttempts"][0]["changedFiles"])
+        self.assertIn("final.txt", result.pipeline_result.candidate.changed_files)
+
+    def test_implementation_recovery_wrong_branch_blocks(self):
+        with self.project() as fixture:
+            implementer = fixture.root / "wrong-branch-implementer.py"
+            implementer.write_text(
+                "import subprocess, sys\n"
+                "subprocess.run(['git', 'checkout', '-b', 'wrong-implementation-recovery'], check=True, capture_output=True, text=True)\n"
+                "sys.exit(9)\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Wrong branch implementation recovery", 1, fixture.config))
+            record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-wrong-branch-implementation-recovery" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertIn("IMPLEMENTATION_RECOVERY_BRANCH_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual("IMPLEMENTATION_RECOVERY_BRANCH_MISMATCH", record["implementationRecoveryBlock"]["reasonCode"])
+
+    def test_implementation_failure_no_change_then_adjudication_composes(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "failure-then-no-change.py"
+            verifier = fixture.root / "verifier.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    sys.exit(9)\n",
+                encoding="utf-8",
+            )
+            verifier.write_text("print('NO_CHANGES_VERIFIED')\n", encoding="utf-8")
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer=f'"{sys.executable}" "{implementer}"', reviewer=f'"{sys.executable}" "{verifier}"')
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Failure then no changes", None, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertEqual("NO_CHANGES", result.status)
+        self.assertIn("implementation_recovery_implementer", stages)
+        self.assertIn("no_change_verification", stages)
 
     def test_end_to_end_pipeline_publishes_merges_and_cleans_up_with_provider(self):
         with self.project() as fixture:
@@ -1148,6 +1288,82 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("implementer_fix", stages)
         self.assertEqual("4", implementer_count)
         self.assertEqual("3", reviewer_count)
+        self.assertEqual("FEATURE_MISSING", completed_record["noChangeAdjudicationAttempts"][0]["verifierDecision"])
+        self.assertEqual(final_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(final_candidate, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual(final_candidate, result.pipeline_result.exact_head_gate["current_head_sha"])
+
+    def test_implementation_failure_no_change_validation_and_review_recovery_compose_to_final_head(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "reviewer-count.txt"
+            implementer = fixture.root / "implementer-full-recovery-composition.py"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer-full-composition.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "handoff = sys.stdin.read()\n"
+                "if value == 0:\n"
+                "    print('initial implementer failure', file=sys.stderr)\n"
+                "    sys.exit(9)\n"
+                "if value == 1:\n"
+                "    assert 'Implementation failure recovery context:' in handoff\n"
+                "elif value == 2:\n"
+                "    Path('implementation-after-no-change.txt').write_text('candidate C', encoding='utf-8')\n"
+                "elif value == 3:\n"
+                "    Path('validation-fix.txt').write_text('candidate D', encoding='utf-8')\n"
+                "elif value == 4:\n"
+                "    Path('review-fix.txt').write_text('candidate E', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('validation-fix.txt').exists():\n"
+                "    sys.exit(9)\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('FEATURE_MISSING')\n"
+                "elif value == 1:\n"
+                "    print('Changes Requested')\n"
+                "else:\n"
+                "    print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Full autonomous recovery composition", None, fixture.config))
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            final_candidate = result.pipeline_result.candidate.candidate_sha
+            completed_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-full-autonomous-recovery-composition" / "ados-run.json").read_text(encoding="utf-8"))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertIn("implementation_recovery_implementer", stages)
+        self.assertIn("no_change_verification", stages)
+        self.assertIn("no_change_recovery_implementer", stages)
+        self.assertIn("validation_recovery_implementer", stages)
+        self.assertIn("implementer_fix", stages)
+        self.assertEqual("5", implementer_count)
+        self.assertEqual("3", reviewer_count)
+        self.assertEqual(1, len(completed_record["implementationRecoveryAttempts"]))
         self.assertEqual("FEATURE_MISSING", completed_record["noChangeAdjudicationAttempts"][0]["verifierDecision"])
         self.assertEqual(final_candidate, result.pipeline_result.validation.head_after)
         self.assertEqual(final_candidate, result.pipeline_result.review.reviewed_sha)
@@ -2253,7 +2469,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -2301,6 +2517,8 @@ class CliRunTests(unittest.TestCase):
         }
         if validation_max_recovery_rounds is not None:
             config["execution_policy"]["validation"]["max_recovery_rounds"] = validation_max_recovery_rounds
+        if implementation_max_recovery_rounds is not None:
+            config["execution_policy"]["implementation"] = {"max_recovery_rounds": implementation_max_recovery_rounds}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config), encoding="utf-8")
         return path

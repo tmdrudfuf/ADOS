@@ -54,8 +54,14 @@ class ValidationPolicy:
 
 
 @dataclass(frozen=True)
+class ImplementationPolicy:
+    max_recovery_rounds: int
+
+
+@dataclass(frozen=True)
 class ExecutionPolicy:
     schema_version: str
+    implementation: ImplementationPolicy
     publication: PublicationPolicy
     review: ReviewPolicy
     cleanup: CleanupPolicy
@@ -85,6 +91,9 @@ class ExecutionPolicy:
         guardian = _require_mapping(root, "guardian", "POLICY_MISSING_GUARDIAN")
         stop_on_uncertain = _require_bool(guardian, "stop_on_uncertain", "POLICY_INVALID_STOP_ON_UNCERTAIN")
 
+        implementation = _optional_mapping(root, "implementation")
+        implementation_max_recovery_rounds = _optional_positive_int(implementation, "max_recovery_rounds", "POLICY_INVALID_IMPLEMENTATION_MAX_RECOVERY_ROUNDS", 3)
+
         validation = _require_mapping(root, "validation", "POLICY_MISSING_VALIDATION")
         commands = _require_string_sequence(validation, "commands", "POLICY_INVALID_VALIDATION_COMMANDS")
         timeout_ms = _optional_positive_int(validation, "timeout_ms", "POLICY_INVALID_VALIDATION_TIMEOUT_MS", 1_800_000)
@@ -93,6 +102,7 @@ class ExecutionPolicy:
 
         return cls(
             schema_version=schema_version,
+            implementation=ImplementationPolicy(max_recovery_rounds=implementation_max_recovery_rounds),
             publication=PublicationPolicy(merge_strategy=merge_strategy),
             review=ReviewPolicy(reviewer=reviewer, max_rounds=max_rounds),
             cleanup=CleanupPolicy(autonomous=autonomous),
@@ -127,6 +137,15 @@ def _require_mapping(raw: Mapping[str, Any], key: str, code: str) -> Mapping[str
     value = raw.get(key)
     if not isinstance(value, Mapping):
         raise PolicyValidationError(code, f"{key} must be an object")
+    return value
+
+
+def _optional_mapping(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = raw.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise PolicyValidationError(f"POLICY_INVALID_{key.upper()}", f"{key} must be an object when provided")
     return value
 
 

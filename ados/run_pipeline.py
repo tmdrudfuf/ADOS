@@ -335,7 +335,10 @@ class RunPipeline:
             record = implementer_result.run_record or record
             stages.append(_stage("implementer", implementer_result.status, {}))
             if implementer_result.status != "READY_FOR_VALIDATION":
-                return PipelineOutcome(implementer_result.status, tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, violations=tuple(_from_implementer(item) for item in implementer_result.violations))
+                recovery = self._recover_implementation_failure(config, run_record_path, record, stages, bootstrap, implementer_result, timeout_ms)
+                if isinstance(recovery, PipelineOutcome):
+                    return recovery
+                implementer_result, record = recovery
         else:
             implementer_result = None
             stages.append(_stage("implementer", "SKIPPED", {"status": str(record.get("status", ""))}))
@@ -419,7 +422,10 @@ class RunPipeline:
             record = implementer_result.run_record or _read_json(run_record_path)
             stages.append(_stage("implementer_fix", implementer_result.status, {"round": str(round_number)}))
             if implementer_result.status != "READY_FOR_VALIDATION":
-                return PipelineOutcome(implementer_result.status, tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=tuple(_from_implementer(item) for item in implementer_result.violations))
+                recovery = self._recover_implementation_failure(config, run_record_path, record, stages, bootstrap, implementer_result, timeout_ms)
+                if isinstance(recovery, PipelineOutcome):
+                    return recovery
+                implementer_result, record = recovery
             round_number += 1
 
         if review_result is None or validation_result is None or candidate_result is None:
@@ -454,6 +460,92 @@ class RunPipeline:
                 break
         _write_json(evidence_path, {"status": "PASS" if all(item.exit_code == 0 for item in results) else "BLOCK", "commands": [item.to_dict() for item in results]})
         return tuple(results)
+
+    def _recover_implementation_failure(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        failed_implementer: ImplementerRuntimeOutcome,
+        timeout_ms: int,
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        current = failed_implementer
+        current_record = record
+        while current.status in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+            max_rounds = config.execution_policy.implementation.max_recovery_rounds
+            round_number = _implementation_recovery_attempt_count(current_record) + 1
+            _write_implementation_failure_status(run_record_path, current_record, current)
+            current_record = _read_json(run_record_path) or current_record
+            if round_number > max_rounds:
+                violation = _violation(
+                    "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED",
+                    "implementation recovery reached the configured maximum recovery rounds",
+                    {"max_recovery_rounds": str(max_rounds), "status": current.status},
+                )
+                _write_implementation_recovery_block_status(run_record_path, current_record, violation, status=current.status)
+                return PipelineOutcome(
+                    current.status,
+                    tuple([*stages, _stage("implementation_recovery", "BLOCKED", {"round": str(round_number - 1), "max_rounds": str(max_rounds)})]),
+                    _read_json(run_record_path),
+                    bootstrap=bootstrap,
+                    implementer_result=current,
+                    violations=tuple([*(_from_implementer(item) for item in current.violations), violation]),
+                )
+
+            safety = _implementation_recovery_safety(self.git, current_record)
+            if safety:
+                _write_implementation_recovery_block_status(run_record_path, current_record, safety)
+                return PipelineOutcome(
+                    "IMPLEMENTATION_FAILED",
+                    tuple([*stages, _stage("implementation_recovery", "BLOCKED", {"round": str(round_number)})]),
+                    _read_json(run_record_path),
+                    bootstrap=bootstrap,
+                    implementer_result=current,
+                    violations=(safety,),
+                )
+
+            _append_implementation_recovery_attempt(run_record_path, current_record, current, round_number, max_rounds)
+            recovery_record = _read_json(run_record_path) or current_record
+            retry = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+            _update_implementation_recovery_attempt(
+                run_record_path,
+                round_number,
+                {
+                    "recoveryImplementerStatus": retry.status,
+                    "recoveryImplementerViolationCodes": [item.code for item in retry.violations],
+                    "headAfterRecovery": _implementer_result_head_after(retry),
+                    "changedFilesAfterRecovery": list(_implementer_result_changed_files(retry)),
+                },
+            )
+            updated_record = _read_json(run_record_path) or retry.run_record or recovery_record
+            stages.append(_stage("implementation_recovery_implementer", retry.status, {"round": str(round_number), "prior_status": current.status}))
+            if retry.status == "READY_FOR_VALIDATION":
+                _update_implementation_recovery_attempt(run_record_path, round_number, {"status": "READY_FOR_VALIDATION"})
+                return retry, _read_json(run_record_path) or updated_record
+            if retry.status not in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+                violation = _violation("IMPLEMENTATION_RECOVERY_NONRECOVERABLE", "implementation recovery produced a nonrecoverable implementer result", {"status": retry.status})
+                _write_implementation_recovery_block_status(run_record_path, updated_record, violation, status=retry.status if retry.status in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"} else "IMPLEMENTATION_FAILED")
+                return PipelineOutcome(
+                    retry.status,
+                    tuple(stages),
+                    _read_json(run_record_path),
+                    bootstrap=bootstrap,
+                    implementer_result=retry,
+                    violations=tuple([*(_from_implementer(item) for item in retry.violations), violation]),
+                )
+            current = retry
+            current_record = updated_record
+
+        return PipelineOutcome(
+            current.status,
+            tuple(stages),
+            current_record,
+            bootstrap=bootstrap,
+            implementer_result=current,
+            violations=tuple(_from_implementer(item) for item in current.violations),
+        )
 
     def _recover_validation_failure(
         self,
@@ -494,16 +586,10 @@ class RunPipeline:
         updated_record = _read_json(run_record_path) or implementer_result.run_record or recovery_record
         stages.append(_stage("validation_recovery_implementer", implementer_result.status, {"round": str(round_number), "failed_candidate_sha": candidate.candidate_sha}))
         if implementer_result.status != "READY_FOR_VALIDATION":
-            return PipelineOutcome(
-                implementer_result.status,
-                tuple(stages),
-                updated_record,
-                bootstrap=bootstrap,
-                implementer_result=implementer_result,
-                candidate=candidate,
-                validation=validation,
-                violations=tuple(_from_implementer(item) for item in implementer_result.violations),
-            )
+            recovery = self._recover_implementation_failure(config, run_record_path, updated_record, stages, bootstrap, implementer_result, timeout_ms)
+            if isinstance(recovery, PipelineOutcome):
+                return recovery
+            return recovery
 
         worktree = Path(record["featureWorktree"])
         try:
@@ -613,7 +699,10 @@ class RunPipeline:
         _update_no_change_adjudication(run_record_path, round_number, {"recoveryImplementerStatus": recovery_implementer.status, "recoveryImplementerViolationCodes": [item.code for item in recovery_implementer.violations]})
         updated_record = _read_json(run_record_path) or recovery_implementer.run_record or recovery_record
         if recovery_implementer.status != "READY_FOR_VALIDATION":
-            return PipelineOutcome(recovery_implementer.status, tuple(stages), updated_record, bootstrap=bootstrap, implementer_result=recovery_implementer, candidate=candidate, no_change_verification=verification, violations=tuple(_from_implementer(item) for item in recovery_implementer.violations))
+            recovery = self._recover_implementation_failure(config, run_record_path, updated_record, stages, bootstrap, recovery_implementer, timeout_ms)
+            if isinstance(recovery, PipelineOutcome):
+                return recovery
+            return recovery
         return recovery_implementer, updated_record
 
     def _finalize_no_changes(
@@ -1255,6 +1344,121 @@ def _write_validation_failure_status(path: Path, record: dict[str, Any], candida
     _write_json(path, updated)
 
 
+def _write_implementation_failure_status(path: Path, record: dict[str, Any], implementer: ImplementerRuntimeOutcome) -> None:
+    updated = dict(record)
+    updated["status"] = implementer.status
+    updated["nextStage"] = "implementation_recovery"
+    updated["implementationFailure"] = _implementation_failure_payload(implementer)
+    _write_json(path, updated)
+
+
+def _implementation_failure_payload(implementer: ImplementerRuntimeOutcome) -> dict[str, Any]:
+    result = implementer.result
+    return {
+        "status": implementer.status,
+        "exitCode": "" if result is None or result.exit_code is None else str(result.exit_code),
+        "timedOut": str(result.timed_out).lower() if result is not None else "false",
+        "stdout": _bounded(result.stdout if result is not None else ""),
+        "stderr": _bounded(result.stderr if result is not None else ""),
+        "headBefore": result.head_before if result is not None else "",
+        "headAfter": result.head_after if result is not None else "",
+        "changedFiles": list(result.changed_files) if result is not None else [],
+        "reasonCodes": [item.code for item in implementer.violations],
+        "recoveryStage": "implementation_recovery",
+    }
+
+
+def _implementation_recovery_attempt_count(record: dict[str, Any]) -> int:
+    attempts = record.get("implementationRecoveryAttempts")
+    return len(attempts) if isinstance(attempts, list) else 0
+
+
+def _append_implementation_recovery_attempt(path: Path, record: dict[str, Any], implementer: ImplementerRuntimeOutcome, round_number: int, max_rounds: int) -> None:
+    updated = dict(record)
+    attempts_raw = updated.get("implementationRecoveryAttempts")
+    attempts = list(attempts_raw) if isinstance(attempts_raw, list) else []
+    payload = _implementation_failure_payload(implementer)
+    attempts.append(
+        {
+            "round": round_number,
+            "maxRounds": max_rounds,
+            "status": "RECOVERY_IMPLEMENTER_PENDING",
+            "priorStatus": implementer.status,
+            "priorExitCode": payload["exitCode"],
+            "priorTimedOut": payload["timedOut"],
+            "priorStdout": payload["stdout"],
+            "priorStderr": payload["stderr"],
+            "headBefore": payload["headBefore"],
+            "headAfter": payload["headAfter"],
+            "changedFiles": payload["changedFiles"],
+            "reasonCodes": payload["reasonCodes"],
+        }
+    )
+    updated["implementationRecoveryAttempts"] = attempts
+    updated["implementationFailure"] = payload
+    updated.pop("implementationRecoveryBlock", None)
+    _write_json(path, updated)
+
+
+def _update_implementation_recovery_attempt(path: Path, round_number: int, fields: dict[str, Any]) -> None:
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return
+    attempts_raw = record.get("implementationRecoveryAttempts")
+    if not isinstance(attempts_raw, list):
+        return
+    attempts: list[Any] = []
+    for attempt in attempts_raw:
+        if isinstance(attempt, dict) and attempt.get("round") == round_number:
+            attempts.append({**attempt, **fields})
+        else:
+            attempts.append(attempt)
+    record["implementationRecoveryAttempts"] = attempts
+    _write_json(path, record)
+
+
+def _write_implementation_recovery_block_status(path: Path, record: dict[str, Any], violation: PipelineViolation, *, status: str = "IMPLEMENTATION_FAILED") -> None:
+    updated = dict(record)
+    updated["status"] = status
+    updated["nextStage"] = "human_intervention"
+    updated["implementationRecoveryBlock"] = {
+        "status": "BLOCKED",
+        "reasonCode": violation.code,
+        "message": violation.message,
+        "evidence": violation.evidence,
+    }
+    _write_json(path, updated)
+
+
+def _implementation_recovery_safety(git: GitRepositoryProvider, record: dict[str, Any]) -> PipelineViolation | None:
+    worktree = Path(str(record.get("featureWorktree", "")))
+    expected_branch = str(record.get("featureBranch", ""))
+    base = str(record.get("authoritativeBaseSha", ""))
+    if not worktree.is_dir():
+        return _violation("IMPLEMENTATION_RECOVERY_WORKTREE_MISSING", "implementation recovery requires the recorded feature worktree", {"worktree": str(worktree)})
+    try:
+        branch = git.current_branch(worktree)
+        head = git.current_head(worktree)
+    except RepositoryProviderError as exc:
+        return _violation(exc.code, exc.message, {"worktree": str(worktree)})
+    if branch != expected_branch:
+        return _violation("IMPLEMENTATION_RECOVERY_BRANCH_MISMATCH", "implementation recovery requires the recorded feature branch", {"expected": expected_branch, "actual": branch})
+    try:
+        if base and not git.is_ancestor(worktree, base, head):
+            return _violation("IMPLEMENTATION_RECOVERY_LINEAGE_INVALID", "implementation recovery HEAD does not descend from recorded base", {"base": base, "head": head})
+    except RepositoryProviderError as exc:
+        return _violation(exc.code, exc.message, {"worktree": str(worktree)})
+    return None
+
+
+def _implementer_result_head_after(implementer: ImplementerRuntimeOutcome) -> str:
+    return implementer.result.head_after if implementer.result is not None else ""
+
+
+def _implementer_result_changed_files(implementer: ImplementerRuntimeOutcome) -> tuple[str, ...]:
+    return implementer.result.changed_files if implementer.result is not None else ()
+
+
 def _validation_failure_payload(path: Path, candidate: CandidatePreparationResult, validation: ValidationResult) -> dict[str, Any]:
     failed_commands = [
         {
@@ -1480,6 +1684,9 @@ def _write_publication_status(path: Path, record: dict[str, Any], status: str) -
 
 
 def _clear_resolved_recovery_fields(record: dict[str, Any], status: str) -> None:
+    if status not in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+        record.pop("implementationFailure", None)
+        record.pop("implementationRecoveryBlock", None)
     if status != "VALIDATION_FAILED":
         record.pop("validationFailure", None)
         record.pop("validationRecoveryBlock", None)
