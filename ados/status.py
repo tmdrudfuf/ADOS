@@ -483,13 +483,17 @@ def _validation_failure_evidence(record: dict[str, Any], record_path: Path) -> d
         candidate = _read_json_object(record_path.with_name("candidate.json"))
         if isinstance(candidate, dict):
             candidate_sha = str(candidate.get("candidate_sha", ""))
-    return {
+    evidence = {
         "resume_stage": "implementation_recovery",
         "candidate_sha": candidate_sha,
         "failed_validation_commands": failed,
         "validation_failure_artifact": str(record_path.with_name("validation-runtime.json")),
     }
-
+    block = record.get("validationRecoveryBlock")
+    if isinstance(block, dict) and str(block.get("status", "")) == "BLOCKED":
+        evidence["resume_stage"] = ""
+        evidence["validation_recovery_block_reason"] = str(block.get("reasonCode", ""))
+    return evidence
 
 def _nonzero_exit(value: Any) -> bool:
     try:
