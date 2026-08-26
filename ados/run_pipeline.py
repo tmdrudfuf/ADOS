@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from .exact_head_gate import ExactHeadGate
 from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome
+from .no_change_verifier import NoChangeVerificationRequest, NoChangeVerificationResult, NoChangeVerificationViolation, NoChangeVerifier
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
 from .publication_engine import PublicationEngine, PublicationEvidence, PublicationGateResult
@@ -137,6 +138,7 @@ class PipelineOutcome:
     implementer_result: ImplementerRuntimeOutcome | None = None
     candidate: CandidatePreparationResult | None = None
     validation: ValidationResult | None = None
+    no_change_verification: NoChangeVerificationResult | None = None
     review: ReviewResult | None = None
     exact_head_gate: dict[str, object] | None = None
     publication_gate: PublicationGateResult | None = None
@@ -154,6 +156,7 @@ class PipelineOutcome:
             "implementerResult": self.implementer_result.to_dict() if self.implementer_result else None,
             "candidate": self.candidate.to_dict() if self.candidate else None,
             "validation": self.validation.to_dict() if self.validation else None,
+            "noChangeVerification": self.no_change_verification.to_dict() if self.no_change_verification else None,
             "review": self.review.to_dict() if self.review else None,
             "exactHeadGate": self.exact_head_gate,
             "publicationGate": self.publication_gate.to_dict() if self.publication_gate else None,
@@ -267,6 +270,7 @@ class RunPipeline:
         implementer: ImplementerRuntime | None = None,
         validation: ValidationEngine | None = None,
         review: ReviewEngine | None = None,
+        no_change_verifier: NoChangeVerifier | None = None,
         exact_head: ExactHeadGate | None = None,
         publication: PublicationEngine | None = None,
         publisher: PublicationProvider | None = None,
@@ -277,6 +281,7 @@ class RunPipeline:
         self.implementer = implementer or ImplementerRuntime()
         self.validation = validation or ValidationEngine()
         self.review = review or ReviewEngine()
+        self.no_change_verifier = no_change_verifier or NoChangeVerifier()
         self.exact_head = exact_head or ExactHeadGate()
         self.publication = publication or PublicationEngine()
         self.publisher = publisher or GitHubCliPublicationProvider()
@@ -346,7 +351,11 @@ class RunPipeline:
             if candidate_result.status == "BLOCKED":
                 return PipelineOutcome("CANDIDATE_BLOCKED", tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, violations=candidate_result.violations)
             if candidate_result.status == "NO_CHANGES":
-                return self._finalize_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate_result)
+                adjudication = self._adjudicate_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate_result, timeout_ms)
+                if isinstance(adjudication, PipelineOutcome):
+                    return adjudication
+                implementer_result, record = adjudication
+                continue
             _record_validation_recovery_candidate(run_record_path, record, candidate_result)
             record = _read_json(run_record_path) or record
             _write_status(run_record_path, record, "READY_FOR_VALIDATION")
@@ -553,6 +562,60 @@ class RunPipeline:
             return CandidatePreparationResult("NO_CHANGES", head, changed)
         return CandidatePreparationResult("COMMITTED", head, changed)
 
+    def _adjudicate_no_changes(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        implementer_result: ImplementerRuntimeOutcome | None,
+        candidate: CandidatePreparationResult,
+        timeout_ms: int,
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        round_number = _no_change_adjudication_attempt_count(record) + 1
+        max_rounds = config.execution_policy.validation.max_no_change_recovery_rounds
+        verification = self.no_change_verifier.run(
+            policy=config.execution_policy,
+            request=NoChangeVerificationRequest(
+                repository_path=Path(record["featureWorktree"]),
+                spec_number=str(record["specNumber"]),
+                feature_description=str(record["featureDescription"]),
+                candidate_sha=candidate.candidate_sha,
+                base_sha=str(record["authoritativeBaseSha"]),
+                implementer_status=candidate.status,
+            ),
+        )
+        _write_json(run_record_path.with_name("no-change-verification-runtime.json"), verification.to_dict())
+        _append_no_change_adjudication(run_record_path, record, candidate, verification, round_number, max_rounds)
+        record = _read_json(run_record_path) or record
+        stages.append(_stage("no_change_verification", verification.decision, {"round": str(round_number), "candidate_sha": candidate.candidate_sha}))
+        if verification.status != "PASS":
+            violation = _violation("NO_CHANGES_AMBIGUOUS", "no-change verification did not produce a trusted decision", {"candidate_sha": candidate.candidate_sha})
+            _write_no_change_adjudication_block(run_record_path, record, violation)
+            return PipelineOutcome("NO_CHANGES_AMBIGUOUS", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=verification, violations=tuple([*(_from_no_change_verification(item) for item in verification.violations), violation]))
+        if verification.decision == "NO_CHANGES_VERIFIED":
+            return self._finalize_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate, no_change_verification=verification)
+        if verification.decision == "AMBIGUOUS":
+            violation = _violation("NO_CHANGES_AMBIGUOUS", "verifier could not determine whether the feature is already satisfied", {"candidate_sha": candidate.candidate_sha})
+            _write_no_change_adjudication_block(run_record_path, record, violation)
+            return PipelineOutcome("NO_CHANGES_AMBIGUOUS", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=verification, violations=(violation,))
+
+        if round_number > max_rounds:
+            violation = _violation("NO_CHANGE_RECOVERY_MAX_ROUNDS_EXCEEDED", "no-change recovery reached the configured maximum recovery rounds", {"max_no_change_recovery_rounds": str(max_rounds), "candidate_sha": candidate.candidate_sha})
+            _write_no_change_adjudication_block(run_record_path, record, violation)
+            return PipelineOutcome("NO_CHANGES_AMBIGUOUS", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=verification, violations=(violation,))
+
+        _write_no_change_recovery_status(run_record_path, record, verification)
+        recovery_record = _read_json(run_record_path) or record
+        recovery_implementer = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+        stages.append(_stage("no_change_recovery_implementer", recovery_implementer.status, {"round": str(round_number)}))
+        _update_no_change_adjudication(run_record_path, round_number, {"recoveryImplementerStatus": recovery_implementer.status, "recoveryImplementerViolationCodes": [item.code for item in recovery_implementer.violations]})
+        updated_record = _read_json(run_record_path) or recovery_implementer.run_record or recovery_record
+        if recovery_implementer.status != "READY_FOR_VALIDATION":
+            return PipelineOutcome(recovery_implementer.status, tuple(stages), updated_record, bootstrap=bootstrap, implementer_result=recovery_implementer, candidate=candidate, no_change_verification=verification, violations=tuple(_from_implementer(item) for item in recovery_implementer.violations))
+        return recovery_implementer, updated_record
+
     def _finalize_no_changes(
         self,
         config: ProjectConfig,
@@ -562,6 +625,7 @@ class RunPipeline:
         bootstrap: tuple[BootstrapCommandResult, ...],
         implementer_result: ImplementerRuntimeOutcome | None,
         candidate: CandidatePreparationResult,
+        no_change_verification: NoChangeVerificationResult | None = None,
     ) -> PipelineOutcome:
         violations = _no_change_violations(self.git, Path(record["featureWorktree"]), record, candidate.candidate_sha)
         if violations:
@@ -572,13 +636,13 @@ class RunPipeline:
         cleanup = self._cleanup(config, record)
         stages.append(_stage("cleanup", cleanup.status, {"archive": str(no_change_archive)}))
         if cleanup.status != "PASS":
-            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=no_change_verification, cleanup=cleanup, violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in cleanup.violations))
         local_delete = _run(("git", "branch", "-d", record["featureBranch"]), Path(record["primaryRepository"]))
         if local_delete.returncode != 0 and "not found" not in (local_delete.stderr + local_delete.stdout).lower():
             violation = _violation("LOCAL_BRANCH_DELETE_FAILED", "local no-change feature branch deletion failed", {"stderr": local_delete.stderr})
-            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup, violations=(violation,))
+            return PipelineOutcome("NO_CHANGES_CLEANUP_INCOMPLETE", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=no_change_verification, cleanup=cleanup, violations=(violation,))
         _write_status(primary_record, {**record, "noChangeArchive": str(no_change_archive)}, "NO_CHANGES")
-        return PipelineOutcome("NO_CHANGES", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, cleanup=cleanup)
+        return PipelineOutcome("NO_CHANGES", tuple(stages), _read_json(primary_record), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, no_change_verification=no_change_verification, cleanup=cleanup)
 
     def _publish(
         self,
@@ -1334,6 +1398,79 @@ def _validation_recovery_block_violation(record: dict[str, Any]) -> PipelineViol
     return _violation(str(block.get("reasonCode", "VALIDATION_RECOVERY_BLOCKED")), str(block.get("message", "validation recovery is blocked")), evidence)
 
 
+def _no_change_adjudication_attempt_count(record: dict[str, Any]) -> int:
+    attempts = record.get("noChangeAdjudicationAttempts")
+    return len(attempts) if isinstance(attempts, list) else 0
+
+
+def _append_no_change_adjudication(path: Path, record: dict[str, Any], candidate: CandidatePreparationResult, verification: NoChangeVerificationResult, round_number: int, max_rounds: int) -> None:
+    updated = dict(record)
+    attempts_raw = updated.get("noChangeAdjudicationAttempts")
+    attempts = list(attempts_raw) if isinstance(attempts_raw, list) else []
+    attempts.append(
+        {
+            "round": round_number,
+            "maxRounds": max_rounds,
+            "candidateSha": candidate.candidate_sha,
+            "baseSha": str(record.get("authoritativeBaseSha", "")),
+            "implementerStatus": candidate.status,
+            "verifier": str(record.get("reviewer", "")),
+            "verifierDecision": verification.decision,
+            "verifierStatus": verification.status,
+            "verifierSha": verification.verified_sha,
+            "verifierStdout": _bounded(verification.stdout),
+            "verifierStderr": _bounded(verification.stderr),
+            "verifierViolationCodes": [item.code for item in verification.violations],
+        }
+    )
+    updated["noChangeAdjudicationAttempts"] = attempts
+    updated.pop("noChangeAdjudicationBlock", None)
+    _write_json(path, updated)
+
+
+def _update_no_change_adjudication(path: Path, round_number: int, fields: dict[str, Any]) -> None:
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return
+    attempts_raw = record.get("noChangeAdjudicationAttempts")
+    if not isinstance(attempts_raw, list):
+        return
+    attempts: list[Any] = []
+    for attempt in attempts_raw:
+        if isinstance(attempt, dict) and attempt.get("round") == round_number:
+            attempts.append({**attempt, **fields})
+        else:
+            attempts.append(attempt)
+    record["noChangeAdjudicationAttempts"] = attempts
+    _write_json(path, record)
+
+
+def _write_no_change_recovery_status(path: Path, record: dict[str, Any], verification: NoChangeVerificationResult) -> None:
+    updated = dict(record)
+    updated["status"] = "READY_FOR_IMPLEMENTATION"
+    updated["nextStage"] = "no_change_recovery"
+    updated["noChangeRecovery"] = {
+        "status": "NO_CHANGES_REJECTED_FEATURE_MISSING",
+        "verifierDecision": verification.decision,
+        "verifierOutput": _bounded(verification.stdout),
+        "verifierSha": verification.verified_sha,
+    }
+    _write_json(path, updated)
+
+
+def _write_no_change_adjudication_block(path: Path, record: dict[str, Any], violation: PipelineViolation) -> None:
+    updated = dict(record)
+    updated["status"] = "NO_CHANGES_AMBIGUOUS"
+    updated["nextStage"] = "human_intervention"
+    updated["noChangeAdjudicationBlock"] = {
+        "status": "BLOCKED",
+        "reasonCode": violation.code,
+        "message": violation.message,
+        "evidence": violation.evidence,
+    }
+    _write_json(path, updated)
+
+
 def _write_publication_status(path: Path, record: dict[str, Any], status: str) -> None:
     updated = dict(record)
     updated["status"] = status
@@ -1346,6 +1483,9 @@ def _clear_resolved_recovery_fields(record: dict[str, Any], status: str) -> None
     if status != "VALIDATION_FAILED":
         record.pop("validationFailure", None)
         record.pop("validationRecoveryBlock", None)
+    if status not in {"NO_CHANGES_AMBIGUOUS", "READY_FOR_IMPLEMENTATION"}:
+        record.pop("noChangeRecovery", None)
+        record.pop("noChangeAdjudicationBlock", None)
     if status != "REVIEW_BLOCKED":
         record.pop("reviewBlock", None)
 
@@ -2111,4 +2251,8 @@ def _from_validation(violation: Any) -> PipelineViolation:
 
 
 def _from_review(violation: Any) -> PipelineViolation:
+    return PipelineViolation(violation.code, violation.message, violation.evidence)
+
+
+def _from_no_change_verification(violation: Any) -> PipelineViolation:
     return PipelineViolation(violation.code, violation.message, violation.evidence)
