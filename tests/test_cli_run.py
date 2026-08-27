@@ -1837,8 +1837,9 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
-    def test_review_blocked_incomplete_output_without_structural_reason_does_not_resume(self):
+    def test_review_blocked_runtime_decision_unavailable_resumes_at_review(self):
         with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
             validation_counter = fixture.root / "validation-count.txt"
             validation = fixture.root / "validation.py"
             validation.write_text(
@@ -1855,7 +1856,7 @@ class CliRunTests(unittest.TestCase):
                 f"counter = Path(r'{reviewer_counter}')\n"
                 "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
                 "counter.write_text(str(value + 1), encoding='utf-8')\n"
-                "print('Waiting for the background full test suite to finish before issuing the final verdict.' if value == 0 else 'Approved')\n",
+                "print('Waiting for the background full test suite to finish before issuing the final decision.' if value == 0 else 'Approved')\n",
                 encoding="utf-8",
             )
             fixture.config = self.write_config(
@@ -1876,21 +1877,63 @@ class CliRunTests(unittest.TestCase):
             candidate_before = json.loads(candidate_path.read_text(encoding="utf-8"))["candidate_sha"]
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
 
-            second = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Interrupted review output", None, fixture.config, dry_run=True))
+            second = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, "Interrupted review output", None, fixture.config))
             validation_count = validation_counter.read_text(encoding="utf-8")
             reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
 
         self.assertEqual("REVIEW_BLOCKED", first.status)
         self.assertEqual("REVIEW_DECISION_UNAVAILABLE", blocked_record["reviewBlock"]["reasonCode"])
+        self.assertEqual("review_runtime", blocked_record["reviewBlock"]["blockCause"])
         self.assertFalse(blocked_record["reviewBlock"]["transient"])
-        self.assertEqual("False", status.workflow.evidence["resumable"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
         self.assertEqual("REVIEW_DECISION_UNAVAILABLE", status.workflow.evidence["review_block_reason"])
-        self.assertEqual("", status.workflow.evidence["resume_stage"])
-        self.assertFalse(second.resumed)
-        self.assertEqual("BLOCKED", second.status)
+        self.assertEqual("review", status.workflow.evidence["resume_stage"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
         self.assertEqual("1", validation_count)
-        self.assertEqual("1", reviewer_count)
+        self.assertEqual("2", reviewer_count)
+        self.assertEqual("1", implementer_count)
         self.assertEqual(candidate_before, blocked_record["reviewBlock"]["candidateSha"])
+        self.assertEqual(candidate_before, second.pipeline_result.review.reviewed_sha)
+        self.assertEqual("Approved", second.pipeline_result.review.decision)
+
+    def test_repeated_review_runtime_decision_unavailable_remains_resumable(self):
+        with self.project(implementer_mode="count") as fixture:
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Waiting for the background validation run before issuing the final decision.')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            publisher = FakePublisher(fixture.repo)
+            service = RunService(pipeline=RunPipeline(publisher=publisher))
+            first = service.run(RunRequest(fixture.repo, "Repeated interrupted review output", None, fixture.config))
+            second = service.run(RunRequest(fixture.repo, "Repeated interrupted review output", None, fixture.config))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+            codes = self.codes(second)
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("REVIEW_BLOCKED", second.status)
+        self.assertEqual("2", reviewer_count)
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("review", status.workflow.evidence["resume_stage"])
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", codes)
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", codes)
+        self.assertNotIn("WORKTREE_PATH_EXISTS", codes)
+        self.assertNotIn("CONFLICTING_WORKTREE", codes)
 
     def test_review_blocked_sha_mismatch_does_not_resume(self):
         with self.project(implementer_mode="count") as fixture:

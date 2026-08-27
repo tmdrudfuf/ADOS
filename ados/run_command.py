@@ -15,7 +15,7 @@ from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, 
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider
@@ -462,6 +462,7 @@ def _review_blocked_is_resumable(record_path: Path) -> bool:
     return (
         not transient_review_blocked_evidence(candidate, validation, review)
         or not review_changes_requested_evidence(record, candidate, validation, review, record_path)
+        or not review_runtime_unavailable_evidence(record, candidate, validation, review)
     )
 
 

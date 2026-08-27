@@ -1295,8 +1295,9 @@ class RunPipeline:
             return self._finalize_no_changes(config, run_record_path, record, [*stages, _stage("no_change_recovery", "PASS", {"candidate_sha": candidate.candidate_sha})], (), None, CandidatePreparationResult("NO_CHANGES", candidate.candidate_sha, candidate.changed_files))
         resumable = transient_review_blocked_evidence(candidate_raw, validation_raw, review_raw)
         if resumable:
+            review_runtime_resume = review_runtime_unavailable_evidence(record, candidate_raw, validation_raw, review_raw)
             changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
-            if changes_requested_resume:
+            if review_runtime_resume and changes_requested_resume:
                 return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
 
         candidate = _candidate_from_mapping(candidate_raw)
@@ -2365,6 +2366,91 @@ def transient_review_blocked_evidence(candidate: Any, validation: Any, review: A
     if not _is_transient_review_block(review_result):
         return (_violation("REVIEW_RESUME_TRANSIENT_FAILURE_UNPROVEN", "review blocker does not prove transient reviewer failure", {}),)
     return ()
+
+
+def review_runtime_unavailable_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("REVIEW_RUNTIME_RESUME_CANDIDATE_INVALID", "review runtime retry requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("REVIEW_RUNTIME_RESUME_VALIDATION_MISSING", "review runtime retry requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "PASS":
+        return (_violation("REVIEW_RUNTIME_RESUME_VALIDATION_NOT_PASSED", "review runtime retry requires previously passed validation", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_RUNTIME_RESUME_VALIDATION_SHA_MISMATCH",
+                "review runtime retry validation evidence does not match candidate",
+                {
+                    "candidate_sha": candidate_result.candidate_sha,
+                    "head_before": validation_result.head_before,
+                    "head_after": validation_result.head_after,
+                },
+            ),
+        )
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_EVIDENCE_MISSING", "review runtime retry requires review evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "BLOCK" or review_result.decision != "Unavailable":
+        return (
+            _violation(
+                "REVIEW_RUNTIME_RESUME_REVIEW_STATE_INVALID",
+                "review runtime retry requires a blocked unavailable review result",
+                {"status": review_result.status, "decision": review_result.decision},
+            ),
+        )
+    if review_result.reviewed_sha != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_RUNTIME_RESUME_REVIEW_SHA_MISMATCH",
+                "review runtime retry evidence does not match candidate",
+                {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
+            ),
+        )
+    if not isinstance(record, dict) or str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return (_violation("REVIEW_RUNTIME_RESUME_RECORD_INVALID", "review runtime retry requires REVIEW_BLOCKED durable state", {"status": str(record.get("status", "")) if isinstance(record, dict) else ""}),)
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_RUNTIME_RESUME_BLOCK_MISSING", "review runtime retry requires durable review block evidence", {}),)
+    if str(block.get("blockCause", "")) != "review_runtime":
+        return (_violation("REVIEW_RUNTIME_RESUME_BLOCK_CAUSE_UNSAFE", "review runtime retry requires review_runtime block cause", {"blockCause": str(block.get("blockCause", ""))}),)
+    if str(block.get("reasonCode", "")) != "REVIEW_DECISION_UNAVAILABLE":
+        return (_violation("REVIEW_RUNTIME_RESUME_REASON_UNSAFE", "review runtime retry requires decision-unavailable runtime evidence", {"reasonCode": str(block.get("reasonCode", ""))}),)
+    if block.get("reasonCodes", []) not in ([], ["REVIEW_DECISION_UNAVAILABLE"]):
+        return (_violation("REVIEW_RUNTIME_RESUME_REASON_CODES_UNSAFE", "review runtime retry requires only REVIEW_DECISION_UNAVAILABLE reason codes", {}),)
+    if str(block.get("candidateSha", "")) != candidate_result.candidate_sha or str(block.get("validatedSha", "")) != validation_result.head_after or str(block.get("reviewedSha", "")) != review_result.reviewed_sha:
+        return (
+            _violation(
+                "REVIEW_RUNTIME_RESUME_BLOCK_SHA_MISMATCH",
+                "review runtime retry durable block SHA evidence does not match candidate artifacts",
+                {
+                    "candidate_sha": candidate_result.candidate_sha,
+                    "validated_sha": validation_result.head_after,
+                    "reviewed_sha": review_result.reviewed_sha,
+                },
+            ),
+        )
+    if str(block.get("exitCode", "0")) != "0" or str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
+        return (_violation("REVIEW_RUNTIME_RESUME_PROCESS_UNSAFE", "review runtime retry requires successful non-transient process evidence", {}),)
+    if review_result.exit_code != 0 or review_result.stderr:
+        return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_PROCESS_UNSAFE", "review runtime retry requires successful review process evidence", {"exit_code": str(review_result.exit_code)}),)
+    codes = tuple(violation.code for violation in review_result.violations)
+    if codes != ("REVIEW_DECISION_UNAVAILABLE",):
+        return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_CODES_UNSAFE", "review runtime retry requires only REVIEW_DECISION_UNAVAILABLE review violation", {"codes": ",".join(codes)}),)
+    if parse_review_decision(review_result.stdout) != "Unavailable":
+        return (_violation("REVIEW_RUNTIME_RESUME_DECISION_PRESENT", "review runtime retry is not used when current parser can classify a decision", {}),)
+    if not _review_runtime_output_indicates_incomplete_decision(review_result.stdout):
+        return (_violation("REVIEW_RUNTIME_RESUME_INCOMPLETE_OUTPUT_UNPROVEN", "review runtime retry requires explicit incomplete decision output", {}),)
+    return ()
+
+
+def _review_runtime_output_indicates_incomplete_decision(stdout: str) -> bool:
+    lines = [line.strip().lower() for line in str(stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    first = lines[0]
+    return first.startswith("waiting for ") and "decision" in first
 
 
 def review_changes_requested_evidence(record: Any, candidate: Any, validation: Any, review: Any, record_path: Path | None = None) -> tuple[PipelineViolation, ...]:
