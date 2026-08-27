@@ -176,6 +176,43 @@ class ImplementerRuntimeTests(unittest.TestCase):
         self.assertEqual("READY_FOR_VALIDATION", second.status)
         self.assertIsNone(second.result)
 
+    def test_validation_recovery_handoff_surfaces_stderr_and_allows_focused_diagnostics(self):
+        with self.project() as fixture:
+            runner = self.runner(fixture.root / "runner.py", "success")
+            config = self.write_config(fixture.config, fixture.repo, implementer=f'"{sys.executable}" "{runner}"')
+            record_path = self.ready_run(fixture, config)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["status"] = "VALIDATION_FAILED"
+            record["nextStage"] = "implementation_recovery"
+            record["validationFailure"] = {
+                "recoveryStage": "implementation_recovery",
+                "candidateSha": "abc123",
+                "status": "BLOCK",
+                "headBefore": "abc123",
+                "headAfter": "abc123",
+                "failedCommands": [
+                    {
+                        "command": "npm test",
+                        "exitCode": 1,
+                        "reasonCode": "VALIDATION_COMMAND_FAILED",
+                        "stdout": "many passing test rows before the failure",
+                        "stderr": "AssertionError: expected visible row",
+                    }
+                ],
+            }
+            record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            outcome = ImplementerRuntime().run(config=config, run_record_path=record_path)
+
+        handoff = outcome.runtime.handoff
+        self.assertEqual("READY_FOR_VALIDATION", outcome.status)
+        self.assertIn("Implementation recovery context:", handoff)
+        self.assertIn("Read the validation artifact and identify the root cause before editing.", handoff)
+        self.assertIn("You may run focused diagnostic commands or tests for the failing area.", handoff)
+        self.assertIn("leave the full configured validation pipeline to ADOS", handoff)
+        self.assertIn("Do not start review, publish, merge, deploy, or mutate GitHub", handoff)
+        self.assertNotIn("Do not run validation, start review", handoff)
+        self.assertLess(handoff.index("stderr: AssertionError: expected visible row"), handoff.index("stdout: many passing test rows"))
+
     def test_durable_state_serialization_resume_compatibility_and_handoff_bound(self):
         with self.project(project_id="aiverse-shaped") as fixture:
             runner = self.runner(fixture.root / "runner.py", "success")
