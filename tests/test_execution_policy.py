@@ -27,6 +27,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(1_800_000, policy.validation.timeout_ms)
         self.assertEqual(3, policy.implementation.max_recovery_rounds)
         self.assertEqual(3, policy.validation.max_recovery_rounds)
+        self.assertEqual(1, policy.validation.max_recovery_reopens)
         self.assertEqual(2, policy.validation.max_no_change_recovery_rounds)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             policy.schema_version = "2"
@@ -92,6 +93,19 @@ class ExecutionPolicyTests(unittest.TestCase):
             ExecutionPolicy.from_mapping(raw)
 
         self.assertEqual("POLICY_INVALID_VALIDATION_MAX_RECOVERY_ROUNDS", context.exception.code)
+
+    def test_validation_max_recovery_reopens_is_optional_and_positive_when_present(self):
+        raw = self.valid_mapping()
+        raw["execution_policy"]["validation"]["max_recovery_reopens"] = 2
+        policy = ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual(2, policy.validation.max_recovery_reopens)
+
+        raw["execution_policy"]["validation"]["max_recovery_reopens"] = 0
+        with self.assertRaises(PolicyValidationError) as context:
+            ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual("POLICY_INVALID_VALIDATION_MAX_RECOVERY_REOPENS", context.exception.code)
 
     def test_no_change_max_recovery_rounds_is_optional_and_positive_when_present(self):
         raw = self.valid_mapping()

@@ -865,6 +865,171 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", run_record["validationRecoveryBlock"]["reasonCode"])
         self.assertIn("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in result.pipeline_result.violations})
 
+    def test_exhausted_validation_recovery_without_runtime_change_remains_blocked(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validator = fixture.root / "validator.py"
+            implementer = fixture.root / "implementer-new-candidate.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path(f'candidate-{value + 1}.txt').write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+                validation_max_recovery_rounds=1,
+            )
+
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Exhaust unchanged recovery", None, fixture.config))
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Exhaust unchanged recovery", None, fixture.config))
+            record_path = Path(first.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-exhaust-unchanged-recovery" / "ados-run.json"
+            run_record = json.loads(record_path.read_text(encoding="utf-8"))
+            stages = [stage.id for stage in second.pipeline_result.stages]
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+
+        self.assertTrue(second.resumed)
+        self.assertEqual("VALIDATION_FAILED", first.status)
+        self.assertEqual("VALIDATION_FAILED", second.status)
+        self.assertEqual("2", implementer_count)
+        self.assertIn("recoveryEngine", run_record["validationRecoveryBlock"])
+        self.assertNotIn("validation_recovery_reopen", stages)
+        self.assertIn("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in second.pipeline_result.violations})
+
+    def test_legacy_exhausted_validation_recovery_reopens_once_after_runtime_upgrade(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            implementer = fixture.root / "implementer-new-candidate.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path(f'candidate-{value + 1}.txt').write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if not Path('candidate-3.txt').exists():\n"
+                "    sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+                validation_max_recovery_rounds=1,
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy exhausted recovery", None, fixture.config))
+            record_path = Path(first.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-legacy-exhausted-recovery" / "ados-run.json"
+            legacy_record = json.loads(record_path.read_text(encoding="utf-8"))
+            legacy_record["validationRecoveryBlock"].pop("recoveryEngine", None)
+            legacy_record["validationRecoveryBlock"].pop("policyFingerprint", None)
+            record_path.write_text(json.dumps(legacy_record, indent=2), encoding="utf-8")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy exhausted recovery", None, fixture.config))
+            completed_record = second.pipeline_result.run_record
+            stages = [stage.id for stage in second.pipeline_result.stages]
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertTrue(second.resumed)
+        self.assertEqual("VALIDATION_FAILED", first.status)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual(first.run_record.run_id, second.run_record.run_id)
+        self.assertIn("validation_recovery_reopen", stages)
+        self.assertEqual("3", implementer_count)
+        self.assertEqual("1", reviewer_count)
+        self.assertEqual(1, len(completed_record["validationRecoveryReopens"]))
+        self.assertEqual("legacy_exhausted_block_without_runtime_identity", completed_record["validationRecoveryReopens"][0]["reason"])
+        self.assertEqual(1, completed_record["validationRecoveryReopens"][0]["previousRecoveryAttemptCount"])
+        self.assertEqual(second.pipeline_result.candidate.candidate_sha, second.pipeline_result.validation.head_after)
+        self.assertEqual(second.pipeline_result.candidate.candidate_sha, second.pipeline_result.review.reviewed_sha)
+
+    def test_legacy_exhausted_validation_recovery_second_reopen_blocks(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validator = fixture.root / "validator.py"
+            implementer = fixture.root / "implementer-new-candidate.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path(f'candidate-{value + 1}.txt').write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            validator.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+                validation_max_recovery_rounds=1,
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy reopen once", None, fixture.config))
+            record_path = Path(first.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-legacy-reopen-once" / "ados-run.json"
+            legacy_record = json.loads(record_path.read_text(encoding="utf-8"))
+            legacy_record["validationRecoveryBlock"].pop("recoveryEngine", None)
+            legacy_record["validationRecoveryBlock"].pop("policyFingerprint", None)
+            record_path.write_text(json.dumps(legacy_record, indent=2), encoding="utf-8")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy reopen once", None, fixture.config))
+            third = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy reopen once", None, fixture.config))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("VALIDATION_FAILED", second.status)
+        self.assertEqual("VALIDATION_FAILED", third.status)
+        self.assertEqual("4", implementer_count)
+        self.assertIn("VALIDATION_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in third.pipeline_result.violations})
+
+    def test_legacy_exhausted_validation_recovery_reopen_blocks_wrong_branch(self):
+        with self.project() as fixture:
+            validator = fixture.root / "validator.py"
+            validator.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+                validation_max_recovery_rounds=1,
+            )
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy reopen wrong branch", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-legacy-reopen-wrong-branch" / "ados-run.json"
+            legacy_record = json.loads(record_path.read_text(encoding="utf-8"))
+            legacy_record["validationRecoveryBlock"].pop("recoveryEngine", None)
+            legacy_record["validationRecoveryBlock"].pop("policyFingerprint", None)
+            record_path.write_text(json.dumps(legacy_record, indent=2), encoding="utf-8")
+            self.git(worktree, "checkout", "-b", "wrong-validation-reopen-branch")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Legacy reopen wrong branch", None, fixture.config))
+
+        self.assertEqual("BLOCKED", second.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+        self.assertIn("FEATURE_BRANCH_EXISTS", self.codes(second))
+        self.assertIn("WORKTREE_PATH_EXISTS", self.codes(second))
+
     def test_validation_failure_invokes_automatic_recovery_before_review(self):
         with self.project() as fixture:
             implementer_counter = fixture.root / "implementer-count.txt"
