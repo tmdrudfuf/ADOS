@@ -336,11 +336,26 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
             f"Reviewer: {record['reviewer']}",
             "",
             "Mutate only the feature worktree. Do not modify the primary repository.",
-            "Do not run validation, start review, publish, merge, deploy, or mutate GitHub from this runtime.",
+            "Do not start review, publish, merge, deploy, or mutate GitHub from this runtime.",
+            "Do not run the full configured ADOS validation pipeline; ADOS will run authoritative validation after implementation.",
     ]
     validation_failure = record.get("validationFailure")
     if record.get("status") == "VALIDATION_FAILED" and isinstance(validation_failure, dict):
-        lines.extend(["", "Implementation recovery context:", f"Recovery stage: {validation_failure.get('recoveryStage', 'implementation_recovery')}", f"Candidate SHA: {validation_failure.get('candidateSha', '')}", f"Validation status: {validation_failure.get('status', '')}", f"HEAD before validation: {validation_failure.get('headBefore', '')}", f"HEAD after validation: {validation_failure.get('headAfter', '')}", "Failed validation commands:"])
+        lines.extend(
+            [
+                "",
+                "Implementation recovery context:",
+                f"Recovery stage: {validation_failure.get('recoveryStage', 'implementation_recovery')}",
+                f"Candidate SHA: {validation_failure.get('candidateSha', '')}",
+                f"Validation status: {validation_failure.get('status', '')}",
+                f"HEAD before validation: {validation_failure.get('headBefore', '')}",
+                f"HEAD after validation: {validation_failure.get('headAfter', '')}",
+                "Read the validation artifact and identify the root cause before editing.",
+                "You may run focused diagnostic commands or tests for the failing area.",
+                "Do not weaken tests or bypass validation; leave the full configured validation pipeline to ADOS.",
+                "Failed validation commands:",
+            ]
+        )
         commands = validation_failure.get("failedCommands", [])
         if isinstance(commands, list):
             for command in commands:
@@ -351,8 +366,8 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                         f"- command: {command.get('command', '')}",
                         f"  exit code: {command.get('exitCode', '')}",
                         f"  reason code: {command.get('reasonCode', '')}",
-                        f"  stdout: {command.get('stdout', '')}",
                         f"  stderr: {command.get('stderr', '')}",
+                        f"  stdout: {command.get('stdout', '')}",
                     ]
                 )
     implementation_failure = record.get("implementationFailure")
