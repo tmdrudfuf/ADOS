@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -18,7 +19,7 @@ from .repository_provider import RepositoryProviderError
 from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
-from .worktree_provider import GitWorktreeProvider
+from .worktree_provider import GitWorktreeProvider, WorktreeRecord
 
 
 RESUMABLE_RUN_STATUSES = {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", *PIPELINE_READY_STATUSES}
@@ -117,6 +118,7 @@ class RunResult:
     implementer_result: ImplementerRuntimeOutcome | None = None
     pipeline_result: PipelineOutcome | None = None
     resumed: bool = False
+    adopted: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -128,6 +130,7 @@ class RunResult:
             "implementerResult": self.implementer_result.to_dict() if self.implementer_result else None,
             "pipelineResult": self.pipeline_result.to_dict() if self.pipeline_result else None,
             "resumed": self.resumed,
+            "adopted": self.adopted,
         }
 
 
@@ -173,16 +176,34 @@ class RunService:
             return RunResult("BLOCKED", eligibility)
 
         resume = self._resumable_run(project_path, config, plan)
-        eligibility = self._eligibility(project_path, config, config_path, plan, resume)
+        adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description)
+        eligibility = self._eligibility(project_path, config, config_path, plan, resume, adoption if adoption and adoption.status == "ADOPTABLE" else None)
+        if adoption is not None and adoption.status == "REFUSED":
+            eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
         if eligibility.status != "ELIGIBLE":
             return RunResult("INVALID" if eligibility.status == "INVALID" else "BLOCKED", eligibility, plan)
         if request.dry_run:
-            return RunResult("PLANNED", eligibility, plan, resume.record if resume else self._record(config, request, plan), resumed=resume is not None)
+            planned_record = resume.record if resume else adoption.record if adoption is not None else self._record(config, request, plan)
+            return RunResult("PLANNED", eligibility, plan, planned_record, resumed=resume is not None, adopted=adoption is not None)
 
         if resume is not None:
             pipeline_result = self.pipeline.run(config=config, run_record_path=resume.record_path, timeout_ms=request.implementer_timeout_ms)
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
+
+        if adoption is not None:
+            record_path = self._persist_orphaned_candidate_adoption(adoption)
+            pipeline_result = self.pipeline.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
+            updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
+            return RunResult(
+                pipeline_result.status,
+                eligibility,
+                plan,
+                updated_record,
+                implementer_result=pipeline_result.implementer_result,
+                pipeline_result=pipeline_result,
+                adopted=True,
+            )
 
         worktree_request = WorktreeRequest(
             primary_repository_path=project_path,
@@ -255,7 +276,15 @@ class RunService:
             raise _RunPlanError("AMBIGUOUS_RESUMABLE_RUN", "multiple resumable runs match this feature", {"feature_slug": slug})
         return next(iter(matches)) if matches else None
 
-    def _eligibility(self, project_path: Path, config: ProjectConfig, config_path: Path, plan: RunPlan, resume: "_ResumeCandidate | None" = None) -> RunEligibility:
+    def _eligibility(
+        self,
+        project_path: Path,
+        config: ProjectConfig,
+        config_path: Path,
+        plan: RunPlan,
+        resume: "_ResumeCandidate | None" = None,
+        adoption: "_OrphanedCandidateAdoption | None" = None,
+    ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
         doctor = self.doctor.run(DoctorRequest(project_path=project_path, config_path=config_path))
@@ -278,7 +307,7 @@ class RunService:
                 )
             )
         active_count = status.workflow.evidence.get("active_worktree_count", "0")
-        if active_count not in {"", "0"} and resume is None:
+        if active_count not in {"", "0"} and resume is None and adoption is None:
             violations.append(
                 _violation(
                     "ACTIVE_WORKTREE_PRESENT",
@@ -308,24 +337,242 @@ class RunService:
             violations.append(RunViolation(violation.code, violation.message, violation.evidence))
 
         spec_number = int(plan.spec_number)
-        if (project_path / "specs" / f"{plan.spec_number}-{plan.feature_slug}").exists() and resume is None:
+        if (project_path / "specs" / f"{plan.spec_number}-{plan.feature_slug}").exists() and resume is None and adoption is None:
             violations.append(_violation("SPEC_DIRECTORY_EXISTS", "requested Spec directory already exists", {"spec": plan.spec_number}))
-        if any(_spec_number(path.name) == spec_number for path in (project_path / "specs").glob("*") if path.is_dir()) and resume is None:
+        if any(_spec_number(path.name) == spec_number for path in (project_path / "specs").glob("*") if path.is_dir()) and resume is None and adoption is None:
             violations.append(_violation("SPEC_NUMBER_USED", "requested Spec number already has a directory", {"spec": plan.spec_number}))
         try:
-            if self.git.branch_exists(project_path, plan.feature_branch) and resume is None:
+            if self.git.branch_exists(project_path, plan.feature_branch) and resume is None and adoption is None:
                 violations.append(_violation("FEATURE_BRANCH_EXISTS", "feature branch already exists", {"branch": plan.feature_branch}))
         except RepositoryProviderError as exc:
             violations.append(_violation(exc.code, exc.message, {"branch": plan.feature_branch}))
-        if Path(plan.feature_worktree).exists() and resume is None:
+        if Path(plan.feature_worktree).exists() and resume is None and adoption is None:
             violations.append(_violation("WORKTREE_PATH_EXISTS", "feature worktree path already exists", {"worktree_path": plan.feature_worktree}))
         for record in self.worktrees.list_worktrees(project_path):
             if resume is not None and record.path == Path(resume.record.feature_worktree).resolve():
+                continue
+            if adoption is not None and adoption.worktree is not None and record.path == adoption.worktree.path:
                 continue
             if record.branch == plan.feature_branch or _branch_spec_number(record.branch) == spec_number:
                 violations.append(_violation("CONFLICTING_WORKTREE", "active worktree already owns requested Spec or branch", {"branch": record.branch, "path": str(record.path)}))
 
         return RunEligibility("BLOCKED" if violations else "ELIGIBLE", tuple(violations), tuple(warnings))
+
+    def _orphaned_candidate_adoption(
+        self,
+        project_path: Path,
+        config: ProjectConfig,
+        plan: RunPlan,
+        feature_description: str,
+    ) -> "_OrphanedCandidateAdoption | None":
+        expected_path = Path(plan.feature_worktree).resolve()
+        expected_branch = plan.feature_branch
+        spec_number = int(plan.spec_number)
+        try:
+            worktrees = self.worktrees.list_worktrees(project_path)
+        except RepositoryProviderError as exc:
+            return _orphan_refusal(exc.code, exc.message, {"project_path": str(project_path)})
+
+        related = tuple(
+            record
+            for record in worktrees
+            if record.path == expected_path
+            or record.branch == expected_branch
+            or _branch_spec_number(record.branch) == spec_number
+        )
+        if not related:
+            try:
+                branch_exists = self.git.branch_exists(project_path, expected_branch)
+            except RepositoryProviderError as exc:
+                return _orphan_refusal(exc.code, exc.message, {"expected_branch": expected_branch})
+            if expected_path.exists() or branch_exists:
+                return _orphan_refusal(
+                    "ORPHANED_CANDIDATE_WORKTREE_NOT_REGISTERED",
+                    "orphaned candidate adoption requires one registered deterministic feature worktree",
+                    {"expected_worktree": str(expected_path), "expected_branch": expected_branch, "branch_exists": str(branch_exists)},
+                )
+            return None
+        if len(related) != 1:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_AMBIGUOUS",
+                "multiple worktrees correspond to the requested Spec or feature identity",
+                {"worktrees": ",".join(f"{record.branch}@{record.path}" for record in related)},
+            )
+
+        worktree = related[0]
+        if worktree.path != expected_path:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_WORKTREE_PATH_MISMATCH",
+                "candidate worktree does not match the deterministic feature worktree path",
+                {"expected": str(expected_path), "actual": str(worktree.path)},
+            )
+        if worktree.branch != expected_branch:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_BRANCH_MISMATCH",
+                "candidate worktree does not use the deterministic feature branch",
+                {"expected": expected_branch, "actual": worktree.branch},
+            )
+
+        record_path = self._record_path(expected_path, plan.spec_number, plan.feature_slug)
+        run_dir = record_path.parent
+        if run_dir.exists() and any(run_dir.iterdir()):
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_DURABLE_EVIDENCE_CONFLICT",
+                "existing durable artifacts prevent reconstructing an orphaned candidate run",
+                {"run_directory": str(run_dir)},
+            )
+
+        try:
+            status = self.git.status(expected_path)
+        except RepositoryProviderError as exc:
+            return _orphan_refusal(exc.code, exc.message, {"worktree": str(expected_path)})
+        if status.root != expected_path:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_WORKTREE_ROOT_MISMATCH",
+                "candidate repository root does not match the deterministic worktree",
+                {"expected": str(expected_path), "actual": str(status.root)},
+            )
+        if status.branch != expected_branch:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_BRANCH_MISMATCH",
+                "candidate repository is no longer on the deterministic feature branch",
+                {"expected": expected_branch, "actual": status.branch},
+            )
+        if status.staged or status.dirty_tracked or status.untracked:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_DIRTY",
+                "orphaned candidate adoption requires a clean worktree",
+                {
+                    "staged": ",".join(status.staged),
+                    "dirty_tracked": ",".join(status.dirty_tracked),
+                    "untracked": ",".join(status.untracked),
+                },
+            )
+
+        candidate_sha = status.head
+        if candidate_sha == plan.authoritative_base_sha:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_EQUALS_BASE",
+                "worktree HEAD equals the authoritative base and is not an orphaned feature candidate",
+                {"candidate_sha": candidate_sha, "base_sha": plan.authoritative_base_sha},
+            )
+        try:
+            committed_sha = self.git.ref_head(expected_path, f"{candidate_sha}^{{commit}}")
+            already_merged = self.git.is_ancestor(project_path, candidate_sha, plan.authoritative_base_sha)
+            descends_from_base = self.git.is_ancestor(expected_path, plan.authoritative_base_sha, candidate_sha)
+        except RepositoryProviderError as exc:
+            return _orphan_refusal(exc.code, exc.message, {"candidate_sha": candidate_sha})
+        if committed_sha != candidate_sha:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_SHA_INVALID",
+                "candidate HEAD is not a resolvable committed SHA",
+                {"candidate_sha": candidate_sha, "resolved_sha": committed_sha},
+            )
+        if already_merged:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_ALREADY_MERGED",
+                "candidate is already reachable from the authoritative primary HEAD",
+                {"candidate_sha": candidate_sha, "primary_head": plan.authoritative_base_sha},
+            )
+        if not descends_from_base:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_LINEAGE_MISMATCH",
+                "candidate does not descend from the authoritative base",
+                {"candidate_sha": candidate_sha, "base_sha": plan.authoritative_base_sha},
+            )
+
+        guardian = self.guardian.audit(
+            policy=config.execution_policy,
+            repository_path=project_path,
+            expected_repository_path=config.primary_repository_path,
+            expected_branch=config.default_branch,
+            expected_head=plan.authoritative_base_sha,
+            allowed_local_paths=config.allowed_primary_local_paths,
+        )
+        if guardian.status != "PASS":
+            return _OrphanedCandidateAdoption(
+                status="REFUSED",
+                violations=tuple(RunViolation(f"ORPHANED_CANDIDATE_PRIMARY_{item.code}", item.message, item.evidence) for item in guardian.violations),
+            )
+        try:
+            changed_files = self.git.changed_files(expected_path, plan.authoritative_base_sha, candidate_sha)
+        except RepositoryProviderError as exc:
+            return _orphan_refusal(exc.code, exc.message, {"candidate_sha": candidate_sha, "base_sha": plan.authoritative_base_sha})
+        if not changed_files:
+            return _orphan_refusal(
+                "ORPHANED_CANDIDATE_DIFF_EMPTY",
+                "candidate has no committed file delta from the authoritative base",
+                {"candidate_sha": candidate_sha, "base_sha": plan.authoritative_base_sha},
+            )
+
+        base_record = self._record_from_plan(config, plan, feature_description)
+        record = WorkflowRunRecord(**{**asdict(base_record), "status": "READY_FOR_VALIDATION", "next_stage": "validation"})
+        timestamp = datetime.now(timezone.utc).isoformat()
+        evidence: dict[str, Any] = {
+            "status": "ADOPTED",
+            "reason": "normal_resumable_run_not_found",
+            "previousDurableRunDiscovery": "NONE",
+            "runId": record.run_id,
+            "projectId": record.project_id,
+            "specNumber": record.spec_number,
+            "featureDescription": record.feature_description,
+            "featureSlug": record.feature_slug,
+            "authoritativeBaseSha": record.authoritative_base_sha,
+            "expectedBranch": expected_branch,
+            "actualBranch": status.branch,
+            "expectedWorktree": str(expected_path),
+            "actualWorktree": str(status.root),
+            "candidateSha": candidate_sha,
+            "changedFiles": list(changed_files),
+            "worktreeClean": True,
+            "candidateCommitted": True,
+            "candidateAlreadyMerged": False,
+            "ancestryResult": "DESCENDANT",
+            "primaryGuardian": guardian.to_dict(),
+            "recoveryTimestamp": timestamp,
+            "recoverySequence": 1,
+            "selectedNextStage": "validation",
+            "externalValidationTrusted": False,
+            "externalReviewTrusted": False,
+        }
+        return _OrphanedCandidateAdoption(
+            status="ADOPTABLE",
+            record=record,
+            record_path=record_path,
+            worktree=worktree,
+            candidate_sha=candidate_sha,
+            changed_files=changed_files,
+            evidence=evidence,
+        )
+
+    def _persist_orphaned_candidate_adoption(self, adoption: "_OrphanedCandidateAdoption") -> Path:
+        if adoption.status != "ADOPTABLE" or adoption.record is None or adoption.record_path is None:
+            raise RuntimeError("orphaned candidate adoption is not persistable")
+        adoption.record_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path = adoption.record_path.with_name("orphaned-candidate-adoption.json")
+        adoption_record = {
+            **(adoption.evidence or {}),
+            "status": "ADOPTED",
+            "artifact": str(artifact_path),
+            "adoptedCandidateSha": adoption.candidate_sha,
+            "adoptedChangedFiles": list(adoption.changed_files),
+            "previousDurableRunDiscovery": "NONE",
+            "selectedNextStage": "validation",
+        }
+        run_record = adoption.record.to_dict()
+        run_record["orphanedCandidateAdoption"] = adoption_record
+        _write_mapping(adoption.record_path, run_record)
+        _write_mapping(artifact_path, adoption_record)
+        _write_mapping(
+            adoption.record_path.with_name("candidate.json"),
+            {
+                "status": "COMMITTED",
+                "candidate_sha": adoption.candidate_sha,
+                "changed_files": list(adoption.changed_files),
+                "source": "orphaned_candidate_adoption",
+            },
+        )
+        return adoption.record_path
 
     def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
@@ -553,3 +800,23 @@ class _RunPlanError(RuntimeError):
 class _ResumeCandidate:
     record_path: Path
     record: WorkflowRunRecord
+
+
+@dataclass(frozen=True)
+class _OrphanedCandidateAdoption:
+    status: str
+    violations: tuple[RunViolation, ...] = ()
+    record: WorkflowRunRecord | None = None
+    record_path: Path | None = None
+    worktree: WorktreeRecord | None = None
+    candidate_sha: str = ""
+    changed_files: tuple[str, ...] = ()
+    evidence: dict[str, Any] | None = None
+
+
+def _orphan_refusal(code: str, message: str, evidence: dict[str, str]) -> _OrphanedCandidateAdoption:
+    return _OrphanedCandidateAdoption("REFUSED", (RunViolation(code, message, evidence),))
+
+
+def _write_mapping(path: Path, payload: dict[str, Any] | None) -> None:
+    path.write_text(json.dumps(payload or {}, indent=2, sort_keys=True), encoding="utf-8")

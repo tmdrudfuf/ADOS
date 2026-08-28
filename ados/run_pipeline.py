@@ -295,6 +295,23 @@ class RunPipeline:
         if not isinstance(record, dict):
             return PipelineOutcome("BLOCKED", (_stage("record", "BLOCKED", {}),), {}, violations=(_violation("RUN_RECORD_INVALID", "run record is unavailable", {"path": str(run_record_path)}),))
 
+        orphaned_adoption = record.get("orphanedCandidateAdoption")
+        if (
+            record.get("status") == "READY_FOR_VALIDATION"
+            and isinstance(orphaned_adoption, dict)
+            and orphaned_adoption.get("status") == "ADOPTED"
+        ):
+            adoption_artifact = run_record_path.with_name("orphaned-candidate-adoption.json")
+            if not adoption_artifact.exists():
+                _write_json(adoption_artifact, orphaned_adoption)
+            stages.append(
+                _stage(
+                    "orphaned_candidate_adoption",
+                    "PASS",
+                    {"candidate_sha": str(orphaned_adoption.get("adoptedCandidateSha", ""))},
+                )
+            )
+
         if record.get("status") == "NO_CHANGES_CLEANUP_INCOMPLETE":
             return self._resume_no_changes_cleanup(config, run_record_path, record, stages)
         if record.get("status") in {"MERGED", "CLEANUP_INCOMPLETE"}:
@@ -646,6 +663,15 @@ class RunPipeline:
         if not changed:
             adopted_candidate = _adopted_candidate_from_record(record, status.head)
             if adopted_candidate is not None:
+                _write_json(
+                    Path(record["featureWorktree"]) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "candidate.json",
+                    {
+                        "status": "COMMITTED",
+                        "candidate_sha": adopted_candidate.candidate_sha,
+                        "changed_files": list(adopted_candidate.changed_files),
+                        "source": "durable_candidate_adoption",
+                    },
+                )
                 return adopted_candidate
         if changed:
             add = _run(("git", "add", "-A"), worktree)
@@ -2526,7 +2552,7 @@ def _candidate_from_mapping(raw: Any) -> CandidatePreparationResult | None:
 
 
 def _adopted_candidate_from_record(record: dict[str, Any], current_head: str) -> CandidatePreparationResult | None:
-    for key in ("reviewChangesRecoveryAdoption", "recoveryCandidateAdoption"):
+    for key in ("reviewChangesRecoveryAdoption", "recoveryCandidateAdoption", "orphanedCandidateAdoption"):
         adoption = record.get(key)
         if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
             continue

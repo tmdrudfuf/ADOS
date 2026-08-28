@@ -140,11 +140,15 @@ class StatusService:
         merged_spec_commits = _merged_spec_commits(project_path, current_head, self.git, merged_pull_requests)
         merged_pull_request_heads = tuple(record.head_ref_oid for record in merged_pull_requests)
         worktrees = self._worktrees(project_path, current_head, latest_merged_spec, merged_spec_commits, merged_pull_request_heads)
+        active_adoption = _active_orphaned_candidate_evidence(worktrees)
+        evidence_head = current_head
+        if active_adoption is not None:
+            evidence, evidence_head = active_adoption
         spec = _spec_status(project_path, worktrees, current_head, self.git, merged_pull_requests)
-        validation = _validation_status(evidence, current_head)
-        review = _review_status(evidence, current_head)
-        exact_head = _exact_head_status(evidence, current_head)
-        publication = _publication_status(evidence, current_head)
+        validation = _validation_status(evidence, evidence_head)
+        review = _review_status(evidence, evidence_head)
+        exact_head = _exact_head_status(evidence, evidence_head)
+        publication = _publication_status(evidence, evidence_head)
         workflow = _workflow_status(worktrees, spec, publication, doctor_result.status)
         recovery = _recovery_status(guardian, validation, review, exact_head, workflow)
         next_action = _next_action(guardian, workflow, validation, review, exact_head, spec, recovery)
@@ -370,6 +374,42 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
     return {}
 
 
+def _active_orphaned_candidate_evidence(worktrees: tuple[WorktreeStatus, ...]) -> tuple[dict[str, Any], str] | None:
+    active = [worktree for worktree in worktrees if not worktree.primary and worktree.classification == "ACTIVE"]
+    if len(active) != 1:
+        return None
+    worktree = active[0]
+    runs = Path(worktree.path) / ".agent-workflow" / "runs"
+    if not runs.is_dir():
+        return None
+    for record_path in sorted(runs.glob("*/ados-run.json"), key=lambda path: str(path)):
+        record = _read_json_object(record_path)
+        if not isinstance(record, dict):
+            continue
+        adoption = record.get("orphanedCandidateAdoption")
+        if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
+            continue
+        candidate_sha = str(adoption.get("adoptedCandidateSha", ""))
+        if not candidate_sha or candidate_sha != worktree.head:
+            return ({}, worktree.head)
+        evidence: dict[str, Any] = {}
+        validation = _read_json_object(record_path.with_name("validation-runtime.json"))
+        if isinstance(validation, dict) and str(validation.get("status", "")) == "PASS":
+            evidence["validated_sha"] = str(validation.get("head_after", ""))
+            evidence["validation_status"] = "PASS"
+        review = _read_json_object(record_path.with_name("review-runtime.json"))
+        if isinstance(review, dict):
+            decision = str(review.get("decision", ""))
+            evidence["reviewed_sha"] = str(review.get("reviewed_sha", ""))
+            evidence["claude_decision"] = decision
+            if decision == "Approved":
+                evidence["approved_review_sha"] = str(review.get("reviewed_sha", ""))
+        evidence["merge_commit"] = str(record.get("mergeCommitSha", ""))
+        evidence["pull_request"] = str(record.get("pullRequest", ""))
+        return evidence, worktree.head
+    return None
+
+
 def _active_run_resumable(record_path: Path, status: str) -> bool:
     resumable_statuses = {
         "READY_FOR_IMPLEMENTATION",
@@ -535,9 +575,9 @@ def _validation_status(evidence: dict[str, Any] | None, current_head: str) -> St
 
 
 def _review_status(evidence: dict[str, Any] | None, current_head: str) -> StatusSection:
-    if not evidence or not evidence.get("approved_review_sha"):
+    if not evidence or not (evidence.get("approved_review_sha") or evidence.get("reviewed_sha")):
         return StatusSection("Unavailable", {})
-    reviewed = str(evidence.get("approved_review_sha", ""))
+    reviewed = str(evidence.get("approved_review_sha") or evidence.get("reviewed_sha") or "")
     decision = str(evidence.get("claude_decision", "Unknown"))
     if _is_merged_candidate_evidence(evidence, current_head) and decision == "Approved":
         return StatusSection(

@@ -103,6 +103,228 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("BLOCKED", result.status)
         self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
+    def test_orphaned_candidate_is_adopted_without_implementer_and_receives_fresh_validation_and_review(self):
+        with self.project(implementer_mode="count") as fixture:
+            feature = "Orphaned candidate adoption"
+            plan, worktree, candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            publisher = FakePublisher(fixture.repo, remote_drift=True)
+
+            result = RunService(pipeline=RunPipeline(publisher=publisher)).run(RunRequest(fixture.repo, feature, 1, fixture.config))
+
+            run_dir = worktree / ".agent-workflow" / "runs" / f"{plan.spec_number}-{plan.feature_slug}"
+            adoption = json.loads((run_dir / "orphaned-candidate-adoption.json").read_text(encoding="utf-8"))
+            candidate = json.loads((run_dir / "candidate.json").read_text(encoding="utf-8"))
+            validation = json.loads((run_dir / "validation-runtime.json").read_text(encoding="utf-8"))
+            review = json.loads((run_dir / "review-runtime.json").read_text(encoding="utf-8"))
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            implementer_called = (fixture.root / "implementer-count.txt").exists()
+
+        stages = [stage.id for stage in result.pipeline_result.stages]
+        self.assertTrue(result.adopted)
+        self.assertFalse(result.resumed)
+        self.assertEqual("PUBLICATION_BLOCKED", result.status)
+        self.assertIn("orphaned_candidate_adoption", stages)
+        self.assertEqual("SKIPPED", next(stage.status for stage in result.pipeline_result.stages if stage.id == "implementer"))
+        self.assertFalse(implementer_called)
+        self.assertEqual(candidate_sha, adoption["candidateSha"])
+        self.assertFalse(adoption["externalValidationTrusted"])
+        self.assertFalse(adoption["externalReviewTrusted"])
+        self.assertEqual(candidate_sha, candidate["candidate_sha"])
+        self.assertEqual("PASS", validation["status"])
+        self.assertEqual(candidate_sha, validation["head_before"])
+        self.assertEqual(candidate_sha, validation["head_after"])
+        self.assertEqual("Approved", review["decision"])
+        self.assertEqual(candidate_sha, review["reviewed_sha"])
+        self.assertEqual("Passed", status.validation.state)
+        self.assertEqual(candidate_sha, status.validation.evidence["validated_sha"])
+        self.assertEqual("Approved", status.review.state)
+        self.assertEqual(candidate_sha, status.review.evidence["reviewed_sha"])
+
+    def test_orphaned_candidate_dry_run_is_visible_without_durable_mutation(self):
+        with self.project() as fixture:
+            feature = "Visible orphan adoption"
+            _plan, worktree, _candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            before = self.snapshot(fixture.repo)
+
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+            after = self.snapshot(fixture.repo)
+
+        self.assertEqual("PLANNED", result.status)
+        self.assertTrue(result.adopted)
+        self.assertEqual("validation", result.run_record.next_stage)
+        self.assertEqual(before, after)
+        self.assertFalse((worktree / ".agent-workflow").exists())
+
+    def test_interrupted_orphan_adoption_resumes_from_durable_record_without_implementer(self):
+        with self.project(implementer_mode="count") as fixture:
+            feature = "Interrupted orphan adoption"
+            plan, _worktree, candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            service = RunService()
+            adoption = service._orphaned_candidate_adoption(fixture.repo, load_project_config(fixture.config), plan, feature)
+            record_path = service._persist_orphaned_candidate_adoption(adoption)
+            record_path.with_name("orphaned-candidate-adoption.json").unlink()
+            record_path.with_name("candidate.json").unlink()
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True))).run(
+                RunRequest(fixture.repo, feature, 1, fixture.config)
+            )
+
+            candidate = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))
+            validation = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+            review = json.loads(record_path.with_name("review-runtime.json").read_text(encoding="utf-8"))
+            implementer_called = (fixture.root / "implementer-count.txt").exists()
+            adoption_artifact_exists = record_path.with_name("orphaned-candidate-adoption.json").exists()
+
+        self.assertTrue(result.resumed)
+        self.assertFalse(result.adopted)
+        self.assertIn("orphaned_candidate_adoption", [stage.id for stage in result.pipeline_result.stages])
+        self.assertFalse(implementer_called)
+        self.assertTrue(adoption_artifact_exists)
+        self.assertEqual(candidate_sha, candidate["candidate_sha"])
+        self.assertEqual(candidate_sha, validation["head_after"])
+        self.assertEqual(candidate_sha, review["reviewed_sha"])
+
+    def test_adopted_candidate_status_does_not_reuse_historical_validation_or_review(self):
+        with self.project() as fixture:
+            feature = "Isolated orphan evidence"
+            plan, _worktree, _candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            self.write_archive(
+                fixture.repo,
+                spec="000-historical",
+                validated_sha=plan.authoritative_base_sha,
+                approved_review_sha=plan.authoritative_base_sha,
+            )
+            service = RunService()
+            config = load_project_config(fixture.config)
+            adoption = service._orphaned_candidate_adoption(fixture.repo, config, plan, feature)
+            service._persist_orphaned_candidate_adoption(adoption)
+
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("Unavailable", status.validation.state)
+        self.assertEqual("Unavailable", status.review.state)
+        self.assertEqual("Unavailable", status.exact_head_gate.state)
+        self.assertEqual("001", status.workflow.evidence["run_spec"])
+
+    def test_adopted_candidate_status_never_promotes_failed_or_nonapproved_evidence(self):
+        with self.project() as fixture:
+            feature = "Safe orphan status evidence"
+            plan, worktree, candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            service = RunService()
+            adoption = service._orphaned_candidate_adoption(fixture.repo, load_project_config(fixture.config), plan, feature)
+            record_path = service._persist_orphaned_candidate_adoption(adoption)
+            record_path.with_name("validation-runtime.json").write_text(
+                json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}),
+                encoding="utf-8",
+            )
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps({"status": "PASS", "decision": "Changes Requested", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Changes Requested", "stderr": "", "violations": []}),
+                encoding="utf-8",
+            )
+            changes_requested = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            record_path.with_name("validation-runtime.json").write_text(
+                json.dumps({"status": "BLOCK", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}),
+                encoding="utf-8",
+            )
+            failed_validation = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+        self.assertEqual("ChangesRequested", changes_requested.review.state)
+        self.assertEqual("Unavailable", changes_requested.exact_head_gate.state)
+        self.assertEqual("Unavailable", failed_validation.validation.state)
+        self.assertEqual("Unavailable", failed_validation.exact_head_gate.state)
+
+    def test_dirty_orphaned_candidate_is_refused_without_cleanup(self):
+        with self.project() as fixture:
+            feature = "Dirty orphan adoption"
+            _plan, worktree, _candidate_sha = self.create_orphaned_candidate(fixture, feature, 1)
+            (worktree / "orphan.txt").write_text("dirty after commit\n", encoding="utf-8")
+            before = self.snapshot(worktree)
+
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+            after = self.snapshot(worktree)
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_DIRTY", self.codes(result))
+        self.assertEqual(before, after)
+
+    def test_orphaned_candidate_wrong_branch_is_refused(self):
+        with self.project() as fixture:
+            feature = "Wrong branch orphan"
+            plan = RunService()._plan(fixture.repo, load_project_config(fixture.config), RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+            self.create_orphaned_candidate(fixture, feature, 1, branch="codex/001-other", path=Path(plan.feature_worktree))
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_BRANCH_MISMATCH", self.codes(result))
+
+    def test_orphaned_candidate_wrong_worktree_path_is_refused(self):
+        with self.project() as fixture:
+            feature = "Wrong path orphan"
+            wrong_path = fixture.root / "wrong-orphan-path"
+            self.create_orphaned_candidate(fixture, feature, 1, path=wrong_path)
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_WORKTREE_PATH_MISMATCH", self.codes(result))
+
+    def test_orphaned_candidate_equal_to_base_is_refused(self):
+        with self.project() as fixture:
+            feature = "Empty orphan candidate"
+            self.create_orphaned_candidate(fixture, feature, 1, commit=False)
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_EQUALS_BASE", self.codes(result))
+
+    def test_orphaned_candidate_outside_base_lineage_is_refused(self):
+        with self.project() as fixture:
+            feature = "Unrelated orphan candidate"
+            plan = RunService()._plan(fixture.repo, load_project_config(fixture.config), RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+            worktree = Path(plan.feature_worktree)
+            self.git(fixture.repo, "worktree", "add", "--detach", str(worktree), plan.authoritative_base_sha)
+            self.git(worktree, "switch", "--orphan", plan.feature_branch)
+            (worktree / "README.md").write_text("unrelated root\n", encoding="utf-8")
+            self.git(worktree, "add", "-A")
+            self.git(worktree, "commit", "-m", "unrelated orphan")
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_LINEAGE_MISMATCH", self.codes(result))
+
+    def test_multiple_spec_worktrees_make_orphaned_candidate_ambiguous(self):
+        with self.project() as fixture:
+            feature = "Ambiguous orphan candidate"
+            self.create_orphaned_candidate(fixture, feature, 1)
+            other = fixture.root / "other-spec-one"
+            self.git(fixture.repo, "worktree", "add", "-b", "codex/001-other", str(other), "HEAD")
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_AMBIGUOUS", self.codes(result))
+
+    def test_existing_durable_resume_wins_over_orphan_adoption(self):
+        with self.project() as fixture:
+            record_path, record = self.create_durable_run(fixture, "Durable wins", 1, "READY_FOR_IMPLEMENTATION")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True))).run(
+                RunRequest(fixture.repo, "Durable wins", 1, fixture.config)
+            )
+
+        self.assertTrue(result.resumed)
+        self.assertFalse(result.adopted)
+        self.assertEqual(record["runId"], result.run_record.run_id)
+        self.assertFalse(record_path.with_name("orphaned-candidate-adoption.json").exists())
+
+    def test_already_merged_orphaned_candidate_is_refused(self):
+        with self.project() as fixture:
+            feature = "Merged orphan candidate"
+            plan, _worktree, _candidate = self.create_orphaned_candidate(fixture, feature, 1)
+            self.git(fixture.repo, "merge", "--no-ff", plan.feature_branch, "-m", "merge orphan")
+            self.git(fixture.repo, "update-ref", "refs/remotes/origin/main", self.head(fixture.repo))
+            result = RunService().run(RunRequest(fixture.repo, feature, 1, fixture.config, dry_run=True))
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ORPHANED_CANDIDATE_ALREADY_MERGED", self.codes(result))
+
     def test_status_human_intervention_blocks_before_mutation(self):
         with self.project() as fixture:
             first = fixture.root / "first"
@@ -2970,6 +3192,22 @@ class CliRunTests(unittest.TestCase):
             "status": self.git(repo, "status", "--short").stdout,
             "worktrees": self.git(repo, "worktree", "list", "--porcelain").stdout,
         }
+
+    def create_orphaned_candidate(self, fixture, feature, spec, *, branch=None, path=None, commit=True):
+        service = RunService()
+        config = load_project_config(fixture.config)
+        plan = service._plan(fixture.repo, config, RunRequest(fixture.repo, feature, spec, fixture.config, dry_run=True))
+        worktree = Path(path or plan.feature_worktree)
+        feature_branch = branch or plan.feature_branch
+        self.git(fixture.repo, "worktree", "add", "-b", feature_branch, str(worktree), plan.authoritative_base_sha)
+        if commit:
+            spec_dir = worktree / "specs" / f"{plan.spec_number}-{plan.feature_slug}"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "spec.md").write_text(f"# {feature}\n", encoding="utf-8")
+            (worktree / "orphan.txt").write_text("orphaned candidate\n", encoding="utf-8")
+            self.git(worktree, "add", "specs", "orphan.txt")
+            self.git(worktree, "commit", "-m", f"spec {plan.spec_number}: {feature}")
+        return plan, worktree, self.head(worktree)
 
     def create_durable_run(self, fixture, feature, spec, status):
         service = RunService()
