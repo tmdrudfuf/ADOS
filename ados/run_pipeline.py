@@ -413,7 +413,11 @@ class RunPipeline:
             side_effect_violations = _isolate_review_artifacts(Path(record["featureWorktree"]), run_record_path, record, review_scope, candidate_result.candidate_sha, review_artifact_snapshot)
             if side_effect_violations:
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result, block_violations=side_effect_violations, block_cause="review_side_effect")
-                return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=side_effect_violations)
+                recovered = self._recover_review_side_effect(config, run_record_path, _read_json(run_record_path) or record, candidate_result, validation_result, review_result, side_effect_violations, "review", stages)
+                if isinstance(recovered, PipelineOutcome):
+                    return recovered
+                stages.append(_stage("review_side_effect_recovery", "PASS", {"attempt": str(recovered["round"]), "candidate_sha": candidate_result.candidate_sha}))
+                return self._resume_review(config, run_record_path, _read_json(run_record_path) or record, stages, timeout_ms)
             if review_result.status != "PASS":
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=tuple(_from_review(item) for item in review_result.violations))
@@ -1297,13 +1301,15 @@ class RunPipeline:
         if resumable:
             review_runtime_resume = review_runtime_unavailable_evidence(record, candidate_raw, validation_raw, review_raw)
             changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
-            if review_runtime_resume and changes_requested_resume:
+            side_effect_resume_gate = review_side_effect_recovery_evidence(record, candidate_raw, validation_raw, review_raw)
+            if review_runtime_resume and changes_requested_resume and side_effect_resume_gate:
                 return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=resumable)
 
         candidate = _candidate_from_mapping(candidate_raw)
         validation = _validation_from_mapping(validation_raw) if isinstance(validation_raw, dict) else None
         if candidate is None or validation is None:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, violations=(_violation("REVIEW_RESUME_EVIDENCE_MISSING", "review resume evidence is incomplete", {}),))
+        side_effect_resume = review_side_effect_recovery_evidence(record, candidate_raw, validation_raw, review_raw)
 
         worktree = Path(record["featureWorktree"])
         try:
@@ -1315,6 +1321,22 @@ class RunPipeline:
         if branch != record["featureBranch"]:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {"branch": branch})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_BRANCH_MISMATCH", "review resume worktree is on a different branch", {"expected": str(record["featureBranch"]), "actual": branch}),))
         if status.staged or status.dirty_tracked or status.untracked:
+            if not side_effect_resume:
+                recovered = self._recover_review_side_effect(
+                    config,
+                    run_record_path,
+                    record,
+                    candidate,
+                    validation,
+                    _review_from_mapping(review_raw) if isinstance(review_raw, dict) else None,
+                    (_violation("REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", "review left product worktree dirty", {"status": _format_status(status)}),),
+                    "resume",
+                    stages,
+                )
+                if isinstance(recovered, PipelineOutcome):
+                    return recovered
+                stages.append(_stage("review_side_effect_recovery", "PASS", {"attempt": str(recovered["round"]), "candidate_sha": candidate.candidate_sha}))
+                return self._resume_review(config, run_record_path, _read_json(run_record_path) or record, stages, timeout_ms)
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_WORKTREE_DIRTY", "review resume requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),))
         if current_head != candidate.candidate_sha:
             changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
@@ -1346,7 +1368,11 @@ class RunPipeline:
         side_effect_violations = _isolate_review_artifacts(worktree, run_record_path, record, review_scope, candidate.candidate_sha, review_artifact_snapshot)
         if side_effect_violations:
             _write_review_block_status(run_record_path, record, review, candidate, validation, block_violations=side_effect_violations, block_cause="review_side_effect")
-            return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=side_effect_violations)
+            recovered = self._recover_review_side_effect(config, run_record_path, _read_json(run_record_path) or record, candidate, validation, review, side_effect_violations, "review", stages)
+            if isinstance(recovered, PipelineOutcome):
+                return recovered
+            stages.append(_stage("review_side_effect_recovery", "PASS", {"attempt": str(recovered["round"]), "candidate_sha": candidate.candidate_sha}))
+            return self._resume_review(config, run_record_path, _read_json(run_record_path) or record, stages, timeout_ms)
         if review.status != "PASS":
             _write_review_block_status(run_record_path, record, review, candidate, validation)
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=tuple(_from_review(item) for item in review.violations))
@@ -1362,6 +1388,123 @@ class RunPipeline:
         if exact.status != "MATCH":
             return PipelineOutcome("EXACT_HEAD_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, exact_head_gate=exact.to_dict(), violations=tuple(PipelineViolation(item.code, item.message, item.evidence) for item in exact.violations))
         return self._publish(config, run_record_path, record, stages, (), None, candidate, validation, review, exact.to_dict())
+
+    def _recover_review_side_effect(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        candidate: CandidatePreparationResult,
+        validation: ValidationResult,
+        review: ReviewResult | None,
+        side_effect_violations: tuple[PipelineViolation, ...],
+        source: str,
+        stages: list[PipelineStage],
+    ) -> dict[str, Any] | PipelineOutcome:
+        evidence_violations = review_side_effect_recovery_evidence(record, candidate.to_dict(), validation.to_dict(), review.to_dict() if review else None)
+        if evidence_violations:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {})]), record, candidate=candidate, validation=validation, review=review, violations=evidence_violations)
+
+        max_rounds = config.execution_policy.review.max_side_effect_recovery_rounds
+        attempts = _review_side_effect_recovery_attempts(record)
+        round_number = len(attempts) + 1
+        if round_number > max_rounds:
+            violation = _violation(
+                "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED",
+                "review side-effect recovery exceeded the configured retry budget",
+                {"max_rounds": str(max_rounds), "candidate_sha": candidate.candidate_sha},
+            )
+            _write_review_block_status(run_record_path, record, review or _empty_review(candidate.candidate_sha), candidate, validation, block_violations=(violation,), block_cause="review_side_effect")
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), _read_json(run_record_path) or record, candidate=candidate, validation=validation, review=review, violations=(violation,))
+
+        worktree = Path(str(record.get("featureWorktree", "")))
+        try:
+            before = self.git.status(worktree)
+            head_before = self.git.current_head(worktree)
+            branch_before = self.git.current_branch(worktree)
+        except RepositoryProviderError as exc:
+            violation = _violation(exc.code, exc.message, {"worktree": str(worktree)})
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {})]), record, candidate=candidate, validation=validation, review=review, violations=(violation,))
+
+        safety_violations = _review_side_effect_restore_safety(record, candidate, before, head_before, branch_before)
+        if safety_violations:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), record, candidate=candidate, validation=validation, review=review, violations=safety_violations)
+
+        restore_violations = _restore_review_side_effects(worktree, before)
+        try:
+            after = self.git.status(worktree)
+            head_after = self.git.current_head(worktree)
+            branch_after = self.git.current_branch(worktree)
+        except RepositoryProviderError as exc:
+            after = before
+            head_after = ""
+            branch_after = ""
+            restore_violations = (*restore_violations, _violation(exc.code, exc.message, {"worktree": str(worktree)}))
+
+        clean_after = not (after.staged or after.dirty_tracked or after.untracked)
+        if head_after != candidate.candidate_sha:
+            restore_violations = (*restore_violations, _violation("REVIEW_SIDE_EFFECT_RECOVERY_HEAD_CHANGED", "review side-effect recovery changed HEAD", {"candidate_sha": candidate.candidate_sha, "head_after": head_after}))
+        if branch_after != str(record.get("featureBranch", "")):
+            restore_violations = (*restore_violations, _violation("REVIEW_SIDE_EFFECT_RECOVERY_BRANCH_CHANGED", "review side-effect recovery changed branch", {"expected": str(record.get("featureBranch", "")), "actual": branch_after}))
+        if not clean_after:
+            restore_violations = (*restore_violations, _violation("REVIEW_SIDE_EFFECT_RECOVERY_STILL_DIRTY", "review side-effect recovery did not restore a clean worktree", {"status": _format_status(after)}))
+
+        attempt = {
+            "round": round_number,
+            "maxRounds": max_rounds,
+            "status": "BLOCKED" if restore_violations else "RESTORED",
+            "source": source,
+            "recordedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "candidateSha": candidate.candidate_sha,
+            "validatedSha": validation.head_after,
+            "reviewedSha": review.reviewed_sha if review else "",
+            "reviewDecision": review.decision if review else "",
+            "headBeforeRecovery": head_before,
+            "headAfterRecovery": head_after,
+            "branchBeforeRecovery": branch_before,
+            "branchAfterRecovery": branch_after,
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(worktree),
+            "stagedPaths": list(before.staged),
+            "dirtyTrackedPaths": list(before.dirty_tracked),
+            "untrackedPaths": list(before.untracked),
+            "sideEffectViolationCodes": [violation.code for violation in side_effect_violations],
+            "cleanAfterRecovery": clean_after,
+            "restoreViolations": [violation.to_dict() for violation in restore_violations],
+        }
+        updated = dict(_read_json(run_record_path) or record)
+        updated_attempts = _review_side_effect_recovery_attempts(updated)
+        updated_attempts.append(attempt)
+        updated["reviewSideEffectRecoveryAttempts"] = updated_attempts
+        _write_json(run_record_path.with_name(f"review-side-effect-recovery-{round_number}.json"), attempt)
+
+        if restore_violations:
+            updated["status"] = "REVIEW_BLOCKED"
+            updated["nextStage"] = "recovery"
+            updated["reviewBlock"] = {
+                "status": review.status if review else "BLOCK",
+                "decision": review.decision if review else "Unavailable",
+                "reasonCode": restore_violations[0].code,
+                "reasonCodes": [violation.code for violation in restore_violations],
+                "blockCause": "review_side_effect",
+                "transient": False,
+                "resumeStage": "",
+                "reviewer": str(record.get("reviewer", "")),
+                "candidateSha": candidate.candidate_sha,
+                "validatedSha": validation.head_after,
+                "baseSha": str(record.get("authoritativeBaseSha", "")),
+                "reviewedSha": review.reviewed_sha if review else candidate.candidate_sha,
+                "exitCode": review.exit_code if review else 0,
+                "timedOut": False,
+            }
+            _write_json(run_record_path, updated)
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), updated, candidate=candidate, validation=validation, review=review, violations=restore_violations)
+
+        updated["status"] = "REVIEW_BLOCKED"
+        updated["nextStage"] = "review"
+        _write_json(run_record_path, updated)
+        return attempt
 
     def _adopt_review_changes_recovery_candidate(
         self,
@@ -1969,6 +2112,95 @@ def _isolate_review_artifacts(
     return tuple(violations)
 
 
+def _format_status(status: Any) -> str:
+    lines: list[str] = []
+    lines.extend(f"A  {path}" for path in getattr(status, "staged", ()))
+    lines.extend(f" M {path}" for path in getattr(status, "dirty_tracked", ()))
+    lines.extend(f"?? {path}" for path in getattr(status, "untracked", ()))
+    return "\n".join(lines)
+
+
+def _review_side_effect_recovery_attempts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    attempts = record.get("reviewSideEffectRecoveryAttempts")
+    if not isinstance(attempts, list):
+        return []
+    return [dict(item) for item in attempts if isinstance(item, dict)]
+
+
+def _review_side_effect_restore_safety(
+    record: dict[str, Any],
+    candidate: CandidatePreparationResult,
+    status: Any,
+    current_head: str,
+    branch: str,
+) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+    expected_branch = str(record.get("featureBranch", ""))
+    if branch != expected_branch:
+        violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_BRANCH_MISMATCH", "review side-effect recovery requires the recorded feature branch", {"expected": expected_branch, "actual": branch}))
+    if current_head != candidate.candidate_sha:
+        violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_HEAD_MISMATCH", "review side-effect recovery requires HEAD to match the reviewed candidate", {"candidate_sha": candidate.candidate_sha, "current_head": current_head}))
+    if not (status.staged or status.dirty_tracked or status.untracked):
+        violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_NOT_DIRTY", "review side-effect recovery requires side-effect changes to restore", {}))
+    for path in (*status.staged, *status.dirty_tracked, *status.untracked):
+        if _unsafe_relative_path(path):
+            violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_PATH_UNSAFE", "review side-effect recovery path is unsafe", {"path": path}))
+    return tuple(violations)
+
+
+def _unsafe_relative_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").strip()
+    if not normalized or normalized.startswith("/") or normalized.startswith("../") or "/../" in normalized or normalized == "..":
+        return True
+    parts = [part for part in normalized.split("/") if part]
+    return any(part == ".git" for part in parts)
+
+
+def _restore_review_side_effects(worktree: Path, status: Any) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+    staged = tuple(dict.fromkeys(str(path) for path in getattr(status, "staged", ())))
+    dirty = tuple(dict.fromkeys(str(path) for path in getattr(status, "dirty_tracked", ())))
+    untracked = tuple(dict.fromkeys(str(path) for path in getattr(status, "untracked", ())))
+    if staged:
+        restore_staged = _run(("git", "restore", "--staged", "--", *staged), worktree)
+        if restore_staged.returncode != 0:
+            violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_RESTORE_STAGED_FAILED", "review side-effect staged restore failed", {"stderr": restore_staged.stderr}))
+    tracked = tuple(dict.fromkeys((*staged, *dirty)))
+    if tracked:
+        restore_tracked = _run(("git", "restore", "--worktree", "--", *tracked), worktree)
+        if restore_tracked.returncode != 0:
+            violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_RESTORE_TRACKED_FAILED", "review side-effect tracked restore failed", {"stderr": restore_tracked.stderr}))
+    for relative in untracked:
+        try:
+            _remove_untracked_side_effect(worktree, relative)
+        except OSError as exc:
+            violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_REMOVE_UNTRACKED_FAILED", "review side-effect untracked removal failed", {"path": relative, "error": str(exc)}))
+        except ValueError as exc:
+            violations.append(_violation("REVIEW_SIDE_EFFECT_RECOVERY_PATH_UNSAFE", "review side-effect untracked path is unsafe", {"path": relative, "error": str(exc)}))
+    return tuple(violations)
+
+
+def _remove_untracked_side_effect(worktree: Path, relative: str) -> None:
+    if _unsafe_relative_path(relative):
+        raise ValueError("unsafe relative path")
+    root = worktree.resolve()
+    target = (worktree / relative).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("path escapes worktree") from exc
+    if not target.exists():
+        return
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+
+def _empty_review(candidate_sha: str) -> ReviewResult:
+    return ReviewResult("BLOCK", "Unavailable", candidate_sha, 0, "", "", ())
+
+
 def _review_artifact_candidates(worktree: Path, scope: str) -> tuple[Path, ...]:
     if not _is_path_like_scope(scope):
         return ()
@@ -2012,11 +2244,12 @@ def _write_review_block_status(
     transient = _is_transient_review_block(review)
     reason_code = _review_block_reason_code(review, block_violations)
     changes_requested = reason_code == "REVIEW_CHANGES_REQUESTED"
+    side_effect_recoverable = block_cause == "review_side_effect" and reason_code == "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"
     reason_codes = [violation.code for violation in block_violations] if block_violations else [violation.code for violation in review.violations]
     durable_cause = block_cause or ("review_decision" if changes_requested else "review_runtime")
     updated = dict(record)
     updated["status"] = "REVIEW_BLOCKED"
-    updated["nextStage"] = "review" if transient else "implementation_recovery" if changes_requested else "recovery"
+    updated["nextStage"] = "review" if transient or side_effect_recoverable else "implementation_recovery" if changes_requested else "recovery"
     updated["reviewBlock"] = {
         "status": review.status,
         "decision": review.decision,
@@ -2024,7 +2257,7 @@ def _write_review_block_status(
         "reasonCodes": reason_codes,
         "blockCause": durable_cause,
         "transient": transient,
-        "resumeStage": "review" if transient else "implementation_recovery" if changes_requested else "",
+        "resumeStage": "review" if transient or side_effect_recoverable else "implementation_recovery" if changes_requested else "",
         "reviewer": str(record.get("reviewer", "")),
         "candidateSha": candidate.candidate_sha,
         "validatedSha": validation.head_after,
@@ -2321,6 +2554,62 @@ def _review_from_mapping(raw: dict[str, Any]) -> ReviewResult:
         stderr=str(raw.get("stderr", "")),
         violations=violations,
     )
+
+
+def review_side_effect_recovery_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict) or str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_RECORD_INVALID", "review side-effect recovery requires REVIEW_BLOCKED durable state", {"status": str(record.get("status", "")) if isinstance(record, dict) else ""}),)
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_CANDIDATE_INVALID", "review side-effect recovery requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_VALIDATION_MISSING", "review side-effect recovery requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "PASS":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_VALIDATION_NOT_PASSED", "review side-effect recovery requires previously passed validation", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_SIDE_EFFECT_RECOVERY_VALIDATION_SHA_MISMATCH",
+                "review side-effect recovery validation evidence does not match candidate",
+                {"candidate_sha": candidate_result.candidate_sha, "head_before": validation_result.head_before, "head_after": validation_result.head_after},
+            ),
+        )
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REVIEW_MISSING", "review side-effect recovery requires review evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "PASS":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REVIEW_NOT_PASSED", "review side-effect recovery requires a successful reviewer execution", {"status": review_result.status}),)
+    if review_result.reviewed_sha != candidate_result.candidate_sha:
+        return (
+            _violation(
+                "REVIEW_SIDE_EFFECT_RECOVERY_REVIEW_SHA_MISMATCH",
+                "review side-effect recovery review evidence does not match candidate",
+                {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
+            ),
+        )
+    if review_result.exit_code != 0 or review_result.stderr:
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REVIEW_PROCESS_UNSAFE", "review side-effect recovery requires successful review process evidence", {"exit_code": str(review_result.exit_code)}),)
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_BLOCK_MISSING", "review side-effect recovery requires durable review block evidence", {}),)
+    if str(block.get("blockCause", "")) != "review_side_effect":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_BLOCK_CAUSE_UNSAFE", "review side-effect recovery requires review_side_effect block cause", {"blockCause": str(block.get("blockCause", ""))}),)
+    if str(block.get("reasonCode", "")) != "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REASON_UNSAFE", "review side-effect recovery is only supported for dirty-worktree side effects", {"reasonCode": str(block.get("reasonCode", ""))}),)
+    if block.get("reasonCodes", []) not in ([], ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"]):
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REASON_CODES_UNSAFE", "review side-effect recovery requires only dirty-worktree side-effect reason codes", {}),)
+    if str(block.get("candidateSha", "")) != candidate_result.candidate_sha or str(block.get("validatedSha", "")) != validation_result.head_after or str(block.get("reviewedSha", "")) != review_result.reviewed_sha:
+        return (
+            _violation(
+                "REVIEW_SIDE_EFFECT_RECOVERY_BLOCK_SHA_MISMATCH",
+                "review side-effect recovery durable block SHA evidence does not match artifacts",
+                {"candidate_sha": candidate_result.candidate_sha, "validated_sha": validation_result.head_after, "reviewed_sha": review_result.reviewed_sha},
+            ),
+        )
+    if str(block.get("exitCode", "0")) != "0" or str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
+        return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_PROCESS_UNSAFE", "review side-effect recovery requires successful non-transient reviewer process evidence", {}),)
+    return ()
 
 
 def transient_review_blocked_evidence(candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:

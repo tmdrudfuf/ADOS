@@ -13,7 +13,7 @@ from .git_provider import GitRepositoryProvider, MergedPullRequest
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import review_changes_requested_evidence, review_runtime_unavailable_evidence, transient_review_blocked_evidence
+from .run_pipeline import review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, transient_review_blocked_evidence
 from .worktree_classification import branch_spec_number, classify_worktree
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
 
@@ -405,6 +405,7 @@ def _active_run_resumable(record_path: Path, status: str) -> bool:
         not transient_review_blocked_evidence(candidate, validation, review)
         or not review_changes_requested_evidence(_read_json_object(record_path), candidate, validation, review, record_path)
         or not review_runtime_unavailable_evidence(_read_json_object(record_path), candidate, validation, review)
+        or not review_side_effect_recovery_evidence(_read_json_object(record_path), candidate, validation, review)
     )
 
 
@@ -441,12 +442,16 @@ def _review_block_evidence(record: dict[str, Any], record_path: Path) -> dict[st
         review = _read_json_object(record_path.with_name("review-runtime.json"))
         changes_requested_resumable = current_resumable and not review_changes_requested_evidence(record, candidate, validation, review, record_path)
         review_runtime_resumable = current_resumable and not review_runtime_unavailable_evidence(record, candidate, validation, review)
+        review_side_effect_resumable = current_resumable and not review_side_effect_recovery_evidence(record, candidate, validation, review)
         if changes_requested_resumable:
             if reason in {"", "REVIEW_BLOCK_UNCLASSIFIED"}:
                 reason = "REVIEW_CHANGES_REQUESTED"
             if not resume_stage:
                 resume_stage = "implementation_recovery"
         elif review_runtime_resumable:
+            if not resume_stage:
+                resume_stage = "review"
+        elif review_side_effect_resumable:
             if not resume_stage:
                 resume_stage = "review"
         return {

@@ -33,6 +33,7 @@ class PublicationPolicy:
 class ReviewPolicy:
     reviewer: str
     max_rounds: int
+    max_side_effect_recovery_rounds: int
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,12 @@ class ExecutionPolicy:
         review = _require_mapping(root, "review", "POLICY_MISSING_REVIEW")
         reviewer = _require_non_empty_string(review, "reviewer", "POLICY_MISSING_REVIEWER")
         max_rounds = _require_positive_int(review, "max_rounds", "POLICY_INVALID_MAX_ROUNDS")
+        max_side_effect_recovery_rounds = _optional_positive_int(
+            review,
+            "max_side_effect_recovery_rounds",
+            "POLICY_INVALID_REVIEW_MAX_SIDE_EFFECT_RECOVERY_ROUNDS",
+            1,
+        )
 
         cleanup = _require_mapping(root, "cleanup", "POLICY_MISSING_CLEANUP")
         autonomous = _require_bool(cleanup, "autonomous", "POLICY_INVALID_CLEANUP_AUTONOMOUS")
@@ -106,7 +113,11 @@ class ExecutionPolicy:
             schema_version=schema_version,
             implementation=ImplementationPolicy(max_recovery_rounds=implementation_max_recovery_rounds),
             publication=PublicationPolicy(merge_strategy=merge_strategy),
-            review=ReviewPolicy(reviewer=reviewer, max_rounds=max_rounds),
+            review=ReviewPolicy(
+                reviewer=reviewer,
+                max_rounds=max_rounds,
+                max_side_effect_recovery_rounds=max_side_effect_recovery_rounds,
+            ),
             cleanup=CleanupPolicy(autonomous=autonomous),
             guardian=GuardianPolicy(stop_on_uncertain=stop_on_uncertain),
             validation=ValidationPolicy(
