@@ -39,6 +39,9 @@ class RepositoryProvider(Protocol):
     def is_ancestor(self, path: Path, ancestor: str, descendant: str) -> bool:
         """Return whether ancestor is reachable from descendant."""
 
+    def changed_files(self, path: Path, base: str, head: str) -> tuple[str, ...]:
+        """Return files changed between two committed revisions."""
+
     def status(self, path: Path) -> RepositoryStatus:
         """Return read-only repository status."""
 

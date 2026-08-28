@@ -131,6 +131,10 @@ class GitRepositoryProvider:
         message = (completed.stderr or completed.stdout or "git merge-base failed").strip()
         raise RepositoryProviderError("GIT_ANCESTRY_UNAVAILABLE", message)
 
+    def changed_files(self, path: Path, base: str, head: str) -> tuple[str, ...]:
+        output = self._git(path, "diff", "--name-only", "--no-renames", f"{base}..{head}")
+        return tuple(line for line in output.splitlines() if line.strip())
+
     def status(self, path: Path) -> RepositoryStatus:
         root = self.repository_root(path)
         branch = self.current_branch(root)
