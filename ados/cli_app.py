@@ -321,8 +321,8 @@ def _format_run_human(result: RunResult) -> str:
         )
     if result.run_record:
         if result.resumed:
-            lines.extend(["Resuming existing run:", f"run_id: {result.run_record.run_id}", f"status: {result.run_record.status}", "Implementer invocation starting...", ""])
-        lines.extend(["Implementation handoff:", result.run_record.next_stage, ""])
+            lines.extend(["Resuming existing run:", f"run_id: {result.run_record.run_id}", f"status: {result.run_record.status}", ""])
+        lines.extend(["Durable stage:", result.run_record.next_stage, ""])
     if result.eligibility.violations:
         lines.append("Violations:")
         for violation in result.eligibility.violations:
