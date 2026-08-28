@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import ctypes
@@ -409,11 +409,11 @@ class RunPipeline:
                 ),
             )
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
+            stages.append(_stage("review", review_result.decision, {"reviewed_sha": review_result.reviewed_sha, "round": str(round_number)}))
             side_effect_violations = _isolate_review_artifacts(Path(record["featureWorktree"]), run_record_path, record, review_scope, candidate_result.candidate_sha, review_artifact_snapshot)
             if side_effect_violations:
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result, block_violations=side_effect_violations, block_cause="review_side_effect")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=side_effect_violations)
-            stages.append(_stage("review", review_result.decision, {"reviewed_sha": review_result.reviewed_sha, "round": str(round_number)}))
             if review_result.status != "PASS":
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=tuple(_from_review(item) for item in review_result.violations))
@@ -1342,17 +1342,17 @@ class RunPipeline:
             ),
         )
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
+        stages.append(_stage("review", review.decision, {"reviewed_sha": review.reviewed_sha, "resumed": "true"}))
         side_effect_violations = _isolate_review_artifacts(worktree, run_record_path, record, review_scope, candidate.candidate_sha, review_artifact_snapshot)
         if side_effect_violations:
             _write_review_block_status(run_record_path, record, review, candidate, validation, block_violations=side_effect_violations, block_cause="review_side_effect")
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=side_effect_violations)
-        stages.append(_stage("review", review.decision, {"reviewed_sha": review.reviewed_sha, "resumed": "true"}))
         if review.status != "PASS":
             _write_review_block_status(run_record_path, record, review, candidate, validation)
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=tuple(_from_review(item) for item in review.violations))
         if review.decision == "Changes Requested":
             _write_status(run_record_path, record, "READY_FOR_IMPLEMENTATION")
-            return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+            return _prepend_stages(self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms), tuple(stages))
         if review.decision != "Approved":
             _write_review_block_status(run_record_path, record, review, candidate, validation, block_violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),), block_cause="review_decision_unavailable")
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
@@ -2772,6 +2772,10 @@ def _bounded(value: str | bytes | None) -> str:
 
 def _stage(identifier: str, status: str, evidence: dict[str, str]) -> PipelineStage:
     return PipelineStage(identifier, status, evidence)
+
+
+def _prepend_stages(outcome: PipelineOutcome, prefix: tuple[PipelineStage, ...]) -> PipelineOutcome:
+    return replace(outcome, stages=tuple([*prefix, *outcome.stages]))
 
 
 def _violation(code: str, message: str, evidence: dict[str, str]) -> PipelineViolation:

@@ -1935,6 +1935,55 @@ class CliRunTests(unittest.TestCase):
         self.assertNotIn("WORKTREE_PATH_EXISTS", codes)
         self.assertNotIn("CONFLICTING_WORKTREE", codes)
 
+    def test_review_runtime_unavailable_changes_requested_resume_preserves_review_stage_before_fix(self):
+        with self.project() as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            implementer = fixture.root / "implementer.py"
+            reviewer = fixture.root / "reviewer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{implementer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path(f'candidate-{value + 1}.txt').write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('Waiting for the background validation run before issuing the final decision.')\n"
+                "elif value == 1:\n"
+                "    print('Changes Requested')\n"
+                "else:\n"
+                "    print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            publisher = FakePublisher(fixture.repo)
+            service = RunService(pipeline=RunPipeline(publisher=publisher))
+            first = service.run(RunRequest(fixture.repo, "Runtime unavailable then changes", None, fixture.config))
+            second = service.run(RunRequest(fixture.repo, "Runtime unavailable then changes", None, fixture.config))
+            stages = [(stage.id, stage.status) for stage in second.pipeline_result.stages]
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("2", implementer_count)
+        self.assertEqual("3", reviewer_count)
+        self.assertLess(stages.index(("review", "Changes Requested")), stages.index(("implementer", "READY_FOR_VALIDATION")))
+        self.assertIn(("review", "Approved"), stages)
+
     def test_review_blocked_sha_mismatch_does_not_resume(self):
         with self.project(implementer_mode="count") as fixture:
             reviewer = fixture.root / "reviewer.py"
@@ -2538,8 +2587,10 @@ class CliRunTests(unittest.TestCase):
             blocked_record = json.loads(record_path.read_text(encoding="utf-8"))
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
             second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review side effect", 1, fixture.config, dry_run=True))
+            stages = [(stage.id, stage.status) for stage in first.pipeline_result.stages]
 
         self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertIn(("review", "Changes Requested"), stages)
         self.assertEqual("REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", blocked_record["reviewBlock"]["reasonCode"])
         self.assertEqual("review_side_effect", blocked_record["reviewBlock"]["blockCause"])
         self.assertEqual("False", status.workflow.evidence["resumable"])
