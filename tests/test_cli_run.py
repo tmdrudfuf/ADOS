@@ -10,6 +10,7 @@ from unittest import mock
 
 import ados.run_pipeline as run_pipeline
 from ados.cli import main
+from ados.requirements_source import hash_requirements_content, read_durable_requirements_content, read_requirements_file, write_requirements_artifacts
 from ados.run_command import RunRequest, RunService
 from ados.run_pipeline import PipelineViolation, PullRequestInfo, RunPipeline
 from ados.project_config import load_project_config
@@ -23,6 +24,7 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual(0, completed.returncode)
         self.assertIn("--feature", completed.stdout)
+        self.assertIn("--requirements-file", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -41,6 +43,222 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual("READY_FOR_PUBLICATION", result.status)
         self.assertEqual("007", result.plan.spec_number)
+
+    def test_requirements_file_is_recorded_and_reaches_implementer_and_reviewer(self):
+        with self.project() as fixture:
+            requirements = fixture.root / "requirements.md"
+            requirements.write_text("runtime rendering is mandatory; metadata-only is insufficient\n", encoding="utf-8")
+            implementer_prompt = fixture.root / "implementer-prompt.txt"
+            reviewer_prompt = fixture.root / "reviewer-prompt.txt"
+            implementer = fixture.root / "requirements-implementer.py"
+            reviewer = fixture.root / "requirements-reviewer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                f"prompt_path = Path(r'{implementer_prompt}')\n"
+                "prompt = __import__('sys').stdin.read()\n"
+                "prompt_path.write_text(prompt, encoding='utf-8')\n"
+                "assert 'runtime rendering is mandatory' in prompt\n"
+                "spec_dir = Path('specs/001-rendered-office')\n"
+                "spec_dir.mkdir(parents=True, exist_ok=True)\n"
+                "(spec_dir / 'spec.md').write_text('# Rendered Office\\n\\nruntime rendering is mandatory\\n', encoding='utf-8')\n"
+                "Path('implementation.txt').write_text('rendered office candidate', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"prompt_path = Path(r'{reviewer_prompt}')\n"
+                "prompt = __import__('sys').stdin.read()\n"
+                "prompt_path.write_text(prompt, encoding='utf-8')\n"
+                "assert 'runtime rendering is mandatory' in prompt\n"
+                "assert 'metadata-only is insufficient' in prompt\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Rendered Office", 1, fixture.config, requirements_file=requirements)
+            )
+            archive_dir = fixture.repo / ".agent-workflow" / "runs" / "001-rendered-office"
+            run_record = json.loads((archive_dir / "ados-run.json").read_text(encoding="utf-8"))
+            requirements_metadata = json.loads((archive_dir / "requirements-source.json").read_text(encoding="utf-8"))
+            requirements_copy = (archive_dir / "requirements-source.md").read_text(encoding="utf-8")
+            implementer_prompt_text = implementer_prompt.read_text(encoding="utf-8")
+            reviewer_prompt_text = reviewer_prompt.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("true", str(run_record["requirements"]["supplied"]).lower())
+        self.assertEqual(run_record["requirements"]["sha256"], requirements_metadata["canonicalSha256"])
+        self.assertIn("runtime rendering is mandatory", requirements_copy)
+        self.assertIn("BEGIN AUTHORITATIVE REQUIREMENTS", implementer_prompt_text)
+        self.assertIn("BEGIN AUTHORITATIVE REQUIREMENTS", reviewer_prompt_text)
+
+    def test_requirements_file_reaches_bootstrap_spec_generation(self):
+        with self.project() as fixture:
+            requirements = fixture.root / "visual-requirements.md"
+            requirements.write_text(
+                "The existing visible office composition must be replaced. "
+                "Actual runtime Phaser rendering is mandatory. Metadata-only implementation is insufficient.\n",
+                encoding="utf-8",
+            )
+            prompt_path = fixture.root / "bootstrap-prompt.txt"
+            bootstrap = fixture.root / "bootstrap-spec.py"
+            bootstrap.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "prompt = sys.stdin.read()\n"
+                f"Path(r'{prompt_path}').write_text(prompt, encoding='utf-8')\n"
+                "spec_dir = Path('specs/135-rendered-office')\n"
+                "spec_dir.mkdir(parents=True, exist_ok=True)\n"
+                "if 'Actual runtime Phaser rendering is mandatory' in prompt and 'Metadata-only implementation is insufficient' in prompt:\n"
+                "    spec = '# Rendered Office\\n\\nActual runtime Phaser rendering is mandatory. Metadata-only implementation is insufficient.\\n'\n"
+                "else:\n"
+                "    spec = '# Rendered Office\\n\\nThis feature only adds metadata. Rendering is out of scope.\\n'\n"
+                "(spec_dir / 'spec.md').write_text(spec, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, bootstrap_commands=[f'"{sys.executable}" "{bootstrap}"'])
+            source = read_requirements_file(requirements)
+            self.assertFalse(hasattr(source, "code"))
+            run_dir = fixture.repo / ".agent-workflow" / "runs" / "135-rendered-office"
+            run_dir.mkdir(parents=True)
+            record_path = run_dir / "ados-run.json"
+            record = {
+                "projectId": "example-project",
+                "featureWorktree": str(fixture.repo),
+                "specNumber": "135",
+                "featureSlug": "rendered-office",
+                "requirements": source.to_record(),
+            }
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            write_requirements_artifacts(record_path, record, source)
+
+            result = RunPipeline()._bootstrap(load_project_config(fixture.config), record, record_path)
+            prompt = prompt_path.read_text(encoding="utf-8")
+            generated_spec = (fixture.repo / "specs" / "135-rendered-office" / "spec.md").read_text(encoding="utf-8")
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(0, result[0].exit_code)
+        self.assertIn("BEGIN AUTHORITATIVE REQUIREMENTS", prompt)
+        self.assertIn("Actual runtime Phaser rendering is mandatory", prompt)
+        self.assertIn("Actual runtime Phaser rendering is mandatory", generated_spec)
+        self.assertNotIn("Rendering is out of scope", generated_spec)
+
+    def test_resume_uses_durable_requirements_and_changed_external_file_blocks_when_supplied(self):
+        with self.project() as fixture:
+            requirements = fixture.root / "requirements.md"
+            requirements.write_text("original durable requirement\n", encoding="utf-8")
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer_prompt = fixture.root / "reviewer-prompt.txt"
+            reviewer = fixture.root / "transient-reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "count = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(count + 1), encoding='utf-8')\n"
+                "prompt = sys.stdin.read()\n"
+                "if count == 0:\n"
+                "    print('temporary outage', file=sys.stderr)\n"
+                "    sys.exit(3)\n"
+                f"Path(r'{reviewer_prompt}').write_text(prompt, encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, reviewer=f'"{sys.executable}" "{reviewer}"')
+            service = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo, remote_drift=True)))
+
+            first = service.run(RunRequest(fixture.repo, "Durable Requirements Resume", 1, fixture.config, requirements_file=requirements))
+            requirements.write_text("changed external requirement\n", encoding="utf-8")
+            blocked = service.run(RunRequest(fixture.repo, "Durable Requirements Resume", 1, fixture.config, dry_run=True, requirements_file=requirements))
+            run_dir = Path(first.plan.feature_worktree) / ".agent-workflow" / "runs" / "001-durable-requirements-resume"
+            durable_record = json.loads((run_dir / "ados-run.json").read_text(encoding="utf-8"))
+            durable_requirements = read_durable_requirements_content(run_dir / "ados-run.json", durable_record)
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("BLOCKED", blocked.status)
+        self.assertIn("REQUIREMENTS_FILE_CHANGED", self.codes(blocked))
+        self.assertIn("original durable requirement", durable_requirements)
+        self.assertNotIn("changed external requirement", durable_requirements)
+
+    def test_missing_and_empty_requirements_files_block_before_worktree_creation(self):
+        with self.project() as fixture:
+            missing = fixture.root / "missing.md"
+            empty = fixture.root / "empty.md"
+            empty.write_text("  \n", encoding="utf-8")
+
+            missing_result = RunService().run(RunRequest(fixture.repo, "Missing Requirements", 1, fixture.config, requirements_file=missing))
+            empty_result = RunService().run(RunRequest(fixture.repo, "Empty Requirements", 2, fixture.config, requirements_file=empty))
+
+        self.assertEqual("INVALID", missing_result.status)
+        self.assertEqual("INVALID", empty_result.status)
+        self.assertIn("REQUIREMENTS_FILE_READ_FAILED", self.codes(missing_result))
+        self.assertIn("REQUIREMENTS_FILE_EMPTY", self.codes(empty_result))
+
+    def test_requirements_hash_mismatch_blocks_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            record_path = run_dir / "ados-run.json"
+            record = {
+                "runId": "requirements-test",
+                "requirements": {
+                    "supplied": True,
+                    "sourcePath": str(run_dir / "requirements.md"),
+                    "sha256": hash_requirements_content("stable requirement\n"),
+                    "contentArtifact": "requirements-source.md",
+                    "metadataArtifact": "requirements-source.json",
+                },
+            }
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            (run_dir / "requirements-source.md").write_text("tampered requirement\n", encoding="utf-8")
+
+            outcome = RunPipeline().run(config=None, run_record_path=record_path, timeout_ms=1000)
+
+        self.assertEqual("BLOCKED", outcome.status)
+        self.assertIn("REQUIREMENTS_HASH_MISMATCH", [violation.code for violation in outcome.violations])
+
+    def test_metadata_only_scope_inversion_against_rendering_requirement_is_not_accepted(self):
+        with self.project() as fixture:
+            requirements = fixture.root / "visual-requirements.md"
+            requirements.write_text("runtime rendering is mandatory; metadata-only is insufficient\n", encoding="utf-8")
+            implementer = fixture.root / "metadata-only-implementer.py"
+            reviewer = fixture.root / "requirements-aware-reviewer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "spec_dir = Path('specs/001-physical-office')\n"
+                "spec_dir.mkdir(parents=True, exist_ok=True)\n"
+                "(spec_dir / 'spec.md').write_text('# Physical Office\\n\\nMetadata only; rendering is out of scope.\\n', encoding='utf-8')\n"
+                "Path('metadata.txt').write_text('metadata only', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "prompt = sys.stdin.read()\n"
+                "spec = Path('specs/001-physical-office/spec.md').read_text(encoding='utf-8')\n"
+                "if 'runtime rendering is mandatory' in prompt and 'rendering is out of scope' in spec:\n"
+                "    print('Decision: Changes Requested')\n"
+                "    print('Blocking: metadata-only scope contradicts authoritative rendering requirement')\n"
+                "else:\n"
+                "    print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+
+            result = RunService().run(RunRequest(fixture.repo, "Physical Office", 1, fixture.config, requirements_file=requirements))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertEqual("Changes Requested", result.pipeline_result.review.decision)
 
     def test_automatic_next_spec(self):
         with self.project(specs=[1, 3]) as fixture:
@@ -2975,12 +3193,19 @@ class CliRunTests(unittest.TestCase):
 
     def test_cleanup_resume_retries_primary_update_before_complete(self):
         with self.project() as fixture:
+            requirements = fixture.root / "requirements.md"
+            requirements.write_text("cleanup retry must preserve durable requirements\n", encoding="utf-8")
             blocker = PipelineViolation("PRIMARY_FETCH_FAILED", "primary fetch failed after merge", {"stderr": "blocked"})
             with mock.patch("ados.run_pipeline._update_primary_main", side_effect=[(blocker,), ()]):
-                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry primary update", None, fixture.config))
+                first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                    RunRequest(fixture.repo, "Retry primary update", None, fixture.config, requirements_file=requirements)
+                )
+                primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / "001-retry-primary-update"
+                requirements_copy_exists_after_block = (primary_run_dir / "requirements-source.md").exists()
                 second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Retry primary update", None, fixture.config))
 
         self.assertEqual("CLEANUP_INCOMPLETE", first.status)
+        self.assertTrue(requirements_copy_exists_after_block)
         self.assertTrue(second.resumed)
         self.assertEqual("COMPLETE", second.status)
 

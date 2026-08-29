@@ -16,6 +16,7 @@ from typing import Any
 from .git_provider import GitRepositoryProvider
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
+from .requirements_source import requirements_prompt_block, verify_durable_requirements
 from .repository_provider import RepositoryProviderError
 
 
@@ -209,6 +210,10 @@ class ImplementerRuntime:
                 violations.append(_violation("WORKTREE_BASE_STALE", "feature HEAD does not descend from recorded base", {"base": record["authoritativeBaseSha"]}))
         except RepositoryProviderError as exc:
             violations.append(_violation(exc.code, exc.message, {"worktree": str(worktree)}))
+        run_record_path = _run_record_path(record)
+        if run_record_path is not None:
+            for violation in verify_durable_requirements(run_record_path, record):
+                violations.append(_violation(violation.code, violation.message, violation.evidence))
         return tuple(violations)
 
     def _spawn(self, command: ImplementerCommand, handoff: str) -> subprocess.CompletedProcess[str] | subprocess.TimeoutExpired[str] | ImplementerViolation:
@@ -320,6 +325,7 @@ def _resolve_command(record: dict[str, Any], timeout_ms: int) -> ImplementerComm
 
 def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
     spec_path = Path(record["featureWorktree"]) / "specs" / f"{record['specNumber']}-{record['featureSlug']}"
+    run_record_path = _run_record_path(record)
     lines = [
             "ADOS Implementer Handoff",
             "",
@@ -339,6 +345,17 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
             "Do not start review, publish, merge, deploy, or mutate GitHub from this runtime.",
             "Do not run the full configured ADOS validation pipeline; ADOS will run authoritative validation after implementation.",
     ]
+    if run_record_path is not None:
+        requirements_block = requirements_prompt_block(run_record_path, record)
+        if requirements_block:
+            lines.extend(
+                [
+                    "",
+                    requirements_block,
+                    "",
+                    "Generated spec, plan, and tasks must reflect these requirements. If explicit requirements conflict with a smaller slice, stop and surface the conflict instead of redefining the feature.",
+                ]
+            )
     validation_failure = record.get("validationFailure")
     if record.get("status") == "VALIDATION_FAILED" and isinstance(validation_failure, dict):
         lines.extend(
@@ -421,6 +438,13 @@ def _read_record(path: Path) -> dict[str, Any] | ImplementerViolation:
     if not isinstance(raw, dict):
         return _violation("RUN_RECORD_INVALID", "run record must be a JSON object", {"path": str(path)})
     return raw
+
+
+def _run_record_path(record: dict[str, Any]) -> Path | None:
+    required = ("featureWorktree", "specNumber", "featureSlug")
+    if any(not isinstance(record.get(key), str) or not record.get(key) for key in required):
+        return None
+    return Path(record["featureWorktree"]) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-run.json"
 
 
 def _existing_evidence(record_path: Path) -> dict[str, Any] | None:
