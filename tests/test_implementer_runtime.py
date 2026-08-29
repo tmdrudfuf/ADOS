@@ -213,6 +213,38 @@ class ImplementerRuntimeTests(unittest.TestCase):
         self.assertNotIn("Do not run validation, start review", handoff)
         self.assertLess(handoff.index("stderr: AssertionError: expected visible row"), handoff.index("stdout: many passing test rows"))
 
+    def test_changes_requested_review_stdout_reaches_implementer_handoff(self):
+        with self.project() as fixture:
+            runner = self.runner(fixture.root / "runner.py", "success")
+            config = self.write_config(fixture.config, fixture.repo, implementer=f'"{sys.executable}" "{runner}"')
+            record_path = self.ready_run(fixture, config)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["status"] = "READY_FOR_IMPLEMENTATION"
+            record["nextStage"] = "implementation_recovery"
+            record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "BLOCK",
+                        "decision": "Unavailable",
+                        "reviewed_sha": "abc123",
+                        "exit_code": 0,
+                        "stdout": "# Review Decision: Changes Requested\n\nBlocking finding:\n\nvalidation_recovery_implementer is incorrectly classified as blocked.",
+                        "stderr": "",
+                        "violations": [{"code": "REVIEW_DECISION_UNAVAILABLE", "message": "reviewer output did not contain a supported decision", "evidence": {}}],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            outcome = ImplementerRuntime().run(config=config, run_record_path=record_path)
+
+        handoff = outcome.runtime.handoff
+        self.assertEqual("READY_FOR_VALIDATION", outcome.status)
+        self.assertIn("Independent review Changes Requested context:", handoff)
+        self.assertIn("# Review Decision: Changes Requested", handoff)
+        self.assertIn("validation_recovery_implementer is incorrectly classified as blocked", handoff)
+
     def test_durable_state_serialization_resume_compatibility_and_handoff_bound(self):
         with self.project(project_id="aiverse-shaped") as fixture:
             runner = self.runner(fixture.root / "runner.py", "success")

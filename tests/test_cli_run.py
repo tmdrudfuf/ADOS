@@ -2964,6 +2964,96 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(adopted_candidate, result.pipeline_result.validation.head_after)
         self.assertEqual(adopted_candidate, result.pipeline_result.review.reviewed_sha)
 
+    def test_review_decision_heading_parser_failed_run_resumes_without_new_run_conflicts_and_delivers_body(self):
+        with self.project() as fixture:
+            implementer_prompt = fixture.root / "implementer-prompt.txt"
+            implementer = fixture.root / "implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "prompt = sys.stdin.read()\n"
+                f"Path(r'{implementer_prompt}').write_text(prompt, encoding='utf-8')\n"
+                "assert 'validation_recovery_implementer is incorrectly classified as blocked' in prompt\n"
+                "Path('review-fix.txt').write_text('fixed review finding', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer_counter = fixture.root / "review-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('# Review Decision: Changes Requested')\n"
+                "    print('\\nBlocking finding:\\n\\nsrc/.../LiveAgentWorkVisualization.ts\\n\\nvalidation_recovery_implementer is incorrectly classified as blocked.')\n"
+                "else:\n"
+                "    print('# Review Decision: Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+            )
+            record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Review decision heading recovery", 1)
+            record["implementer"] = f'"{sys.executable}" "{implementer}"'
+            record["reviewer"] = f'"{sys.executable}" "{reviewer}"'
+            record["reviewBlock"].update(
+                {
+                    "status": "BLOCK",
+                    "decision": "Unavailable",
+                    "reasonCode": "REVIEW_DECISION_UNAVAILABLE",
+                    "reasonCodes": ["REVIEW_DECISION_UNAVAILABLE"],
+                    "blockCause": "review_runtime",
+                    "resumeStage": "",
+                }
+            )
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            historical_stdout = (
+                "# Review Decision: Changes Requested\n\n"
+                "Blocking finding:\n\n"
+                "src/.../LiveAgentWorkVisualization.ts\n\n"
+                "validation_recovery_implementer is incorrectly classified as blocked.\n"
+            )
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "status": "BLOCK",
+                        "decision": "Unavailable",
+                        "reviewed_sha": reviewed_candidate,
+                        "exit_code": 0,
+                        "stdout": historical_stdout,
+                        "stderr": "",
+                        "violations": [{"code": "REVIEW_DECISION_UNAVAILABLE", "message": "reviewer output did not contain a supported decision", "evidence": {}}],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Review decision heading recovery", 1, fixture.config))
+            codes = self.codes(result)
+            handoff = implementer_prompt.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("implementation_recovery", status.workflow.evidence["resume_stage"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", codes)
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", codes)
+        self.assertNotIn("WORKTREE_PATH_EXISTS", codes)
+        self.assertNotIn("CONFLICTING_WORKTREE", codes)
+        self.assertIn("Independent review Changes Requested context:", handoff)
+        self.assertIn("validation_recovery_implementer is incorrectly classified as blocked", handoff)
+        self.assertEqual("2", reviewer_count)
+        self.assertNotEqual(reviewed_candidate, result.pipeline_result.validation.head_after)
+        self.assertEqual(result.pipeline_result.validation.head_after, result.pipeline_result.review.reviewed_sha)
+
     def test_parser_failed_ambiguous_output_is_not_resumable(self):
         with self.project(implementer_mode="count") as fixture:
             record_path, record, reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Parser ambiguous review recovery", 1)
