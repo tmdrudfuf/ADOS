@@ -15,6 +15,7 @@ from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, SAFE_TIMEOUT_MS
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
+from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
 from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
@@ -33,6 +34,7 @@ class RunRequest:
     config_path: Path | None = None
     dry_run: bool = False
     implementer_timeout_ms: int = SAFE_TIMEOUT_MS
+    requirements_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -88,9 +90,10 @@ class WorkflowRunRecord:
     execution_policy_version: str
     status: str
     next_stage: str
+    requirements: dict[str, Any] | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
             "runId": self.run_id,
             "projectId": self.project_id,
             "specNumber": self.spec_number,
@@ -106,6 +109,9 @@ class WorkflowRunRecord:
             "status": self.status,
             "nextStage": self.next_stage,
         }
+        if self.requirements is not None:
+            record["requirements"] = self.requirements
+        return record
 
 
 @dataclass(frozen=True)
@@ -168,6 +174,12 @@ class RunService:
             config = load_project_config(config_path)
         except ProjectConfigError as exc:
             return _invalid(exc.code, exc.message, {"config_path": str(config_path)})
+        requirements: RequirementsSource | None = None
+        if request.requirements_file is not None:
+            loaded_requirements = read_requirements_file(request.requirements_file)
+            if isinstance(loaded_requirements, RequirementsViolation):
+                return _invalid(loaded_requirements.code, loaded_requirements.message, loaded_requirements.evidence)
+            requirements = loaded_requirements
 
         try:
             plan = self._plan(project_path, config, request)
@@ -175,15 +187,19 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),))
             return RunResult("BLOCKED", eligibility)
 
-        resume = self._resumable_run(project_path, config, plan)
-        adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description)
+        resume = self._resumable_run(project_path, config, plan, requirements)
+        if resume is not None:
+            requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
+            if requirements_violations:
+                return RunResult("BLOCKED", RunEligibility("BLOCKED", requirements_violations), plan, resume.record, resumed=True)
+        adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description, requirements)
         eligibility = self._eligibility(project_path, config, config_path, plan, resume, adoption if adoption and adoption.status == "ADOPTABLE" else None)
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
         if eligibility.status != "ELIGIBLE":
             return RunResult("INVALID" if eligibility.status == "INVALID" else "BLOCKED", eligibility, plan)
         if request.dry_run:
-            planned_record = resume.record if resume else adoption.record if adoption is not None else self._record(config, request, plan)
+            planned_record = resume.record if resume else adoption.record if adoption is not None else self._record(config, request, plan, requirements)
             return RunResult("PLANNED", eligibility, plan, planned_record, resumed=resume is not None, adopted=adoption is not None)
 
         if resume is not None:
@@ -219,10 +235,11 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", tuple(RunViolation(item.code, item.message, item.evidence) for item in created.violations))
             return RunResult("BLOCKED", eligibility, plan, worktree_result=created)
 
-        record = self._record(config, request, plan)
+        record = self._record(config, request, plan, requirements)
         record_path = self._record_path(Path(plan.feature_worktree), plan.spec_number, plan.feature_slug)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        write_requirements_artifacts(record_path, record.to_dict(), requirements)
         pipeline_result = self.pipeline.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -364,6 +381,7 @@ class RunService:
         config: ProjectConfig,
         plan: RunPlan,
         feature_description: str,
+        requirements: RequirementsSource | None = None,
     ) -> "_OrphanedCandidateAdoption | None":
         expected_path = Path(plan.feature_worktree).resolve()
         expected_branch = plan.feature_branch
@@ -505,7 +523,7 @@ class RunService:
                 {"candidate_sha": candidate_sha, "base_sha": plan.authoritative_base_sha},
             )
 
-        base_record = self._record_from_plan(config, plan, feature_description)
+        base_record = self._record_from_plan(config, plan, feature_description, requirements)
         record = WorkflowRunRecord(**{**asdict(base_record), "status": "READY_FOR_VALIDATION", "next_stage": "validation"})
         timestamp = datetime.now(timezone.utc).isoformat()
         evidence: dict[str, Any] = {
@@ -543,6 +561,7 @@ class RunService:
             candidate_sha=candidate_sha,
             changed_files=changed_files,
             evidence=evidence,
+            requirements=requirements,
         )
 
     def _persist_orphaned_candidate_adoption(self, adoption: "_OrphanedCandidateAdoption") -> Path:
@@ -562,6 +581,7 @@ class RunService:
         run_record = adoption.record.to_dict()
         run_record["orphanedCandidateAdoption"] = adoption_record
         _write_mapping(adoption.record_path, run_record)
+        write_requirements_artifacts(adoption.record_path, run_record, adoption.requirements)
         _write_mapping(artifact_path, adoption_record)
         _write_mapping(
             adoption.record_path.with_name("candidate.json"),
@@ -574,13 +594,13 @@ class RunService:
         )
         return adoption.record_path
 
-    def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan) -> "_ResumeCandidate | None":
+    def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan, requirements: RequirementsSource | None = None) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
         primary_runs = project_path / ".agent-workflow" / "runs"
-        candidates.extend(self._resume_candidates_in_run_dir(config, plan, None, primary_runs))
+        candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, None, primary_runs))
         for record in self.worktrees.list_worktrees(project_path):
             runs = record.path / ".agent-workflow" / "runs"
-            candidates.extend(self._resume_candidates_in_run_dir(config, plan, record, runs))
+            candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, record, runs))
         deduped: dict[tuple[str, str], _ResumeCandidate] = {}
         for candidate in candidates:
             deduped.setdefault((candidate.record.run_id, str(Path(candidate.record.feature_worktree).resolve())), candidate)
@@ -589,7 +609,7 @@ class RunService:
             return candidates[0]
         return None
 
-    def _resume_candidates_in_run_dir(self, config: ProjectConfig, plan: RunPlan, worktree_record: Any | None, runs: Path) -> list["_ResumeCandidate"]:
+    def _resume_candidates_in_run_dir(self, config: ProjectConfig, plan: RunPlan, requirements: RequirementsSource | None, worktree_record: Any | None, runs: Path) -> list["_ResumeCandidate"]:
         candidates: list[_ResumeCandidate] = []
         if not runs.is_dir():
             return candidates
@@ -597,7 +617,7 @@ class RunService:
             raw = _read_mapping(candidate_path)
             if raw is None:
                 continue
-            candidate = self._resume_candidate(config, plan, worktree_record, candidate_path, raw)
+            candidate = self._resume_candidate(config, plan, requirements, worktree_record, candidate_path, raw)
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
@@ -606,6 +626,7 @@ class RunService:
         self,
         config: ProjectConfig,
         plan: RunPlan,
+        requirements: RequirementsSource | None,
         worktree_record: Any | None,
         record_path: Path,
         raw: dict[str, Any],
@@ -642,10 +663,10 @@ class RunService:
             return None
         return _ResumeCandidate(record_path=record_path, record=record)
 
-    def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan) -> WorkflowRunRecord:
-        return self._record_from_plan(config, plan, request.feature_description)
+    def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan, requirements: RequirementsSource | None = None) -> WorkflowRunRecord:
+        return self._record_from_plan(config, plan, request.feature_description, requirements)
 
-    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str) -> WorkflowRunRecord:
+    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str, requirements: RequirementsSource | None = None) -> WorkflowRunRecord:
         run_id = _run_id(config.project_id, plan.spec_number, plan.feature_slug, plan.authoritative_base_sha)
         return WorkflowRunRecord(
             run_id=run_id,
@@ -662,6 +683,7 @@ class RunService:
             execution_policy_version=config.execution_policy.schema_version,
             status="READY_FOR_IMPLEMENTATION",
             next_stage="implementation_handoff",
+            requirements=requirements.to_record() if requirements is not None else None,
         )
 
     def _record_path(self, worktree: Path, spec: str, slug: str) -> Path:
@@ -673,6 +695,7 @@ def _invalid(code: str, message: str, evidence: dict[str, str]) -> RunResult:
 
 
 def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
+    requirements = raw.get("requirements")
     return WorkflowRunRecord(
         run_id=str(raw["runId"]),
         project_id=str(raw["projectId"]),
@@ -688,7 +711,21 @@ def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
         execution_policy_version=str(raw["executionPolicyVersion"]),
         status=str(raw["status"]),
         next_stage=str(raw["nextStage"]),
+        requirements=dict(requirements) if isinstance(requirements, dict) else None,
     )
+
+
+def _requirements_resume_violations(record_path: Path, record: dict[str, Any], requirements: RequirementsSource | None) -> tuple[RunViolation, ...]:
+    violations: list[RunViolation] = []
+    compatibility = requested_requirements_compatible(record, requirements)
+    if compatibility is not None:
+        violations.append(_from_requirements_violation(compatibility))
+    violations.extend(_from_requirements_violation(violation) for violation in verify_durable_requirements(record_path, record))
+    return tuple(violations)
+
+
+def _from_requirements_violation(violation: RequirementsViolation) -> RunViolation:
+    return RunViolation(violation.code, violation.message, violation.evidence)
 
 
 def _read_mapping(path: Path) -> dict[str, Any] | None:
@@ -812,6 +849,7 @@ class _OrphanedCandidateAdoption:
     candidate_sha: str = ""
     changed_files: tuple[str, ...] = ()
     evidence: dict[str, Any] | None = None
+    requirements: RequirementsSource | None = None
 
 
 def _orphan_refusal(code: str, message: str, evidence: dict[str, str]) -> _OrphanedCandidateAdoption:

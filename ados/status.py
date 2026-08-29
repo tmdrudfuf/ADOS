@@ -368,6 +368,11 @@ def _active_run_evidence(active: list[WorktreeStatus]) -> dict[str, str]:
                     "run_record": str(candidate),
                     "resumable": str(resumable),
                 }
+                requirements = raw.get("requirements")
+                if isinstance(requirements, dict) and requirements.get("supplied"):
+                    evidence["requirements_supplied"] = "true"
+                    evidence["requirements_sha256"] = str(requirements.get("sha256", ""))
+                    evidence["requirements_source"] = str(requirements.get("sourcePath", ""))
                 evidence.update(review_block)
                 evidence.update(validation_failure)
                 return evidence

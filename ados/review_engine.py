@@ -22,6 +22,9 @@ class ReviewRequest:
     base_sha: str
     scope: str
     diff: str = ""
+    requirements_content: str = ""
+    requirements_sha: str = ""
+    requirements_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -226,13 +229,33 @@ def _normalize_decision_line(line: str, *, allow_suffix: bool = False) -> str:
 
 
 def _prompt(request: ReviewRequest) -> str:
-    return (
-        f"Review exact candidate HEAD: {request.candidate_sha}\n"
-        f"Base SHA: {request.base_sha}\n"
-        f"Scope: {request.scope}\n\n"
-        "Return exactly one top-level decision: Approved or Changes Requested.\n\n"
-        f"Diff:\n{request.diff}\n"
+    lines = [
+        f"Review exact candidate HEAD: {request.candidate_sha}",
+        f"Base SHA: {request.base_sha}",
+        f"Scope: {request.scope}",
+        "",
+    ]
+    if request.requirements_content:
+        lines.extend(
+            [
+                "Authoritative detailed requirements:",
+                f"Source path: {request.requirements_source}",
+                f"SHA-256: {request.requirements_sha}",
+                "Review the candidate against these requirements as well as generated Spec artifacts. If generated artifacts or implementation narrow, invert, or omit explicit requirements, that is blocking.",
+                "BEGIN AUTHORITATIVE REQUIREMENTS",
+                request.requirements_content,
+                "END AUTHORITATIVE REQUIREMENTS",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Return exactly one top-level decision: Approved or Changes Requested.",
+            "",
+            f"Diff:\n{request.diff}",
+        ]
     )
+    return "\n".join(lines)
 
 
 def _verify_request(repository_path: Path, request: ReviewRequest) -> tuple[ReviewViolation, ...]:

@@ -22,6 +22,9 @@ class NoChangeVerificationRequest:
     candidate_sha: str
     base_sha: str
     implementer_status: str
+    requirements_content: str = ""
+    requirements_sha: str = ""
+    requirements_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,22 +102,43 @@ def parse_no_change_verification_decision(output: str) -> str:
 
 
 def _prompt(request: NoChangeVerificationRequest) -> str:
-    return (
-        "ADOS NO_CHANGES Verification\n\n"
-        f"Spec: {request.spec_number}\n"
-        f"Feature: {request.feature_description}\n"
-        f"Repository/worktree: {request.repository_path}\n"
-        f"Authoritative base SHA: {request.base_sha}\n"
-        f"Current HEAD/candidate SHA: {request.candidate_sha}\n"
-        f"Implementer result: {request.implementer_status}\n\n"
-        "Inspect actual production code and runtime reachability. Do not treat similarly named tests, docs, mocks, "
-        "provider simulations, types, or foundation-only services as proof that the feature exists.\n\n"
-        "Return exactly one explicit decision line:\n"
-        "NO_CHANGES_VERIFIED\n"
-        "FEATURE_MISSING\n"
-        "AMBIGUOUS\n\n"
-        "If FEATURE_MISSING, describe the concrete missing seam and files/components inspected.\n"
+    lines = [
+        "ADOS NO_CHANGES Verification",
+        "",
+        f"Spec: {request.spec_number}",
+        f"Feature: {request.feature_description}",
+        f"Repository/worktree: {request.repository_path}",
+        f"Authoritative base SHA: {request.base_sha}",
+        f"Current HEAD/candidate SHA: {request.candidate_sha}",
+        f"Implementer result: {request.implementer_status}",
+        "",
+    ]
+    if request.requirements_content:
+        lines.extend(
+            [
+                "Authoritative detailed requirements:",
+                f"Source path: {request.requirements_source}",
+                f"SHA-256: {request.requirements_sha}",
+                "Use these requirements as the acceptance boundary for the NO_CHANGES claim.",
+                "BEGIN AUTHORITATIVE REQUIREMENTS",
+                request.requirements_content,
+                "END AUTHORITATIVE REQUIREMENTS",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Inspect actual production code and runtime reachability. Do not treat similarly named tests, docs, mocks, provider simulations, types, or foundation-only services as proof that the feature exists.",
+            "",
+            "Return exactly one explicit decision line:",
+            "NO_CHANGES_VERIFIED",
+            "FEATURE_MISSING",
+            "AMBIGUOUS",
+            "",
+            "If FEATURE_MISSING, describe the concrete missing seam and files/components inspected.",
+        ]
     )
+    return "\n".join(lines)
 
 
 def _reviewer_command(command: str) -> tuple[str, ...] | NoChangeVerificationViolation:

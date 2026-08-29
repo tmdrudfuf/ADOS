@@ -40,6 +40,7 @@ class CliApplication:
         run = subparsers.add_parser("run", help="start an ADOS-managed feature run")
         run.add_argument("--project", required=True)
         run.add_argument("--feature", required=True)
+        run.add_argument("--requirements-file")
         run.add_argument("--spec", type=int)
         run.add_argument("--config")
         run.add_argument("--dry-run", action="store_true")
@@ -149,6 +150,7 @@ class CliApplication:
                     config_path=Path(args.config) if args.config else None,
                     dry_run=args.dry_run,
                     implementer_timeout_ms=args.implementer_timeout_ms,
+                    requirements_file=Path(args.requirements_file) if args.requirements_file else None,
                 )
             )
             if args.json:

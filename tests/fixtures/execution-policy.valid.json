@@ -15,6 +15,7 @@
       "stop_on_uncertain": true
     },
     "validation": {
+      "timeout_ms": 2400000,
       "commands": [
         "python -m unittest discover",
         "git diff --check"

@@ -23,6 +23,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
 from .publication_engine import PublicationEngine, PublicationEvidence, PublicationGateResult
 from .repository_provider import RepositoryProviderError
+from .requirements_source import read_durable_requirements_content, requirements_prompt_block, verify_durable_requirements
 from .review_engine import ReviewEngine, ReviewRequest, ReviewResult, ReviewViolation, parse_review_decision
 from .validation_engine import ValidationCommandResult, ValidationEngine, ValidationResult, ValidationViolation
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult, WorktreeViolation
@@ -294,6 +295,11 @@ class RunPipeline:
         record = _read_json(run_record_path)
         if not isinstance(record, dict):
             return PipelineOutcome("BLOCKED", (_stage("record", "BLOCKED", {}),), {}, violations=(_violation("RUN_RECORD_INVALID", "run record is unavailable", {"path": str(run_record_path)}),))
+        requirements_violations = _requirements_violations(run_record_path, record)
+        if requirements_violations:
+            return PipelineOutcome("BLOCKED", (_stage("requirements", "BLOCKED", {}),), record, violations=requirements_violations)
+        if isinstance(record.get("requirements"), dict):
+            stages.append(_stage("requirements", "PASS", {"sha256": str(record["requirements"].get("sha256", ""))}))
 
         orphaned_adoption = record.get("orphanedCandidateAdoption")
         if (
@@ -423,6 +429,9 @@ class RunPipeline:
                     base_sha=record["authoritativeBaseSha"],
                     scope=review_scope,
                     diff=diff,
+                    requirements_content=read_durable_requirements_content(run_record_path, record),
+                    requirements_sha=str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
+                    requirements_source=str(record.get("requirements", {}).get("sourcePath", "")) if isinstance(record.get("requirements"), dict) else "",
                 ),
             )
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
@@ -473,6 +482,7 @@ class RunPipeline:
         existing = _read_json(evidence_path)
         if isinstance(existing, dict) and existing.get("status") == "PASS":
             return tuple(BootstrapCommandResult(**item) for item in existing.get("commands", []))
+        bootstrap_input = _bootstrap_input(run_record_path, record)
         results: list[BootstrapCommandResult] = []
         for command in config.bootstrap_commands:
             if any(token in command for token in UNSAFE_TOKENS):
@@ -481,7 +491,7 @@ class RunPipeline:
                 try:
                     parts = _split_command(command)
                     executable = _resolve_executable(parts[0])
-                    completed = subprocess.run((executable, *parts[1:]), cwd=Path(record["featureWorktree"]), shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    completed = subprocess.run((executable, *parts[1:]), cwd=Path(record["featureWorktree"]), shell=False, input=bootstrap_input, capture_output=True, text=True, encoding="utf-8", errors="replace")
                     result = BootstrapCommandResult(command, completed.returncode, _bounded(completed.stdout), _bounded(completed.stderr), False)
                 except (FileNotFoundError, OSError) as exc:
                     result = BootstrapCommandResult(command, None, "", str(exc), False)
@@ -713,6 +723,9 @@ class RunPipeline:
                 candidate_sha=candidate.candidate_sha,
                 base_sha=str(record["authoritativeBaseSha"]),
                 implementer_status=candidate.status,
+                requirements_content=read_durable_requirements_content(run_record_path, record),
+                requirements_sha=str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
+                requirements_source=str(record.get("requirements", {}).get("sourcePath", "")) if isinstance(record.get("requirements"), dict) else "",
             ),
         )
         _write_json(run_record_path.with_name("no-change-verification-runtime.json"), verification.to_dict())
@@ -1387,6 +1400,9 @@ class RunPipeline:
                 base_sha=record["authoritativeBaseSha"],
                 scope=review_scope,
                 diff=diff,
+                requirements_content=read_durable_requirements_content(run_record_path, record),
+                requirements_sha=str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
+                requirements_source=str(record.get("requirements", {}).get("sourcePath", "")) if isinstance(record.get("requirements"), dict) else "",
             ),
         )
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
@@ -2365,6 +2381,7 @@ def _legacy_no_change_violations(git: GitRepositoryProvider, worktree: Path, rec
 def _archive_no_change(primary: Path, record: dict[str, Any], candidate: CandidatePreparationResult) -> Path:
     archive = primary / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-no-change-evidence.json"
     archive.parent.mkdir(parents=True, exist_ok=True)
+    _archive_requirements_source(archive.parent, record)
     _write_json(
         archive,
         {
@@ -2374,6 +2391,7 @@ def _archive_no_change(primary: Path, record: dict[str, Any], candidate: Candida
             "candidate_sha": candidate.candidate_sha,
             "authoritative_base_sha": str(record.get("authoritativeBaseSha", "")),
             "changed_files": list(candidate.changed_files),
+            "requirements": record.get("requirements") if isinstance(record.get("requirements"), dict) else None,
             "publication": "not_started",
             "merge_commit": "",
         },
@@ -2384,6 +2402,7 @@ def _archive_no_change(primary: Path, record: dict[str, Any], candidate: Candida
 def _archive_evidence(primary: Path, record: dict[str, Any], candidate: CandidatePreparationResult, validation: ValidationResult, review: ReviewResult, pr: PullRequestInfo, merge: MergeResult) -> Path:
     archive = primary / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / "ados-review-evidence.json"
     archive.parent.mkdir(parents=True, exist_ok=True)
+    _archive_requirements_source(archive.parent, record)
     _write_json(
         archive,
         {
@@ -2392,6 +2411,7 @@ def _archive_evidence(primary: Path, record: dict[str, Any], candidate: Candidat
             "validated_sha": validation.head_after,
             "approved_review_sha": review.reviewed_sha,
             "claude_decision": review.decision,
+            "requirements": record.get("requirements") if isinstance(record.get("requirements"), dict) else None,
             "validation": validation.to_dict(),
             "review": review.to_dict(),
             "pull_request": pr.number,
@@ -2408,6 +2428,35 @@ def _archive_evidence(primary: Path, record: dict[str, Any], candidate: Candidat
         else:
             _write_json(archive.with_name("review-generated-artifacts.json"), _archive_generated_review_artifacts(archive.parent, generated_payload))
     return archive
+
+
+def _archive_requirements_source(primary_run_dir: Path, record: dict[str, Any]) -> None:
+    requirements = record.get("requirements")
+    if not isinstance(requirements, dict) or not requirements.get("supplied"):
+        return
+    primary_run_dir.mkdir(parents=True, exist_ok=True)
+    source_run_dir = Path(str(record.get("featureWorktree", ""))) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}"
+    for filename in ("requirements-source.md", "requirements-source.json"):
+        source = source_run_dir / filename
+        if source.exists():
+            shutil.copyfile(source, primary_run_dir / filename)
+
+
+def _bootstrap_input(run_record_path: Path, record: dict[str, Any]) -> str:
+    block = requirements_prompt_block(run_record_path, record)
+    if not block:
+        return ""
+    return "\n".join(
+        [
+            "ADOS Bootstrap / Spec Generation Requirements",
+            "",
+            block,
+            "",
+            "Bootstrap/spec generation must preserve the semantic constraints above in generated spec.md, plan, and tasks.",
+            "The short feature title is only a title. Do not silently narrow, invert, or redefine explicit requirements.",
+            "If the requirements are too large, contradictory, or cannot be reconciled safely, fail closed instead of declaring the requirement out of scope.",
+        ]
+    )
 
 
 def _archive_evidence_from_run(primary: Path, run_record_path: Path, record: dict[str, Any]) -> Path | PipelineViolation:
@@ -2469,6 +2518,7 @@ def _archive_generated_review_artifacts(primary_run_dir: Path, payload: Any) -> 
 
 def _archive_run_record(primary: Path, record: dict[str, Any], status: str) -> Path:
     path = _canonical_run_record_path(primary, record)
+    _archive_requirements_source(path.parent, record)
     _write_status(path, record, status)
     return path
 
@@ -3111,3 +3161,10 @@ def _from_review(violation: Any) -> PipelineViolation:
 
 def _from_no_change_verification(violation: Any) -> PipelineViolation:
     return PipelineViolation(violation.code, violation.message, violation.evidence)
+
+
+def _requirements_violations(run_record_path: Path, record: dict[str, Any]) -> tuple[PipelineViolation, ...]:
+    return tuple(
+        PipelineViolation(violation.code, violation.message, violation.evidence)
+        for violation in verify_durable_requirements(run_record_path, record)
+    )
