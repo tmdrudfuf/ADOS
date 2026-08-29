@@ -207,7 +207,7 @@ def _normalize_decision_line(line: str, *, allow_suffix: bool = False) -> str:
     normalized = _strip_decision_markup(line.strip())
     normalized = _strip_markdown_emphasis(normalized)
     normalized = _strip_edge_emphasis_markers(normalized)
-    normalized = re.sub(r"^(?:Decision|Review):\s*", "", normalized, flags=re.IGNORECASE).strip()
+    normalized = re.sub(r"^(?:Review\s+Decision|Decision|Review):\s*", "", normalized, flags=re.IGNORECASE).strip()
     normalized = _strip_markdown_emphasis(normalized)
     normalized = _strip_edge_emphasis_markers(normalized)
     normalized = _strip_decision_markup(normalized)

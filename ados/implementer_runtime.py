@@ -18,6 +18,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
 from .requirements_source import requirements_prompt_block, verify_durable_requirements
 from .repository_provider import RepositoryProviderError
+from .review_engine import parse_review_decision
 
 
 SAFE_TIMEOUT_MS = 300_000
@@ -425,6 +426,18 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 "Do not create another Spec, branch, worktree, PR, or merge.",
             ]
         )
+    if run_record_path is not None:
+        review_context = _changes_requested_review_context(run_record_path)
+        if review_context:
+            lines.extend(
+                [
+                    "",
+                    "Independent review Changes Requested context:",
+                    "Read and fix the blocking findings below in this same feature worktree and branch.",
+                    "Do not discard the reviewed candidate unless required to address the findings.",
+                    review_context,
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -456,6 +469,25 @@ def _existing_evidence(record_path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _changes_requested_review_context(record_path: Path) -> str:
+    review_path = record_path.with_name("review-runtime.json")
+    if not review_path.is_file():
+        return ""
+    try:
+        raw = json.loads(review_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    stdout = str(raw.get("stdout", ""))
+    decision = str(raw.get("decision", ""))
+    if decision != "Changes Requested" and parse_review_decision(stdout) != "Changes Requested":
+        return ""
+    reviewed_sha = str(raw.get("reviewed_sha", ""))
+    header = f"Reviewed SHA: {reviewed_sha}" if reviewed_sha else "Reviewed SHA: unavailable"
+    return "\n".join([header, "Review stdout:", _bounded(stdout)])
 
 
 def _write_evidence(record_path: Path, runtime: ImplementerRuntimeRecord, result: ImplementerRuntimeResult, record: dict[str, Any]) -> None:

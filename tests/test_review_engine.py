@@ -64,6 +64,22 @@ class ReviewEngineTests(unittest.TestCase):
     def test_parse_changes_requested(self):
         self.assertEqual("Changes Requested", parse_review_decision("## Decision: Changes Requested"))
 
+    def test_parse_review_decision_heading_changes_requested(self):
+        body = (
+            "# Review Decision: Changes Requested\n\n"
+            "Blocking finding:\n\n"
+            "src/.../LiveAgentWorkVisualization.ts\n\n"
+            "validation_recovery_implementer is incorrectly classified as blocked.\n"
+        )
+        self.assertEqual("Changes Requested", parse_review_decision(body))
+
+    def test_parse_review_decision_heading_variants(self):
+        self.assertEqual("Changes Requested", parse_review_decision("## Review Decision: Changes Requested"))
+        self.assertEqual("Changes Requested", parse_review_decision("### Review Decision: Changes Requested"))
+        self.assertEqual("Changes Requested", parse_review_decision("Review Decision: Changes Requested"))
+        self.assertEqual("Approved", parse_review_decision("# Review Decision: Approved"))
+        self.assertEqual("Approved", parse_review_decision("## Review Decision: Approved"))
+
     def test_parse_decision_prefix_with_markdown_decision(self):
         self.assertEqual("Approved", parse_review_decision("Decision: **Approved**"))
 
@@ -142,6 +158,12 @@ class ReviewEngineTests(unittest.TestCase):
         self.assertEqual(
             "Unavailable",
             parse_review_decision("The previous review was Approved, but this candidate has blocking findings."),
+        )
+
+    def test_prose_containing_review_decision_words_is_unavailable(self):
+        self.assertEqual(
+            "Unavailable",
+            parse_review_decision("The reviewer discussed a Review Decision: Changes Requested pattern without issuing one."),
         )
 
     def test_conflicting_explicit_decisions_are_unavailable(self):
