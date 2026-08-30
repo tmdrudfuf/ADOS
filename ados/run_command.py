@@ -35,6 +35,7 @@ class RunRequest:
     dry_run: bool = False
     implementer_timeout_ms: int = SAFE_TIMEOUT_MS
     requirements_file: Path | None = None
+    reopen_implementation_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,7 +194,15 @@ class RunService:
             if requirements_violations:
                 return RunResult("BLOCKED", RunEligibility("BLOCKED", requirements_violations), plan, resume.record, resumed=True)
         adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description, requirements)
-        eligibility = self._eligibility(project_path, config, config_path, plan, resume, adoption if adoption and adoption.status == "ADOPTABLE" else None)
+        eligibility = self._eligibility(
+            project_path,
+            config,
+            config_path,
+            plan,
+            resume,
+            adoption if adoption and adoption.status == "ADOPTABLE" else None,
+            reopen_implementation_recovery=request.reopen_implementation_recovery,
+        )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
         if eligibility.status != "ELIGIBLE":
@@ -203,13 +212,23 @@ class RunService:
             return RunResult("PLANNED", eligibility, plan, planned_record, resumed=resume is not None, adopted=adoption is not None)
 
         if resume is not None:
-            pipeline_result = self.pipeline.run(config=config, run_record_path=resume.record_path, timeout_ms=request.implementer_timeout_ms)
+            pipeline_result = self.pipeline.run(
+                config=config,
+                run_record_path=resume.record_path,
+                timeout_ms=request.implementer_timeout_ms,
+                reopen_implementation_recovery=request.reopen_implementation_recovery,
+            )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
 
         if adoption is not None:
             record_path = self._persist_orphaned_candidate_adoption(adoption)
-            pipeline_result = self.pipeline.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
+            pipeline_result = self.pipeline.run(
+                config=config,
+                run_record_path=record_path,
+                timeout_ms=request.implementer_timeout_ms,
+                reopen_implementation_recovery=request.reopen_implementation_recovery,
+            )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
                 pipeline_result.status,
@@ -240,7 +259,12 @@ class RunService:
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
         write_requirements_artifacts(record_path, record.to_dict(), requirements)
-        pipeline_result = self.pipeline.run(config=config, run_record_path=record_path, timeout_ms=request.implementer_timeout_ms)
+        pipeline_result = self.pipeline.run(
+            config=config,
+            run_record_path=record_path,
+            timeout_ms=request.implementer_timeout_ms,
+            reopen_implementation_recovery=request.reopen_implementation_recovery,
+        )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
 
@@ -301,6 +325,7 @@ class RunService:
         plan: RunPlan,
         resume: "_ResumeCandidate | None" = None,
         adoption: "_OrphanedCandidateAdoption | None" = None,
+        reopen_implementation_recovery: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -333,6 +358,12 @@ class RunService:
                 )
             )
         blocking_recovery = _run_blocking_recovery_codes(status.recovery.state, status.recovery.reason_codes)
+        if (
+            reopen_implementation_recovery
+            and resume is not None
+            and set(blocking_recovery) == {"IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+        ):
+            blocking_recovery = ()
         if blocking_recovery:
             violations.append(
                 _violation(

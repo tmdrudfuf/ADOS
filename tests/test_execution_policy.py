@@ -26,6 +26,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(("git diff --check",), policy.validation.commands)
         self.assertEqual(1_800_000, policy.validation.timeout_ms)
         self.assertEqual(3, policy.implementation.max_recovery_rounds)
+        self.assertEqual(1, policy.implementation.max_recovery_reopens)
         self.assertEqual(3, policy.validation.max_recovery_rounds)
         self.assertEqual(1, policy.validation.max_recovery_reopens)
         self.assertEqual(2, policy.validation.max_no_change_recovery_rounds)
@@ -81,6 +82,19 @@ class ExecutionPolicyTests(unittest.TestCase):
             ExecutionPolicy.from_mapping(raw)
 
         self.assertEqual("POLICY_INVALID_IMPLEMENTATION_MAX_RECOVERY_ROUNDS", context.exception.code)
+
+    def test_implementation_max_recovery_reopens_is_optional_and_positive_when_present(self):
+        raw = self.valid_mapping()
+        raw["execution_policy"]["implementation"] = {"max_recovery_reopens": 2}
+        policy = ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual(2, policy.implementation.max_recovery_reopens)
+
+        raw["execution_policy"]["implementation"]["max_recovery_reopens"] = 0
+        with self.assertRaises(PolicyValidationError) as context:
+            ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual("POLICY_INVALID_IMPLEMENTATION_MAX_RECOVERY_REOPENS", context.exception.code)
 
     def test_validation_max_recovery_rounds_is_optional_and_positive_when_present(self):
         raw = self.valid_mapping()

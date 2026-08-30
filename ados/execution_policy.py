@@ -58,6 +58,7 @@ class ValidationPolicy:
 @dataclass(frozen=True)
 class ImplementationPolicy:
     max_recovery_rounds: int
+    max_recovery_reopens: int
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class ExecutionPolicy:
 
         implementation = _optional_mapping(root, "implementation")
         implementation_max_recovery_rounds = _optional_positive_int(implementation, "max_recovery_rounds", "POLICY_INVALID_IMPLEMENTATION_MAX_RECOVERY_ROUNDS", 3)
+        implementation_max_recovery_reopens = _optional_positive_int(implementation, "max_recovery_reopens", "POLICY_INVALID_IMPLEMENTATION_MAX_RECOVERY_REOPENS", 1)
 
         validation = _require_mapping(root, "validation", "POLICY_MISSING_VALIDATION")
         commands = _require_string_sequence(validation, "commands", "POLICY_INVALID_VALIDATION_COMMANDS")
@@ -111,7 +113,10 @@ class ExecutionPolicy:
 
         return cls(
             schema_version=schema_version,
-            implementation=ImplementationPolicy(max_recovery_rounds=implementation_max_recovery_rounds),
+            implementation=ImplementationPolicy(
+                max_recovery_rounds=implementation_max_recovery_rounds,
+                max_recovery_reopens=implementation_max_recovery_reopens,
+            ),
             publication=PublicationPolicy(merge_strategy=merge_strategy),
             review=ReviewPolicy(
                 reviewer=reviewer,
