@@ -25,6 +25,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode)
         self.assertIn("--feature", completed.stdout)
         self.assertIn("--requirements-file", completed.stdout)
+        self.assertIn("--reopen-implementation-recovery", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -906,6 +907,162 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(1, len(record["implementationRecoveryAttempts"]))
         self.assertEqual("IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED", record["implementationRecoveryBlock"]["reasonCode"])
         self.assertIsNone(result.pipeline_result.validation)
+
+    def test_exhausted_implementation_recovery_requires_explicit_reopen(self):
+        with self.project() as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "fail-twice-then-success.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "prompt = sys.stdin.read()\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value < 2:\n"
+                "    print('temporary implementer failure', file=sys.stderr)\n"
+                "    sys.exit(9)\n"
+                "assert 'Implementation failure recovery context:' in prompt\n"
+                "Path('implementation.txt').write_text('implemented after explicit reopen', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                implementation_max_recovery_rounds=1,
+                implementation_max_recovery_reopens=1,
+            )
+            publisher = FakePublisher(fixture.repo)
+            service = RunService(pipeline=RunPipeline(publisher=publisher))
+
+            first = service.run(RunRequest(fixture.repo, "Reopen implementation recovery", 1, fixture.config))
+            record_path = Path(first.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-reopen-implementation-recovery" / "ados-run.json"
+            first_record = json.loads(record_path.read_text(encoding="utf-8"))
+            second = service.run(RunRequest(fixture.repo, "Reopen implementation recovery", 1, fixture.config))
+            second_record = json.loads(record_path.read_text(encoding="utf-8"))
+            third = service.run(RunRequest(fixture.repo, "Reopen implementation recovery", 1, fixture.config, reopen_implementation_recovery=True))
+            final_record = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-reopen-implementation-recovery" / "ados-run.json").read_text(encoding="utf-8"))
+            stages = [stage.id for stage in third.pipeline_result.stages]
+
+        self.assertEqual("IMPLEMENTATION_FAILED", first.status)
+        self.assertEqual("IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED", first_record["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual("IMPLEMENTATION_FAILED", second.status)
+        self.assertIn("IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in second.pipeline_result.violations})
+        self.assertEqual(1, len(second_record["implementationRecoveryAttempts"]))
+        self.assertEqual("COMPLETE", third.status)
+        self.assertTrue(third.resumed)
+        self.assertIn("implementation_recovery_reopen", stages)
+        self.assertIn("implementation_recovery_implementer", stages)
+        self.assertEqual(first_record["runId"], final_record["runId"])
+        self.assertEqual(1, len(final_record["implementationRecoveryReopens"]))
+        self.assertEqual(2, len(final_record["implementationRecoveryAttempts"]))
+        self.assertEqual([0, 1], [attempt.get("reopenEpoch", 0) for attempt in final_record["implementationRecoveryAttempts"]])
+        self.assertEqual(third.pipeline_result.candidate.candidate_sha, third.pipeline_result.validation.head_after)
+        self.assertEqual(third.pipeline_result.validation.head_after, third.pipeline_result.review.reviewed_sha)
+
+    def test_exhausted_implementation_recovery_reopen_is_bounded(self):
+        with self.project(implementation_max_recovery_rounds=1, implementation_max_recovery_reopens=1, implementer_mode="failure") as fixture:
+            service = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo)))
+            first = service.run(RunRequest(fixture.repo, "Bounded implementation reopen", 1, fixture.config))
+            second = service.run(RunRequest(fixture.repo, "Bounded implementation reopen", 1, fixture.config, reopen_implementation_recovery=True))
+            third = service.run(RunRequest(fixture.repo, "Bounded implementation reopen", 1, fixture.config, reopen_implementation_recovery=True))
+            record_path = Path(first.run_record.feature_worktree) / ".agent-workflow" / "runs" / "001-bounded-implementation-reopen" / "ados-run.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("IMPLEMENTATION_FAILED", first.status)
+        self.assertEqual("IMPLEMENTATION_FAILED", second.status)
+        self.assertEqual("IMPLEMENTATION_FAILED", third.status)
+        self.assertEqual(1, len(record["implementationRecoveryReopens"]))
+        self.assertIn("IMPLEMENTATION_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED", {violation.code for violation in third.pipeline_result.violations})
+
+    def test_exhausted_changes_requested_fix_reopen_preserves_review_body(self):
+        with self.project() as fixture:
+            prompt_path = fixture.root / "reopen-prompt.txt"
+            counter = fixture.root / "implementer-count.txt"
+            implementer = fixture.root / "review-fix-implementer.py"
+            implementer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{counter}')\n"
+                f"prompt_path = Path(r'{prompt_path}')\n"
+                "prompt = sys.stdin.read()\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "prompt_path.write_text(prompt, encoding='utf-8')\n"
+                "assert 'Independent review Changes Requested context:' in prompt\n"
+                "assert 'real player-facing development-request text input' in prompt\n"
+                "Path('review-fix.txt').write_text('fixed after explicit reopen', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer=f'"{sys.executable}" "{implementer}"',
+                implementation_max_recovery_rounds=1,
+                implementation_max_recovery_reopens=1,
+            )
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Review fix reopen", 1)
+            review_stdout = (
+                "## Decision: Changes Requested\n\n"
+                "Blocking finding: real player-facing development-request text input is missing.\n"
+            )
+            record["status"] = "IMPLEMENTATION_FAILED"
+            record["nextStage"] = "human_intervention"
+            record["implementationFailure"] = {
+                "status": "IMPLEMENTATION_FAILED",
+                "exitCode": "1",
+                "timedOut": "false",
+                "stdout": "",
+                "stderr": "implementer failed while applying review fix",
+                "headBefore": candidate_sha,
+                "headAfter": candidate_sha,
+                "changedFiles": [],
+                "reasonCodes": ["IMPLEMENTER_COMMAND_FAILED"],
+                "recoveryStage": "implementation_recovery",
+            }
+            record["implementationRecoveryAttempts"] = [
+                {
+                    "round": 1,
+                    "reopenEpoch": 0,
+                    "maxRounds": 1,
+                    "status": "RECOVERY_IMPLEMENTER_PENDING",
+                    "priorStatus": "IMPLEMENTATION_FAILED",
+                    "priorExitCode": "1",
+                    "priorTimedOut": "false",
+                    "priorStdout": "",
+                    "priorStderr": "implementer failed while applying review fix",
+                    "headBefore": candidate_sha,
+                    "headAfter": candidate_sha,
+                    "changedFiles": [],
+                    "reasonCodes": ["IMPLEMENTER_COMMAND_FAILED"],
+                    "recoveryImplementerStatus": "IMPLEMENTATION_FAILED",
+                    "recoveryImplementerViolationCodes": ["IMPLEMENTER_COMMAND_FAILED"],
+                }
+            ]
+            record["implementationRecoveryBlock"] = {
+                "status": "BLOCKED",
+                "reasonCode": "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED",
+                "message": "implementation recovery reached the configured maximum recovery rounds",
+                "evidence": {"max_recovery_rounds": "1", "status": "IMPLEMENTATION_FAILED"},
+            }
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(
+                json.dumps({"status": "PASS", "decision": "Changes Requested", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": review_stdout, "stderr": "", "violations": []}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Review fix reopen", 1, fixture.config, reopen_implementation_recovery=True)
+            )
+            archived = json.loads((fixture.repo / ".agent-workflow" / "runs" / "001-review-fix-reopen" / "ados-run.json").read_text(encoding="utf-8"))
+            prompt = prompt_path.read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertTrue(result.resumed)
+        self.assertEqual(record["runId"], archived["runId"])
+        self.assertIn("real player-facing development-request text input", prompt)
+        self.assertEqual(1, len(archived["implementationRecoveryReopens"]))
 
     def test_partial_implementation_changes_survive_retry(self):
         with self.project() as fixture:
@@ -3417,7 +3574,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None, review_max_side_effect_recovery_rounds=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -3465,8 +3622,13 @@ class CliRunTests(unittest.TestCase):
         }
         if validation_max_recovery_rounds is not None:
             config["execution_policy"]["validation"]["max_recovery_rounds"] = validation_max_recovery_rounds
+        implementation = {}
         if implementation_max_recovery_rounds is not None:
-            config["execution_policy"]["implementation"] = {"max_recovery_rounds": implementation_max_recovery_rounds}
+            implementation["max_recovery_rounds"] = implementation_max_recovery_rounds
+        if implementation_max_recovery_reopens is not None:
+            implementation["max_recovery_reopens"] = implementation_max_recovery_reopens
+        if implementation:
+            config["execution_policy"]["implementation"] = implementation
         if review_max_side_effect_recovery_rounds is not None:
             config["execution_policy"]["review"]["max_side_effect_recovery_rounds"] = review_max_side_effect_recovery_rounds
         path.parent.mkdir(parents=True, exist_ok=True)
