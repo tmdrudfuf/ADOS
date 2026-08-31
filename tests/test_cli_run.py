@@ -3425,18 +3425,183 @@ class CliRunTests(unittest.TestCase):
             record_path = worktree / ".agent-workflow" / "runs" / "001-dirty-review-side-effect" / "ados-run.json"
             blocked_record = json.loads(record_path.read_text(encoding="utf-8"))
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
-            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review side effect", 1, fixture.config, dry_run=True))
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Dirty review side effect", 1, fixture.config))
             stages = [(stage.id, stage.status) for stage in first.pipeline_result.stages]
 
         self.assertEqual("REVIEW_BLOCKED", first.status)
         self.assertIn(("review_side_effect_recovery", "PASS"), stages)
         self.assertEqual("REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED", blocked_record["reviewBlock"]["reasonCode"])
         self.assertEqual("review_side_effect", blocked_record["reviewBlock"]["blockCause"])
-        self.assertEqual("False", status.workflow.evidence["resumable"])
-        self.assertEqual("", status.workflow.evidence["resume_stage"])
-        self.assertEqual("BLOCKED", second.status)
-        self.assertFalse(second.resumed)
-        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("review", status.workflow.evidence["resume_stage"])
+        self.assertEqual("REVIEW_BLOCKED", second.status)
+        self.assertTrue(second.resumed)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in second.pipeline_result.violations})
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
+
+    def test_review_side_effect_budget_is_scoped_to_review_cycle(self):
+        with self.project() as fixture:
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                review_max_side_effect_recovery_rounds=1,
+            )
+            config = load_project_config(fixture.config)
+            run_dir = fixture.repo / ".agent-workflow" / "runs" / "001-cycle-scoped-review-side-effect"
+            run_dir.mkdir(parents=True)
+            record_path = run_dir / "ados-run.json"
+            base_sha = self.head(fixture.repo)
+            record = {
+                "runId": "cycle-scoped-review-side-effect",
+                "status": "REVIEW_BLOCKED",
+                "nextStage": "review",
+                "featureBranch": "main",
+                "featureWorktree": str(fixture.repo),
+                "authoritativeBaseSha": base_sha,
+                "reviewer": "reviewer",
+            }
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+
+            (fixture.repo / "implementation.txt").write_text("candidate 1\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "implementation.txt")
+            self.git(fixture.repo, "commit", "-m", "candidate 1")
+            candidate_1 = self.head(fixture.repo)
+            candidate_result_1 = run_pipeline.CandidatePreparationResult("COMMITTED", candidate_1, ("implementation.txt",))
+            validation_1 = run_pipeline.ValidationResult("PASS", candidate_1, candidate_1, (), ())
+            review_1 = run_pipeline.ReviewResult("PASS", "Changes Requested", candidate_1, 0, "Changes Requested", "", ())
+            record["reviewBlock"] = {
+                "status": "PASS",
+                "decision": "Changes Requested",
+                "reasonCode": "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE",
+                "reasonCodes": ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"],
+                "blockCause": "review_side_effect",
+                "transient": False,
+                "resumeStage": "review",
+                "reviewer": "reviewer",
+                "candidateSha": candidate_1,
+                "validatedSha": candidate_1,
+                "baseSha": base_sha,
+                "reviewedSha": candidate_1,
+                "exitCode": 0,
+                "timedOut": False,
+            }
+            _write = run_pipeline._write_json
+            _write(record_path, record)
+            (fixture.repo / "implementation.txt").write_text("reviewer side effect 1\n", encoding="utf-8")
+            first = pipeline._recover_review_side_effect(config, record_path, record, candidate_result_1, validation_1, review_1, (), "review", [])
+            self.assertIsInstance(first, dict)
+
+            (fixture.repo / "implementation.txt").write_text("candidate 2\n", encoding="utf-8")
+            self.git(fixture.repo, "add", "implementation.txt")
+            self.git(fixture.repo, "commit", "-m", "candidate 2")
+            candidate_2 = self.head(fixture.repo)
+            candidate_result_2 = run_pipeline.CandidatePreparationResult("COMMITTED", candidate_2, ("implementation.txt",))
+            validation_2 = run_pipeline.ValidationResult("PASS", candidate_2, candidate_2, (), ())
+            review_2 = run_pipeline.ReviewResult("PASS", "Approved", candidate_2, 0, "Approved", "", ())
+            updated_record = json.loads(record_path.read_text(encoding="utf-8"))
+            updated_record["reviewBlock"] = {
+                "status": "PASS",
+                "decision": "Approved",
+                "reasonCode": "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE",
+                "reasonCodes": ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"],
+                "blockCause": "review_side_effect",
+                "transient": False,
+                "resumeStage": "review",
+                "reviewer": "reviewer",
+                "candidateSha": candidate_2,
+                "validatedSha": candidate_2,
+                "baseSha": base_sha,
+                "reviewedSha": candidate_2,
+                "exitCode": 0,
+                "timedOut": False,
+            }
+            _write(record_path, updated_record)
+            (fixture.repo / "implementation.txt").write_text("reviewer side effect 2\n", encoding="utf-8")
+            second = pipeline._recover_review_side_effect(config, record_path, updated_record, candidate_result_2, validation_2, review_2, (), "review", [])
+            self.assertIsInstance(second, dict)
+            attempts = json.loads(record_path.read_text(encoding="utf-8")).get("reviewSideEffectRecoveryAttempts", [])
+
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(["RESTORED", "RESTORED"], [attempt["status"] for attempt in attempts])
+        self.assertEqual([1, 1], [attempt["cycleRound"] for attempt in attempts])
+        self.assertNotEqual(attempts[0]["reviewCycleKey"], attempts[1]["reviewCycleKey"])
+        self.assertNotEqual(attempts[0]["candidateSha"], attempts[1]["candidateSha"])
+
+    def test_max_exceeded_side_effect_block_reopens_when_attempts_belong_to_older_cycle(self):
+        with self.project() as fixture:
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text("print('Approved')\n", encoding="utf-8")
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                review_max_side_effect_recovery_rounds=1,
+            )
+            record_path, record = self.create_durable_run(fixture, "Resume newer side effect", 1, "REVIEW_BLOCKED")
+            worktree = Path(record["featureWorktree"])
+            spec_dir = worktree / "specs" / "001-resume-newer-side-effect"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "spec.md").write_text("# Resume newer side effect\n", encoding="utf-8")
+            (worktree / "implementation.txt").write_text("old candidate\n", encoding="utf-8")
+            self.git(worktree, "add", "specs", "implementation.txt")
+            self.git(worktree, "commit", "-m", "spec 001: old candidate")
+            old_candidate_sha = self.head(worktree)
+            (worktree / "implementation.txt").write_text("new candidate\n", encoding="utf-8")
+            self.git(worktree, "add", "implementation.txt")
+            self.git(worktree, "commit", "-m", "spec 001: new candidate")
+            candidate_sha = self.head(worktree)
+            record["status"] = "REVIEW_BLOCKED"
+            record["nextStage"] = "review"
+            record["reviewBlock"] = {
+                "status": "PASS",
+                "decision": "Approved",
+                "reasonCode": "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED",
+                "reasonCodes": ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"],
+                "blockCause": "review_side_effect",
+                "transient": False,
+                "resumeStage": "review",
+                "reviewer": record["reviewer"],
+                "candidateSha": candidate_sha,
+                "validatedSha": candidate_sha,
+                "baseSha": record["authoritativeBaseSha"],
+                "reviewedSha": candidate_sha,
+                "exitCode": 0,
+                "timedOut": False,
+            }
+            record["reviewSideEffectRecoveryAttempts"] = [
+                {
+                    "round": 1,
+                    "maxRounds": 1,
+                    "status": "RESTORED",
+                    "source": "review",
+                    "candidateSha": old_candidate_sha,
+                    "validatedSha": old_candidate_sha,
+                    "reviewedSha": old_candidate_sha,
+                    "reviewDecision": "Approved",
+                    "dirtyTrackedPaths": ["implementation.txt"],
+                    "untrackedPaths": [],
+                    "stagedPaths": [],
+                    "cleanAfterRecovery": True,
+                    "restoreViolations": [],
+                }
+            ]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": ["specs/001-resume-newer-side-effect/spec.md", "implementation.txt"]}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "Approved", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Approved", "stderr": "", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            (worktree / "implementation.txt").write_text("reviewer side effect\n", encoding="utf-8")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Resume newer side effect", 1, fixture.config))
+            attempts = result.pipeline_result.run_record.get("reviewSideEffectRecoveryAttempts", [])
+
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(2, len(attempts))
+        self.assertEqual("RESTORED", attempts[1]["status"])
+        self.assertEqual(1, attempts[1]["cycleRound"])
+        self.assertEqual(candidate_sha, attempts[1]["candidateSha"])
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
     def test_cleanup_resume_retries_primary_update_before_complete(self):
         with self.project() as fixture:
