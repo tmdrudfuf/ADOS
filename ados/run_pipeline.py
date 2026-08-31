@@ -1571,16 +1571,19 @@ class RunPipeline:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {})]), record, candidate=candidate, validation=validation, review=review, violations=evidence_violations)
 
         max_rounds = config.execution_policy.review.max_side_effect_recovery_rounds
+        cycle_key = _review_side_effect_recovery_cycle_key(candidate, validation, review)
         attempts = _review_side_effect_recovery_attempts(record)
-        round_number = len(attempts) + 1
-        if round_number > max_rounds:
+        cycle_attempts = _review_side_effect_recovery_attempts_for_cycle(attempts, cycle_key, candidate, validation, review)
+        cycle_round = len(cycle_attempts) + 1
+        global_round = len(attempts) + 1
+        if cycle_round > max_rounds:
             violation = _violation(
                 "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED",
                 "review side-effect recovery exceeded the configured retry budget",
-                {"max_rounds": str(max_rounds), "candidate_sha": candidate.candidate_sha},
+                {"max_rounds": str(max_rounds), "candidate_sha": candidate.candidate_sha, "review_cycle_key": cycle_key},
             )
             _write_review_block_status(run_record_path, record, review or _empty_review(candidate.candidate_sha), candidate, validation, block_violations=(violation,), block_cause="review_side_effect")
-            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), _read_json(run_record_path) or record, candidate=candidate, validation=validation, review=review, violations=(violation,))
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(cycle_round), "review_cycle_key": cycle_key})]), _read_json(run_record_path) or record, candidate=candidate, validation=validation, review=review, violations=(violation,))
 
         worktree = Path(str(record.get("featureWorktree", "")))
         try:
@@ -1593,7 +1596,7 @@ class RunPipeline:
 
         safety_violations = _review_side_effect_restore_safety(record, candidate, before, head_before, branch_before)
         if safety_violations:
-            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), record, candidate=candidate, validation=validation, review=review, violations=safety_violations)
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(cycle_round), "review_cycle_key": cycle_key})]), record, candidate=candidate, validation=validation, review=review, violations=safety_violations)
 
         restore_violations = _restore_review_side_effects(worktree, before)
         try:
@@ -1615,7 +1618,9 @@ class RunPipeline:
             restore_violations = (*restore_violations, _violation("REVIEW_SIDE_EFFECT_RECOVERY_STILL_DIRTY", "review side-effect recovery did not restore a clean worktree", {"status": _format_status(after)}))
 
         attempt = {
-            "round": round_number,
+            "round": global_round,
+            "cycleRound": cycle_round,
+            "reviewCycleKey": cycle_key,
             "maxRounds": max_rounds,
             "status": "BLOCKED" if restore_violations else "RESTORED",
             "source": source,
@@ -1642,7 +1647,7 @@ class RunPipeline:
         updated_attempts = _review_side_effect_recovery_attempts(updated)
         updated_attempts.append(attempt)
         updated["reviewSideEffectRecoveryAttempts"] = updated_attempts
-        _write_json(run_record_path.with_name(f"review-side-effect-recovery-{round_number}.json"), attempt)
+        _write_json(run_record_path.with_name(f"review-side-effect-recovery-{global_round}.json"), attempt)
 
         if restore_violations:
             updated["status"] = "REVIEW_BLOCKED"
@@ -1664,7 +1669,7 @@ class RunPipeline:
                 "timedOut": False,
             }
             _write_json(run_record_path, updated)
-            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(round_number)})]), updated, candidate=candidate, validation=validation, review=review, violations=restore_violations)
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery", "BLOCKED", {"attempt": str(cycle_round), "review_cycle_key": cycle_key})]), updated, candidate=candidate, validation=validation, review=review, violations=restore_violations)
 
         updated["status"] = "REVIEW_BLOCKED"
         updated["nextStage"] = "review"
@@ -2367,6 +2372,43 @@ def _review_side_effect_recovery_attempts(record: dict[str, Any]) -> list[dict[s
     return [dict(item) for item in attempts if isinstance(item, dict)]
 
 
+def _review_side_effect_recovery_cycle_key(
+    candidate: CandidatePreparationResult,
+    validation: ValidationResult,
+    review: ReviewResult | None,
+) -> str:
+    reviewed_sha = review.reviewed_sha if review else ""
+    review_decision = review.decision if review else ""
+    return "|".join((candidate.candidate_sha, validation.head_after, reviewed_sha, review_decision))
+
+
+def _review_side_effect_recovery_attempts_for_cycle(
+    attempts: list[dict[str, Any]],
+    cycle_key: str,
+    candidate: CandidatePreparationResult,
+    validation: ValidationResult,
+    review: ReviewResult | None,
+) -> list[dict[str, Any]]:
+    reviewed_sha = review.reviewed_sha if review else ""
+    review_decision = review.decision if review else ""
+    matched: list[dict[str, Any]] = []
+    for attempt in attempts:
+        attempt_cycle = str(attempt.get("reviewCycleKey", ""))
+        if attempt_cycle:
+            if attempt_cycle == cycle_key:
+                matched.append(attempt)
+            continue
+        # Backward compatibility for attempts written before explicit cycle keys.
+        if (
+            str(attempt.get("candidateSha", "")) == candidate.candidate_sha
+            and str(attempt.get("validatedSha", "")) == validation.head_after
+            and str(attempt.get("reviewedSha", "")) == reviewed_sha
+            and str(attempt.get("reviewDecision", "")) == review_decision
+        ):
+            matched.append(attempt)
+    return matched
+
+
 def _review_side_effect_restore_safety(
     record: dict[str, Any],
     candidate: CandidatePreparationResult,
@@ -2869,9 +2911,11 @@ def review_side_effect_recovery_evidence(record: Any, candidate: Any, validation
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_BLOCK_MISSING", "review side-effect recovery requires durable review block evidence", {}),)
     if str(block.get("blockCause", "")) != "review_side_effect":
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_BLOCK_CAUSE_UNSAFE", "review side-effect recovery requires review_side_effect block cause", {"blockCause": str(block.get("blockCause", ""))}),)
-    if str(block.get("reasonCode", "")) != "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE":
+    allowed_reason_codes = {"REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+    if str(block.get("reasonCode", "")) not in allowed_reason_codes:
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REASON_UNSAFE", "review side-effect recovery is only supported for dirty-worktree side effects", {"reasonCode": str(block.get("reasonCode", ""))}),)
-    if block.get("reasonCodes", []) not in ([], ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"]):
+    reason_codes = block.get("reasonCodes", [])
+    if reason_codes not in ([], ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"], ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"]):
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REASON_CODES_UNSAFE", "review side-effect recovery requires only dirty-worktree side-effect reason codes", {}),)
     if str(block.get("candidateSha", "")) != candidate_result.candidate_sha or str(block.get("validatedSha", "")) != validation_result.head_after or str(block.get("reviewedSha", "")) != review_result.reviewed_sha:
         return (
