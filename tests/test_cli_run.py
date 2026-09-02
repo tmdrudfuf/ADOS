@@ -26,6 +26,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--feature", completed.stdout)
         self.assertIn("--requirements-file", completed.stdout)
         self.assertIn("--reopen-implementation-recovery", completed.stdout)
+        self.assertIn("--reopen-review-side-effect-recovery", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -3439,6 +3440,107 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED", {violation.code for violation in second.pipeline_result.violations})
         self.assertNotIn("ACTIVE_WORKTREE_PRESENT", self.codes(second))
 
+    def test_exhausted_review_side_effect_recovery_reopens_clean_newer_head_for_fresh_review(self):
+        with self.project() as fixture:
+            review_count = fixture.root / "review-count.txt"
+            reviewer = fixture.root / "reviewer.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{review_count}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                review_max_side_effect_recovery_rounds=1,
+            )
+            record_path, record, old_sha, new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Reopen review side effect", 1)
+            original_attempts = list(record["reviewSideEffectRecoveryAttempts"])
+
+            blocked = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Reopen review side effect", 1, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Reopen review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            final_record = result.pipeline_result.run_record
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            review_count_value = review_count.read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", blocked.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_REQUIRED", {violation.code for violation in blocked.pipeline_result.violations})
+        self.assertEqual("COMPLETE", result.status)
+        self.assertTrue(result.resumed)
+        self.assertIn("review_side_effect_recovery_reopen", stages)
+        self.assertEqual(new_sha, result.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(new_sha, result.pipeline_result.validation.head_after)
+        self.assertEqual(new_sha, result.pipeline_result.review.reviewed_sha)
+        self.assertEqual("1", review_count_value)
+        self.assertEqual(original_attempts, final_record["reviewSideEffectRecoveryAttempts"])
+        self.assertEqual(1, len(final_record["reviewSideEffectRecoveryReopens"]))
+        self.assertEqual(old_sha, final_record["reviewSideEffectRecoveryReopens"][0]["previousReviewedSha"])
+        self.assertEqual(new_sha, final_record["reviewSideEffectRecoveryReopens"][0]["adoptedCandidateSha"])
+        self.assertIn(f"review-runtime-before-review-side-effect-reopen-{old_sha[:12]}.json", final_record["reviewSideEffectRecoveryReopens"][0]["previousReviewArtifact"])
+
+    def test_exhausted_review_side_effect_reopen_dirty_worktree_fails_closed(self):
+        with self.project() as fixture:
+            record_path, _record, _old_sha, _new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Dirty reopen review side effect", 1)
+            worktree = record_path.parents[3]
+            (worktree / "dirty.txt").write_text("unsafe\n", encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Dirty reopen review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_WORKTREE_DIRTY", {violation.code for violation in result.pipeline_result.violations})
+        self.assertNotIn("reviewSideEffectRecoveryReopens", reopened_record)
+
+    def test_exhausted_review_side_effect_reopen_wrong_branch_fails_closed(self):
+        with self.project() as fixture:
+            record_path, _record, _old_sha, _new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Wrong branch reopen review side effect", 1)
+            worktree = record_path.parents[3]
+            self.git(worktree, "checkout", "-b", "wrong-review-reopen")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Wrong branch reopen review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("FEATURE_BRANCH_EXISTS", self.codes(result))
+        self.assertIn("WORKTREE_PATH_EXISTS", self.codes(result))
+
+    def test_review_side_effect_reopen_rejects_unrelated_review_block(self):
+        with self.project() as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Unrelated review block reopen", 1)
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Unrelated review block reopen", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            unchanged = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertTrue(result.resumed)
+        self.assertIn("review_side_effect_recovery_reopen", [stage.id for stage in result.pipeline_result.stages])
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_BLOCK_CAUSE_UNSAFE", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual(candidate_sha, unchanged["reviewBlock"]["candidateSha"])
+        self.assertNotIn("reviewSideEffectRecoveryReopens", unchanged)
+
+    def test_review_side_effect_reopen_already_used_for_same_head_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, old_sha, new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Repeat reopen review side effect", 1)
+            record["reviewSideEffectRecoveryReopens"] = [{"status": "REOPENED", "adoptedCandidateSha": new_sha}]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Repeat reopen review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_ALREADY_USED", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual([{"adoptedCandidateSha": new_sha, "status": "REOPENED"}], reopened_record["reviewSideEffectRecoveryReopens"])
+
     def test_review_side_effect_budget_is_scoped_to_review_cycle(self):
         with self.project() as fixture:
             fixture.config = self.write_config(
@@ -3908,6 +4010,73 @@ class CliRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         return record_path, record, candidate_sha
+
+    def create_exhausted_review_side_effect_blocked_run(self, fixture, feature, spec):
+        record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_BLOCKED")
+        worktree = Path(record["featureWorktree"])
+        spec_dir = worktree / "specs" / f"{record['specNumber']}-{record['featureSlug']}"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "spec.md").write_text(f"# {feature}\n", encoding="utf-8")
+        (worktree / "implementation.txt").write_text("old candidate\n", encoding="utf-8")
+        self.git(worktree, "add", "specs", "implementation.txt")
+        self.git(worktree, "commit", "-m", f"spec {record['specNumber']}: {feature}")
+        old_sha = self.head(worktree)
+        (worktree / "implementation.txt").write_text("manual side-effect repair\n", encoding="utf-8")
+        self.git(worktree, "add", "implementation.txt")
+        self.git(worktree, "commit", "-m", "manual review side effect repair")
+        new_sha = self.head(worktree)
+        record["status"] = "REVIEW_BLOCKED"
+        record["nextStage"] = "recovery"
+        record["reviewBlock"] = {
+            "status": "PASS",
+            "decision": "Approved",
+            "reasonCode": "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED",
+            "reasonCodes": ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"],
+            "blockCause": "review_side_effect",
+            "transient": False,
+            "resumeStage": "",
+            "reviewer": record["reviewer"],
+            "candidateSha": old_sha,
+            "validatedSha": old_sha,
+            "baseSha": record["authoritativeBaseSha"],
+            "reviewedSha": old_sha,
+            "exitCode": 0,
+            "timedOut": False,
+            "evidence": {"max_rounds": "1", "candidate_sha": old_sha, "review_cycle_key": f"{old_sha}|{old_sha}|{old_sha}|Approved"},
+        }
+        record["reviewSideEffectRecoveryAttempts"] = [
+            {
+                "round": 1,
+                "cycleRound": 1,
+                "reviewCycleKey": f"{old_sha}|{old_sha}|{old_sha}|Approved",
+                "maxRounds": 1,
+                "status": "RESTORED",
+                "source": "review",
+                "candidateSha": old_sha,
+                "validatedSha": old_sha,
+                "reviewedSha": old_sha,
+                "reviewDecision": "Approved",
+                "dirtyTrackedPaths": ["implementation.txt"],
+                "untrackedPaths": [],
+                "stagedPaths": [],
+                "cleanAfterRecovery": True,
+                "restoreViolations": [],
+            }
+        ]
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        record_path.with_name("candidate.json").write_text(
+            json.dumps({"status": "COMMITTED", "candidate_sha": old_sha, "changed_files": [f"specs/{record['specNumber']}-{record['featureSlug']}/spec.md", "implementation.txt"]}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        record_path.with_name("validation-runtime.json").write_text(
+            json.dumps({"status": "PASS", "head_before": old_sha, "head_after": old_sha, "commands": [], "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        record_path.with_name("review-runtime.json").write_text(
+            json.dumps({"status": "PASS", "decision": "Approved", "reviewed_sha": old_sha, "exit_code": 0, "stdout": "Approved", "stderr": "", "violations": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return record_path, record, old_sha, new_sha
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
