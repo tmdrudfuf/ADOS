@@ -1541,6 +1541,21 @@ class RunPipeline:
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
 
         existing_reopens = _review_side_effect_recovery_reopens(record)
+        max_reopens = config.execution_policy.review.max_recovery_reopens
+        reopen_number = len(existing_reopens) + 1
+        if reopen_number > max_reopens:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {"reopen": str(reopen_number - 1)})]),
+                record,
+                violations=(
+                    _violation(
+                        "REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED",
+                        "review side-effect recovery reopen reached the configured maximum reopen count",
+                        {"max_recovery_reopens": str(max_reopens), "reopen": str(reopen_number - 1)},
+                    ),
+                ),
+            )
         if any(str(item.get("adoptedCandidateSha", "")) == current_head for item in existing_reopens):
             return PipelineOutcome(
                 "REVIEW_BLOCKED",
@@ -1550,7 +1565,6 @@ class RunPipeline:
             )
 
         changed_files = tuple(_git_output(worktree, "diff", "--name-only", f"{record['authoritativeBaseSha']}..{current_head}").splitlines())
-        reopen_number = len(existing_reopens) + 1
         candidate_archive = run_record_path.with_name(f"candidate-before-review-side-effect-reopen-{candidate.candidate_sha[:12]}.json")
         validation_archive = run_record_path.with_name(f"validation-runtime-before-review-side-effect-reopen-{candidate.candidate_sha[:12]}.json")
         review_archive = run_record_path.with_name(f"review-runtime-before-review-side-effect-reopen-{candidate.candidate_sha[:12]}.json")
@@ -1561,6 +1575,7 @@ class RunPipeline:
         attempts = _review_side_effect_recovery_attempts(record)
         reopen = {
             "round": reopen_number,
+            "maxReopens": max_reopens,
             "status": "REOPENED",
             "reason": "explicit_human_reopen_after_review_side_effect_recovery_exhaustion",
             "reopenedAt": _utc_now(),
@@ -3042,7 +3057,7 @@ def _candidate_from_mapping(raw: Any) -> CandidatePreparationResult | None:
 
 
 def _adopted_candidate_from_record(record: dict[str, Any], current_head: str) -> CandidatePreparationResult | None:
-    for key in ("reviewChangesRecoveryAdoption", "recoveryCandidateAdoption", "orphanedCandidateAdoption"):
+    for key in ("reviewSideEffectRecoveryReopenAdoption", "reviewChangesRecoveryAdoption", "recoveryCandidateAdoption", "orphanedCandidateAdoption"):
         adoption = record.get(key)
         if not isinstance(adoption, dict) or str(adoption.get("status", "")) != "ADOPTED":
             continue

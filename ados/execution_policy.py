@@ -34,6 +34,7 @@ class ReviewPolicy:
     reviewer: str
     max_rounds: int
     max_side_effect_recovery_rounds: int
+    max_recovery_reopens: int
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,12 @@ class ExecutionPolicy:
             "POLICY_INVALID_REVIEW_MAX_SIDE_EFFECT_RECOVERY_ROUNDS",
             1,
         )
+        review_max_recovery_reopens = _optional_positive_int(
+            review,
+            "max_recovery_reopens",
+            "POLICY_INVALID_REVIEW_MAX_RECOVERY_REOPENS",
+            1,
+        )
 
         cleanup = _require_mapping(root, "cleanup", "POLICY_MISSING_CLEANUP")
         autonomous = _require_bool(cleanup, "autonomous", "POLICY_INVALID_CLEANUP_AUTONOMOUS")
@@ -122,6 +129,7 @@ class ExecutionPolicy:
                 reviewer=reviewer,
                 max_rounds=max_rounds,
                 max_side_effect_recovery_rounds=max_side_effect_recovery_rounds,
+                max_recovery_reopens=review_max_recovery_reopens,
             ),
             cleanup=CleanupPolicy(autonomous=autonomous),
             guardian=GuardianPolicy(stop_on_uncertain=stop_on_uncertain),

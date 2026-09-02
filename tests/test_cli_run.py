@@ -3480,6 +3480,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("1", review_count_value)
         self.assertEqual(original_attempts, final_record["reviewSideEffectRecoveryAttempts"])
         self.assertEqual(1, len(final_record["reviewSideEffectRecoveryReopens"]))
+        self.assertEqual(1, final_record["reviewSideEffectRecoveryReopens"][0]["maxReopens"])
         self.assertEqual(old_sha, final_record["reviewSideEffectRecoveryReopens"][0]["previousReviewedSha"])
         self.assertEqual(new_sha, final_record["reviewSideEffectRecoveryReopens"][0]["adoptedCandidateSha"])
         self.assertIn(f"review-runtime-before-review-side-effect-reopen-{old_sha[:12]}.json", final_record["reviewSideEffectRecoveryReopens"][0]["previousReviewArtifact"])
@@ -3529,6 +3530,7 @@ class CliRunTests(unittest.TestCase):
 
     def test_review_side_effect_reopen_already_used_for_same_head_fails_closed(self):
         with self.project() as fixture:
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, review_max_recovery_reopens=2)
             record_path, record, old_sha, new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Repeat reopen review side effect", 1)
             record["reviewSideEffectRecoveryReopens"] = [{"status": "REOPENED", "adoptedCandidateSha": new_sha}]
             record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
@@ -3540,6 +3542,71 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("REVIEW_BLOCKED", result.status)
         self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_ALREADY_USED", {violation.code for violation in result.pipeline_result.violations})
         self.assertEqual([{"adoptedCandidateSha": new_sha, "status": "REOPENED"}], reopened_record["reviewSideEffectRecoveryReopens"])
+
+    def test_review_side_effect_reopen_beyond_configured_limit_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, old_sha, new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Max reopen review side effect", 1)
+            record["reviewSideEffectRecoveryReopens"] = [{"status": "REOPENED", "adoptedCandidateSha": old_sha}]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Max reopen review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual([{"adoptedCandidateSha": old_sha, "status": "REOPENED"}], reopened_record["reviewSideEffectRecoveryReopens"])
+
+    def test_review_side_effect_reopen_different_head_cannot_bypass_numeric_limit(self):
+        with self.project() as fixture:
+            record_path, record, old_sha, first_repaired_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Different head review side effect", 1)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "second-repair.txt").write_text("second repaired head\n", encoding="utf-8")
+            self.git(worktree, "add", "second-repair.txt")
+            self.git(worktree, "commit", "-m", "second review side effect repair")
+            second_repaired_sha = self.head(worktree)
+            record["reviewSideEffectRecoveryReopens"] = [{"status": "REOPENED", "adoptedCandidateSha": first_repaired_sha}]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Different head review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(first_repaired_sha, second_repaired_sha)
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED", {violation.code for violation in result.pipeline_result.violations})
+        self.assertEqual([{"adoptedCandidateSha": first_repaired_sha, "status": "REOPENED"}], reopened_record["reviewSideEffectRecoveryReopens"])
+
+    def test_review_side_effect_reopen_succeeds_within_configured_numeric_limit(self):
+        with self.project() as fixture:
+            fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, review_max_recovery_reopens=2)
+            record_path, record, old_sha, new_sha = self.create_exhausted_review_side_effect_blocked_run(fixture, "Within max review side effect", 1)
+            record["reviewSideEffectRecoveryReopens"] = [{"status": "REOPENED", "adoptedCandidateSha": old_sha}]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Within max review side effect", 1, fixture.config, reopen_review_side_effect_recovery=True)
+            )
+            final_record = result.pipeline_result.run_record
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(2, len(final_record["reviewSideEffectRecoveryReopens"]))
+        self.assertEqual([old_sha, new_sha], [item["adoptedCandidateSha"] for item in final_record["reviewSideEffectRecoveryReopens"]])
+        self.assertEqual(2, final_record["reviewSideEffectRecoveryReopens"][1]["maxReopens"])
+
+    def test_review_side_effect_reopen_adoption_preserves_changed_files_metadata(self):
+        candidate = run_pipeline._adopted_candidate_from_record(
+            {
+                "reviewSideEffectRecoveryReopenAdoption": {
+                    "status": "ADOPTED",
+                    "adoptedCandidateSha": "abc123",
+                    "adoptedChangedFiles": ["implementation.txt", "specs/001-feature/spec.md"],
+                }
+            },
+            "abc123",
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(("implementation.txt", "specs/001-feature/spec.md"), candidate.changed_files)
 
     def test_review_side_effect_budget_is_scoped_to_review_cycle(self):
         with self.project() as fixture:
@@ -3841,7 +3908,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None, review_max_recovery_reopens=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -3898,6 +3965,8 @@ class CliRunTests(unittest.TestCase):
             config["execution_policy"]["implementation"] = implementation
         if review_max_side_effect_recovery_rounds is not None:
             config["execution_policy"]["review"]["max_side_effect_recovery_rounds"] = review_max_side_effect_recovery_rounds
+        if review_max_recovery_reopens is not None:
+            config["execution_policy"]["review"]["max_recovery_reopens"] = review_max_recovery_reopens
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
