@@ -17,7 +17,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
@@ -36,6 +36,7 @@ class RunRequest:
     implementer_timeout_ms: int = SAFE_TIMEOUT_MS
     requirements_file: Path | None = None
     reopen_implementation_recovery: bool = False
+    reopen_review_side_effect_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,7 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),))
             return RunResult("BLOCKED", eligibility)
 
-        resume = self._resumable_run(project_path, config, plan, requirements)
+        resume = self._resumable_run(project_path, config, plan, requirements, reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery)
         if resume is not None:
             requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
             if requirements_violations:
@@ -202,6 +203,7 @@ class RunService:
             resume,
             adoption if adoption and adoption.status == "ADOPTABLE" else None,
             reopen_implementation_recovery=request.reopen_implementation_recovery,
+            reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
         )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
@@ -217,6 +219,7 @@ class RunService:
                 run_record_path=resume.record_path,
                 timeout_ms=request.implementer_timeout_ms,
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
+                reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -228,6 +231,7 @@ class RunService:
                 run_record_path=record_path,
                 timeout_ms=request.implementer_timeout_ms,
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
+                reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -264,6 +268,7 @@ class RunService:
             run_record_path=record_path,
             timeout_ms=request.implementer_timeout_ms,
             reopen_implementation_recovery=request.reopen_implementation_recovery,
+            reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -326,6 +331,7 @@ class RunService:
         resume: "_ResumeCandidate | None" = None,
         adoption: "_OrphanedCandidateAdoption | None" = None,
         reopen_implementation_recovery: bool = False,
+        reopen_review_side_effect_recovery: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -362,6 +368,12 @@ class RunService:
             reopen_implementation_recovery
             and resume is not None
             and set(blocking_recovery) == {"IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+        ):
+            blocking_recovery = ()
+        if (
+            reopen_review_side_effect_recovery
+            and resume is not None
+            and set(blocking_recovery) == {"REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"}
         ):
             blocking_recovery = ()
         if blocking_recovery:
@@ -625,13 +637,21 @@ class RunService:
         )
         return adoption.record_path
 
-    def _resumable_run(self, project_path: Path, config: ProjectConfig, plan: RunPlan, requirements: RequirementsSource | None = None) -> "_ResumeCandidate | None":
+    def _resumable_run(
+        self,
+        project_path: Path,
+        config: ProjectConfig,
+        plan: RunPlan,
+        requirements: RequirementsSource | None = None,
+        *,
+        reopen_review_side_effect_recovery: bool = False,
+    ) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
         primary_runs = project_path / ".agent-workflow" / "runs"
-        candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, None, primary_runs))
+        candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, None, primary_runs, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery))
         for record in self.worktrees.list_worktrees(project_path):
             runs = record.path / ".agent-workflow" / "runs"
-            candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, record, runs))
+            candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, record, runs, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery))
         deduped: dict[tuple[str, str], _ResumeCandidate] = {}
         for candidate in candidates:
             deduped.setdefault((candidate.record.run_id, str(Path(candidate.record.feature_worktree).resolve())), candidate)
@@ -640,7 +660,16 @@ class RunService:
             return candidates[0]
         return None
 
-    def _resume_candidates_in_run_dir(self, config: ProjectConfig, plan: RunPlan, requirements: RequirementsSource | None, worktree_record: Any | None, runs: Path) -> list["_ResumeCandidate"]:
+    def _resume_candidates_in_run_dir(
+        self,
+        config: ProjectConfig,
+        plan: RunPlan,
+        requirements: RequirementsSource | None,
+        worktree_record: Any | None,
+        runs: Path,
+        *,
+        reopen_review_side_effect_recovery: bool = False,
+    ) -> list["_ResumeCandidate"]:
         candidates: list[_ResumeCandidate] = []
         if not runs.is_dir():
             return candidates
@@ -648,7 +677,7 @@ class RunService:
             raw = _read_mapping(candidate_path)
             if raw is None:
                 continue
-            candidate = self._resume_candidate(config, plan, requirements, worktree_record, candidate_path, raw)
+            candidate = self._resume_candidate(config, plan, requirements, worktree_record, candidate_path, raw, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery)
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
@@ -661,6 +690,8 @@ class RunService:
         worktree_record: Any | None,
         record_path: Path,
         raw: dict[str, Any],
+        *,
+        reopen_review_side_effect_recovery: bool = False,
     ) -> "_ResumeCandidate | None":
         try:
             record = _record_from_mapping(raw)
@@ -669,7 +700,11 @@ class RunService:
         expected = self._record_from_plan(config, plan, record.feature_description)
         if record.status not in RESUMABLE_RUN_STATUSES:
             return None
-        if record.status == "REVIEW_BLOCKED" and not _review_blocked_is_resumable(record_path):
+        if (
+            record.status == "REVIEW_BLOCKED"
+            and not _review_blocked_is_resumable(record_path)
+            and not (reopen_review_side_effect_recovery and _review_side_effect_reopen_candidate(record_path))
+        ):
             return None
         if record.status == "VALIDATION_FAILED" and validation_failed_evidence(
             _read_mapping(record_path.with_name("candidate.json")),
@@ -779,6 +814,15 @@ def _review_blocked_is_resumable(record_path: Path) -> bool:
         or not review_changes_requested_evidence(record, candidate, validation, review, record_path)
         or not review_runtime_unavailable_evidence(record, candidate, validation, review)
         or not review_side_effect_recovery_evidence(record, candidate, validation, review)
+    )
+
+
+def _review_side_effect_reopen_candidate(record_path: Path) -> bool:
+    return not review_side_effect_recovery_reopen_evidence(
+        _read_mapping(record_path),
+        _read_mapping(record_path.with_name("candidate.json")),
+        _read_mapping(record_path.with_name("validation-runtime.json")),
+        _read_mapping(record_path.with_name("review-runtime.json")),
     )
 
 

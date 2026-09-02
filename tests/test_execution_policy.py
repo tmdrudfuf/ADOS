@@ -31,6 +31,7 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(1, policy.validation.max_recovery_reopens)
         self.assertEqual(2, policy.validation.max_no_change_recovery_rounds)
         self.assertEqual(1, policy.review.max_side_effect_recovery_rounds)
+        self.assertEqual(1, policy.review.max_recovery_reopens)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             policy.schema_version = "2"
 
@@ -147,6 +148,19 @@ class ExecutionPolicyTests(unittest.TestCase):
             ExecutionPolicy.from_mapping(raw)
 
         self.assertEqual("POLICY_INVALID_REVIEW_MAX_SIDE_EFFECT_RECOVERY_ROUNDS", context.exception.code)
+
+    def test_review_max_recovery_reopens_is_optional_and_positive_when_present(self):
+        raw = self.valid_mapping()
+        raw["execution_policy"]["review"]["max_recovery_reopens"] = 2
+        policy = ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual(2, policy.review.max_recovery_reopens)
+
+        raw["execution_policy"]["review"]["max_recovery_reopens"] = 0
+        with self.assertRaises(PolicyValidationError) as context:
+            ExecutionPolicy.from_mapping(raw)
+
+        self.assertEqual("POLICY_INVALID_REVIEW_MAX_RECOVERY_REOPENS", context.exception.code)
 
 
 if __name__ == "__main__":

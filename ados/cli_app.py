@@ -46,6 +46,7 @@ class CliApplication:
         run.add_argument("--dry-run", action="store_true")
         run.add_argument("--implementer-timeout-ms", type=int, default=300000)
         run.add_argument("--reopen-implementation-recovery", action="store_true")
+        run.add_argument("--reopen-review-side-effect-recovery", action="store_true")
         run.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
@@ -153,6 +154,7 @@ class CliApplication:
                     implementer_timeout_ms=args.implementer_timeout_ms,
                     requirements_file=Path(args.requirements_file) if args.requirements_file else None,
                     reopen_implementation_recovery=args.reopen_implementation_recovery,
+                    reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
                 )
             )
             if args.json:
