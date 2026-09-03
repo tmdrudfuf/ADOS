@@ -7,6 +7,15 @@
 
 Projects may configure different adapters, but implementer and independent reviewer must remain distinct for a review to satisfy this policy.
 
+When `execution_policy.agent_roles` enables adaptive selection, the implementer
+and reviewer are chosen from operator-defined preference lists plus verified
+runtime failure classification (never invented usage numbers). The pair is
+persisted durably and preserved across resume. If Codex implements a candidate
+(for example after failover), Codex cannot review it and Claude reviews; if
+Claude implements, Codex reviews. If no independent reviewer can be selected,
+review is `REVIEW_BLOCKED` and publication is blocked — implementer self-review
+is never substituted.
+
 ## Decision contract
 
 The reviewer returns one top-level decision:

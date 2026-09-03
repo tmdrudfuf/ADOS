@@ -1,0 +1,605 @@
+"""Deterministic tests for adaptive implementer / reviewer role selection."""
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+from ados.agent_roles import (
+    RUNTIME_FAILURE_CATEGORIES,
+    AgentAssignment,
+    AgentRolePolicy,
+    RoleSelectionError,
+    availability_state_for_category,
+    classify_runtime_failure,
+    failover_implementer,
+    is_external_availability_failure,
+    probe_agent,
+    select_assignment,
+)
+from ados.cli_app import _format_run_human
+from ados.execution_policy import ExecutionPolicy, PolicyValidationError
+from ados.project_config import load_project_config
+from ados.review_engine import ReviewEngine, ReviewRequest
+from ados.run_command import RunRequest, RunService
+from ados.run_pipeline import RunPipeline
+
+from tests.test_cli_run import FakePublisher
+
+
+ADAPTIVE_ROLES = {
+    "mode": "adaptive",
+    "agents": {"codex": "codex-cli exec", "claude": "claude-cli --print"},
+    "implementer_preference": ["codex", "claude"],
+    "reviewer_preference": ["claude", "codex"],
+}
+
+
+def _policy(roles):
+    return AgentRolePolicy.from_mapping(roles)
+
+
+# --------------------------------------------------------------------------- #
+# Policy model + backward compatibility (acceptance A, B)                     #
+# --------------------------------------------------------------------------- #
+
+
+class AgentRolePolicyModelTests(unittest.TestCase):
+    def base_execution_policy(self):
+        return {
+            "execution_policy": {
+                "schema_version": "1",
+                "publication": {"merge_strategy": "merge"},
+                "review": {"reviewer": "claude-cli", "max_rounds": 5},
+                "cleanup": {"autonomous": True},
+                "guardian": {"stop_on_uncertain": True},
+                "validation": {"commands": ["git diff --check"]},
+            }
+        }
+
+    def test_absent_agent_roles_preserves_current_behavior(self):
+        policy = ExecutionPolicy.from_mapping(self.base_execution_policy())
+        self.assertIsNone(policy.agent_roles)
+        self.assertIsNone(policy.to_dict()["agent_roles"])
+
+    def test_fixed_and_adaptive_modes_parse(self):
+        raw = self.base_execution_policy()
+        raw["execution_policy"]["agent_roles"] = {**ADAPTIVE_ROLES, "mode": "fixed"}
+        policy = ExecutionPolicy.from_mapping(raw)
+        self.assertEqual("fixed", policy.agent_roles.mode)
+        self.assertEqual(("codex", "claude"), policy.agent_roles.implementer_preference)
+        roundtrip = json.loads(json.dumps(policy.to_dict()))
+        self.assertEqual("fixed", roundtrip["agent_roles"]["mode"])
+        self.assertEqual({"codex": "codex-cli exec", "claude": "claude-cli --print"}, roundtrip["agent_roles"]["agents"])
+
+    def test_invalid_mode_agents_and_preferences_are_rejected(self):
+        with self.assertRaises(PolicyValidationError) as ctx:
+            _policy({**ADAPTIVE_ROLES, "mode": "auto"})
+        self.assertEqual("POLICY_INVALID_AGENT_ROLES_MODE", ctx.exception.code)
+
+        with self.assertRaises(PolicyValidationError) as ctx:
+            _policy({**ADAPTIVE_ROLES, "agents": {}})
+        self.assertEqual("POLICY_INVALID_AGENT_ROLES_AGENTS", ctx.exception.code)
+
+        with self.assertRaises(PolicyValidationError) as ctx:
+            _policy({**ADAPTIVE_ROLES, "implementer_preference": ["ghost"]})
+        self.assertEqual("POLICY_INVALID_AGENT_ROLES_IMPLEMENTER_PREFERENCE", ctx.exception.code)
+
+
+# --------------------------------------------------------------------------- #
+# Runtime failure classification (acceptance P, Q, R, S)                      #
+# --------------------------------------------------------------------------- #
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_known_external_categories(self):
+        self.assertEqual("QUOTA_EXHAUSTED", classify_runtime_failure(stderr="Error: quota exceeded for this org"))
+        self.assertEqual("USAGE_LIMIT_REACHED", classify_runtime_failure(stdout="You have hit your usage limit"))
+        self.assertEqual("CAPACITY_UNAVAILABLE", classify_runtime_failure(stderr="server is overloaded, try again later"))
+        self.assertEqual("COMMAND_NOT_FOUND", classify_runtime_failure(executable_found=False))
+        self.assertEqual("TRANSIENT_RUNTIME_UNAVAILABLE", classify_runtime_failure(stderr="connection reset by peer"))
+
+    def test_oauth_session_expired_is_authentication_not_code_failure(self):
+        category = classify_runtime_failure(stderr="OAuth session expired and could not be refreshed")
+        self.assertEqual("AUTHENTICATION_UNAVAILABLE", category)
+        self.assertTrue(is_external_availability_failure(category))
+
+    def test_capacity_failure_classified_separately_from_code_failure(self):
+        self.assertEqual("CAPACITY_UNAVAILABLE", classify_runtime_failure(exit_code=1, stderr="503 service unavailable"))
+        self.assertFalse(is_external_availability_failure("UNKNOWN_RUNTIME_FAILURE"))
+
+    def test_unknown_runtime_error_fails_conservatively(self):
+        for text in ("AssertionError: expected 3 got 4", "npm ERR! Test failed.  See above for more details.", "tsc: error TS2322: Type 'x'"):
+            self.assertEqual("UNKNOWN_RUNTIME_FAILURE", classify_runtime_failure(exit_code=1, stderr=text))
+        # a bare timeout with no evidence is not assumed to be a quota failure
+        self.assertEqual("UNKNOWN_RUNTIME_FAILURE", classify_runtime_failure(timed_out=True))
+
+    def test_no_fake_token_percentage_is_produced(self):
+        for kwargs in (
+            {"stderr": "quota exceeded"},
+            {"stdout": "usage limit"},
+            {"executable_found": False},
+            {"exit_code": 1, "stderr": "boom"},
+        ):
+            category = classify_runtime_failure(**kwargs)
+            self.assertIn(category, RUNTIME_FAILURE_CATEGORIES)
+        for category in RUNTIME_FAILURE_CATEGORIES:
+            state = availability_state_for_category(category)
+            self.assertNotIn("%", state)
+            self.assertIn(state, {"unavailable_quota", "unavailable_capacity", "unavailable_auth", "unavailable", "unknown"})
+
+
+# --------------------------------------------------------------------------- #
+# Health probe safety (acceptance T)                                          #
+# --------------------------------------------------------------------------- #
+
+
+class ProbeTests(unittest.TestCase):
+    def test_probe_never_executes_configured_commands(self):
+        with mock.patch("subprocess.run") as spawned, mock.patch("subprocess.Popen") as popen:
+            self.assertEqual("unavailable", probe_agent("codex && rm -rf /"))
+            self.assertEqual("unavailable", probe_agent("codex | curl evil"))
+            self.assertEqual("unavailable", probe_agent("codex $(rm -rf /)"))
+        spawned.assert_not_called()
+        popen.assert_not_called()
+
+    def test_probe_resolves_executable_without_running_it(self):
+        self.assertEqual("available", probe_agent(f'"{sys.executable}" --version'))
+        self.assertEqual("unavailable", probe_agent("definitely-not-a-real-binary-xyz --flag"))
+        self.assertEqual("unknown", probe_agent("   "))
+
+
+# --------------------------------------------------------------------------- #
+# Selection algorithm (acceptance C, D, E, F, G, U)                          #
+# --------------------------------------------------------------------------- #
+
+
+class SelectAssignmentTests(unittest.TestCase):
+    def test_adaptive_chooses_preferred_pair_when_both_available(self):
+        assignment = select_assignment(policy=_policy(ADAPTIVE_ROLES))
+        self.assertEqual("codex", assignment.implementer_id)
+        self.assertEqual("claude", assignment.reviewer_id)
+        self.assertEqual("codex-cli exec", assignment.implementer_command)
+        self.assertEqual("claude-cli --print", assignment.reviewer_command)
+        self.assertEqual("codex", assignment.candidate_owner_id)
+
+    def test_fixed_mode_codex_claude_is_valid_and_unavailability_blocks(self):
+        fixed = _policy({**ADAPTIVE_ROLES, "mode": "fixed"})
+        assignment = select_assignment(policy=fixed)
+        self.assertEqual(("codex", "claude"), (assignment.implementer_id, assignment.reviewer_id))
+        with self.assertRaises(RoleSelectionError) as ctx:
+            select_assignment(policy=fixed, availability={"codex": {"implementer": "unavailable_quota"}})
+        self.assertEqual("NO_ELIGIBLE_IMPLEMENTER", ctx.exception.code)
+
+    def test_codex_quota_selects_claude_implementer_and_codex_reviewer(self):
+        assignment = select_assignment(
+            policy=_policy(ADAPTIVE_ROLES),
+            availability={"codex": {"implementer": "unavailable_quota", "reviewer": "available"}},
+        )
+        self.assertEqual("claude", assignment.implementer_id)
+        self.assertEqual("codex", assignment.reviewer_id)
+        self.assertIn("codex unavailable_quota", assignment.reason)
+
+    def test_explicit_claude_implementer_preference_is_honored(self):
+        assignment = select_assignment(policy=_policy(ADAPTIVE_ROLES), prefer_implementer="claude")
+        self.assertEqual("claude", assignment.implementer_id)
+        self.assertEqual("codex", assignment.reviewer_id)
+        self.assertIn("operator preferred", assignment.reason)
+        with self.assertRaises(RoleSelectionError) as ctx:
+            select_assignment(policy=_policy(ADAPTIVE_ROLES), prefer_implementer="gemini")
+        self.assertEqual("ROLE_OVERRIDE_UNKNOWN_AGENT", ctx.exception.code)
+
+    def test_same_agent_cannot_implement_and_review(self):
+        roles = {**ADAPTIVE_ROLES, "reviewer_preference": ["codex"]}
+        with self.assertRaises(RoleSelectionError) as ctx:
+            select_assignment(policy=_policy(roles))
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", ctx.exception.code)
+
+    def test_no_independent_reviewer_blocks(self):
+        with self.assertRaises(RoleSelectionError) as ctx:
+            select_assignment(
+                policy=_policy(ADAPTIVE_ROLES),
+                availability={
+                    "codex": {"implementer": "available", "reviewer": "unavailable_capacity"},
+                    "claude": {"implementer": "available", "reviewer": "unavailable_auth"},
+                },
+            )
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", ctx.exception.code)
+
+
+class FailoverTests(unittest.TestCase):
+    def test_adaptive_failover_switches_implementer_and_preserves_independence(self):
+        current = select_assignment(policy=_policy(ADAPTIVE_ROLES))
+        switched = failover_implementer(
+            policy=_policy(ADAPTIVE_ROLES),
+            current=current,
+            unavailable_ids={"codex"},
+            category="QUOTA_EXHAUSTED",
+        )
+        self.assertEqual("claude", switched.implementer_id)
+        self.assertEqual("codex", switched.reviewer_id)
+        self.assertEqual("claude", switched.candidate_owner_id)
+        self.assertEqual(current.sequence + 1, switched.sequence)
+        self.assertIn("QUOTA_EXHAUSTED", switched.reason)
+
+    def test_failover_requires_adaptive_mode(self):
+        fixed = _policy({**ADAPTIVE_ROLES, "mode": "fixed"})
+        with self.assertRaises(RoleSelectionError) as ctx:
+            failover_implementer(policy=fixed, current=select_assignment(policy=fixed), unavailable_ids={"codex"}, category="QUOTA_EXHAUSTED")
+        self.assertEqual("FAILOVER_NOT_PERMITTED", ctx.exception.code)
+
+    def test_failover_fails_closed_when_no_alternate_remains(self):
+        current = select_assignment(policy=_policy(ADAPTIVE_ROLES))
+        with self.assertRaises(RoleSelectionError) as ctx:
+            failover_implementer(policy=_policy(ADAPTIVE_ROLES), current=current, unavailable_ids={"codex", "claude"}, category="QUOTA_EXHAUSTED")
+        self.assertEqual("NO_ELIGIBLE_IMPLEMENTER", ctx.exception.code)
+
+
+class AgentAssignmentRecordTests(unittest.TestCase):
+    def test_record_roundtrip_and_no_secrets_persisted(self):
+        assignment = select_assignment(policy=_policy(ADAPTIVE_ROLES))
+        record = assignment.to_record()
+        self.assertEqual(
+            {"implementerId", "reviewerId", "implementerCommand", "reviewerCommand", "mode", "reason", "sequence", "candidateOwnerId", "availability"},
+            set(record),
+        )
+        for key in record:
+            self.assertNotIn("token", key.lower())
+            self.assertNotIn("secret", key.lower())
+            self.assertNotIn("apikey", key.lower().replace("_", ""))
+        restored = AgentAssignment.from_record(json.loads(json.dumps(record)))
+        self.assertEqual(assignment.implementer_id, restored.implementer_id)
+        self.assertEqual(assignment.reviewer_command, restored.reviewer_command)
+        self.assertIsNone(AgentAssignment.from_record(None))
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer command plumbing (acceptance E)                                    #
+# --------------------------------------------------------------------------- #
+
+
+class ReviewerCommandTests(unittest.TestCase):
+    def _policy_doc(self):
+        return ExecutionPolicy.from_mapping(
+            {
+                "execution_policy": {
+                    "schema_version": "1",
+                    "publication": {"merge_strategy": "merge"},
+                    "review": {"reviewer": "policy-default-reviewer", "max_rounds": 5},
+                    "cleanup": {"autonomous": True},
+                    "guardian": {"stop_on_uncertain": True},
+                    "validation": {"commands": ["git diff --check"]},
+                }
+            }
+        )
+
+    def test_assignment_reviewer_command_overrides_policy_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(("git", "init", "-b", "main"), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "config", "user.email", "t@t.invalid"), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "config", "user.name", "T"), cwd=repo, check=True, capture_output=True)
+            (repo / "a.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "commit", "-m", "base"), cwd=repo, check=True, capture_output=True)
+            base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            (repo / "a.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(("git", "commit", "-am", "candidate"), cwd=repo, check=True, capture_output=True)
+            candidate = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            with mock.patch("ados.review_engine.subprocess.run") as spawned:
+                def fake_run(args, **kwargs):
+                    if args[0] == "git":
+                        return subprocess.CompletedProcess(args, 0, "ok", "")
+                    return subprocess.CompletedProcess(args, 0, "Approved", "")
+
+                spawned.side_effect = fake_run
+                result = ReviewEngine().run(
+                    policy=self._policy_doc(),
+                    request=ReviewRequest(
+                        repository_path=repo,
+                        candidate_sha=candidate,
+                        base_sha=base,
+                        scope="a.txt",
+                        reviewer_command="selected-codex-reviewer --json",
+                    ),
+                )
+
+        reviewer_call = [call for call in spawned.call_args_list if call.args[0][0] != "git"][0]
+        self.assertEqual("selected-codex-reviewer", reviewer_call.args[0][0])
+        self.assertEqual("PASS", result.status)
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end durable assignment / failover (acceptance H, I, J, K, L, M,     #
+# N, O, V, X)                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+# A fake agent CLI: one command that reviews when handed a review prompt and
+# otherwise runs the given implementer body. Mirrors how a real agent CLI is a
+# single command used for both roles.
+_AGENT_TEMPLATE = (
+    "import sys, uuid\n"
+    "from pathlib import Path\n"
+    "prompt = sys.stdin.read()\n"
+    "if 'Review exact candidate HEAD' in prompt:\n"
+    "    print('Approved')\n"
+    "    sys.exit(0)\n"
+    "{body}\n"
+)
+_BODY_SUCCESS = (
+    "p = Path('implementation.txt')\n"
+    # write raw LF bytes so re-runs produce a clean delta on every platform
+    "p.write_bytes((p.read_bytes() if p.exists() else b'') + uuid.uuid4().hex.encode() + b'\\n')\n"
+    "print('implemented')\n"
+)
+_BODY_QUOTA = "print('Error: usage limit reached; please try again later', file=sys.stderr)\nsys.exit(1)\n"
+_BODY_QUOTA_DIRTY = (
+    "Path('half-done.txt').write_text('partial work', encoding='utf-8')\n"
+    "print('quota exceeded mid-run', file=sys.stderr)\n"
+    "sys.exit(1)\n"
+)
+
+
+def _agent_script(body):
+    return _AGENT_TEMPLATE.format(body=body)
+
+
+IMPL_SUCCESS = _agent_script(_BODY_SUCCESS)
+IMPL_QUOTA = _agent_script(_BODY_QUOTA)
+IMPL_QUOTA_DIRTY = _agent_script(_BODY_QUOTA_DIRTY)
+
+
+class _RoleProject:
+    def __init__(self, test, *, codex_script, claude_script, mode="adaptive", validation_commands=None):
+        self.test = test
+        self.codex_script = codex_script
+        self.claude_script = claude_script
+        self.mode = mode
+        self.validation_commands = validation_commands or ["git diff --check"]
+
+    def __enter__(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "project"
+        self.repo.mkdir(parents=True)
+        g = self.test.git
+        g(self.repo, "init", "-b", "main")
+        g(self.repo, "config", "user.email", "test@example.invalid")
+        g(self.repo, "config", "user.name", "Test User")
+        (self.repo / ".gitignore").write_text(".agent-workflow/\n", encoding="utf-8")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        g(self.repo, "add", ".gitignore", "README.md")
+        g(self.repo, "commit", "-m", "initial")
+        g(self.repo, "remote", "add", "origin", str(self.repo))
+        g(self.repo, "update-ref", "refs/remotes/origin/main", self.test.head(self.repo))
+
+        codex = self.root / "codex_agent.py"
+        claude = self.root / "claude_agent.py"
+        codex.write_text(self.codex_script, encoding="utf-8")
+        claude.write_text(self.claude_script, encoding="utf-8")
+        self.codex_cmd = f'"{sys.executable}" "{codex}"'
+        self.claude_cmd = f'"{sys.executable}" "{claude}"'
+        config = {
+            "project": {
+                "id": "role-project",
+                "primary_repository_path": str(self.repo),
+                "default_branch": "main",
+                "allowed_primary_local_paths": [],
+            },
+            "roles": {"implementer": self.codex_cmd, "reviewer": self.claude_cmd},
+            "execution_policy": {
+                "schema_version": "1",
+                "publication": {"merge_strategy": "merge"},
+                "review": {"reviewer": self.claude_cmd, "max_rounds": 5},
+                "cleanup": {"autonomous": True},
+                "guardian": {"stop_on_uncertain": True},
+                "validation": {"commands": self.validation_commands},
+                "agent_roles": {
+                    "mode": self.mode,
+                    "agents": {"codex": self.codex_cmd, "claude": self.claude_cmd},
+                    "implementer_preference": ["codex", "claude"],
+                    "reviewer_preference": ["claude", "codex"],
+                },
+            },
+        }
+        self.config = self.root / "project-config.json"
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc):
+        self.temp.cleanup()
+
+    def record(self):
+        matches = list(self.root.rglob("ados-run.json"))
+        assert matches, f"no run record under {self.root}"
+        # Prefer the most recently written copy.
+        return json.loads(max(matches, key=lambda p: p.stat().st_mtime).read_text(encoding="utf-8"))
+
+
+class DurableAssignmentIntegrationTests(unittest.TestCase):
+    def git(self, repo, *args):
+        return subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True, text=True)
+
+    def head(self, repo):
+        return self.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def _service(self, fixture):
+        return RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo)))
+
+    def _run(self, fixture, **kwargs):
+        return self._service(fixture).run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config, **kwargs))
+
+    def test_adaptive_preferred_pair_is_persisted_and_resume_preserves_it(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            # Plain RunService blocks at publication, leaving the durable run intact.
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            record = fixture.record()
+            second = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            resumed_record = fixture.record()
+
+        self.assertEqual("READY_FOR_PUBLICATION", first.status)
+        self.assertEqual("codex", record["agentAssignment"]["implementerId"])
+        self.assertEqual("claude", record["agentAssignment"]["reviewerId"])
+        self.assertEqual("adaptive", record["agentAssignment"]["mode"])
+        self.assertEqual("codex", record["agentAssignment"]["candidateOwnerId"])
+        self.assertTrue(second.resumed)
+        self.assertEqual("READY_FOR_PUBLICATION", second.status)
+        self.assertEqual(record["agentAssignment"], resumed_record["agentAssignment"])
+        self.assertIn("Agent assignment:", _format_run_human(second))
+        self.assertIn("Implementer: codex", _format_run_human(second))
+
+    def test_explicit_claude_preference_is_recorded_durably(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            result = self._run(fixture, prefer_implementer="claude")
+            record = fixture.record()
+
+        self.assertIn(result.status, {"COMPLETE", "READY_FOR_PUBLICATION"})
+        self.assertEqual("claude", record["agentAssignment"]["implementerId"])
+        self.assertEqual("codex", record["agentAssignment"]["reviewerId"])
+        self.assertIn("operator preferred", record["agentAssignment"]["reason"])
+
+    def test_external_quota_failover_does_not_burn_recovery_budget(self):
+        with _RoleProject(self, codex_script=IMPL_QUOTA, claude_script=IMPL_SUCCESS) as fixture:
+            result = self._run(fixture)
+            record = fixture.record()
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("claude", record["agentAssignment"]["implementerId"])
+        self.assertEqual("codex", record["agentAssignment"]["reviewerId"])
+        self.assertEqual("claude", record["agentAssignment"]["candidateOwnerId"])
+        events = record.get("agentAvailabilityEvents", [])
+        self.assertEqual(1, len(events))
+        self.assertEqual("codex", events[0]["agentId"])
+        self.assertEqual("USAGE_LIMIT_REACHED", events[0]["category"])
+        self.assertEqual([], record.get("implementationRecoveryAttempts", []))
+        self.assertIn("implementer_failover", stages)
+        # exact-HEAD / publication invariants remain: reviewed == validated == merged
+        self.assertEqual(
+            result.pipeline_result.validation.head_after,
+            result.pipeline_result.review.reviewed_sha,
+        )
+        self.assertEqual("MATCH", result.pipeline_result.exact_head_gate["status"])
+
+    def test_dirty_worktree_failover_blocks_safely(self):
+        with _RoleProject(self, codex_script=IMPL_QUOTA_DIRTY, claude_script=IMPL_SUCCESS) as fixture:
+            result = self._run(fixture)
+            record = fixture.record()
+            worktree = Path(record["featureWorktree"])
+            partial_work_preserved = (worktree / "half-done.txt").exists()
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        codes = {v.code for v in result.pipeline_result.violations}
+        self.assertIn("FAILOVER_DIRTY_WORKTREE", codes)
+        self.assertEqual("codex", record["agentAssignment"]["implementerId"])
+        self.assertTrue(partial_work_preserved)
+        self.assertEqual([], record.get("implementationRecoveryAttempts", []))
+
+    def test_validation_failure_does_not_trigger_agent_failover(self):
+        counter = "vcount.txt"
+        validation_script = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"c = Path(r'@COUNTER@')\n"
+            "n = int(c.read_text()) if c.exists() else 0\n"
+            "c.write_text(str(n + 1))\n"
+            "sys.exit(1 if n == 0 else 0)\n"
+        )
+
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            vfile = fixture.root / counter
+            script_path = fixture.root / "vcheck.py"
+            script_path.write_text(validation_script.replace("@COUNTER@", str(vfile)), encoding="utf-8")
+            raw = json.loads(fixture.config.read_text(encoding="utf-8"))
+            raw["execution_policy"]["validation"]["commands"] = [f'"{sys.executable}" "{script_path}"']
+            fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+
+            result = self._run(fixture)
+            record = fixture.record()
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertIn(result.status, {"COMPLETE", "READY_FOR_PUBLICATION"})
+        self.assertEqual("codex", record["agentAssignment"]["implementerId"])
+        self.assertEqual([], record.get("agentAvailabilityEvents", []))
+        self.assertNotIn("implementer_failover", stages)
+        self.assertIn("validation_recovery_implementer", stages)
+
+    def test_external_failure_after_candidate_produced_blocks_without_switching(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            counter = fixture.root / "ccount.txt"
+            codex = fixture.root / "codex_agent.py"
+            codex.write_text(
+                "import sys, uuid\n"
+                "from pathlib import Path\n"
+                "prompt = sys.stdin.read()\n"
+                "if 'Review exact candidate HEAD' in prompt:\n"
+                "    print('Approved'); sys.exit(0)\n"
+                f"c = Path(r'{counter}')\n"
+                "n = int(c.read_text()) if c.exists() else 0\n"
+                "c.write_text(str(n + 1))\n"
+                "if n == 0:\n"
+                "    p = Path('implementation.txt')\n"
+                "    p.write_bytes((p.read_bytes() if p.exists() else b'') + uuid.uuid4().hex.encode() + b'\\n')\n"
+                "    print('implemented'); sys.exit(0)\n"
+                "print('Error: quota exceeded for this account', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            reviewer = fixture.root / "cr_reviewer.py"
+            reviewer.write_text("print('Changes Requested')\n", encoding="utf-8")
+            raw = json.loads(fixture.config.read_text(encoding="utf-8"))
+            raw["execution_policy"]["agent_roles"]["agents"]["claude"] = f'"{sys.executable}" "{reviewer}"'
+            raw["execution_policy"]["review"]["reviewer"] = f'"{sys.executable}" "{reviewer}"'
+            fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+
+            result = self._run(fixture)
+            record = fixture.record()
+            worktree = Path(record["featureWorktree"])
+            candidate_preserved = (worktree / "implementation.txt").exists()
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        codes = {v.code for v in result.pipeline_result.violations}
+        self.assertIn("FAILOVER_CANDIDATE_ALREADY_PRODUCED", codes)
+        self.assertEqual("codex", record["agentAssignment"]["implementerId"])
+        self.assertEqual("codex", record["agentAssignment"]["candidateOwnerId"])
+        self.assertTrue(candidate_preserved)
+        self.assertEqual([], record.get("implementationRecoveryAttempts", []))
+        self.assertEqual(1, len(record.get("agentAvailabilityEvents", [])))
+
+    def test_changes_requested_does_not_switch_implementer(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            reviewer = fixture.root / "reviewer_rounds.py"
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"c = Path(r'{fixture.root / 'rcount.txt'}')\n"
+                "n = int(c.read_text()) if c.exists() else 0\n"
+                "c.write_text(str(n + 1))\n"
+                "print('Changes Requested' if n == 0 else 'Approved')\n",
+                encoding="utf-8",
+            )
+            raw = json.loads(fixture.config.read_text(encoding="utf-8"))
+            reviewer_cmd = f'"{sys.executable}" "{reviewer}"'
+            raw["execution_policy"]["review"]["reviewer"] = reviewer_cmd
+            raw["execution_policy"]["agent_roles"]["agents"]["claude"] = reviewer_cmd
+            # codex stays the implementer; claude id now maps to the rounds reviewer
+            fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+
+            result = self._run(fixture)
+            record = fixture.record()
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertIn(result.status, {"COMPLETE", "READY_FOR_PUBLICATION"})
+        self.assertEqual("codex", record["agentAssignment"]["implementerId"])
+        self.assertEqual([], record.get("agentAvailabilityEvents", []))
+        self.assertNotIn("implementer_failover", stages)
+        self.assertIn("implementer_fix", stages)
+
+
+if __name__ == "__main__":
+    unittest.main()

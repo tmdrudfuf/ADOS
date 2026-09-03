@@ -25,6 +25,7 @@ class ReviewRequest:
     requirements_content: str = ""
     requirements_sha: str = ""
     requirements_source: str = ""
+    reviewer_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,8 @@ class ReviewEngine:
         if violations:
             return ReviewResult("BLOCK", "Unavailable", request.candidate_sha, 0, "", "", violations)
 
-        command_or_violation = _reviewer_command(policy.review.reviewer)
+        reviewer = request.reviewer_command.strip() or policy.review.reviewer
+        command_or_violation = _reviewer_command(reviewer)
         if isinstance(command_or_violation, ReviewViolation):
             return ReviewResult("BLOCK", "Unavailable", request.candidate_sha, 0, "", "", (command_or_violation,))
 

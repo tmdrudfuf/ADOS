@@ -71,11 +71,16 @@ class ExecutionPolicy:
     cleanup: CleanupPolicy
     guardian: GuardianPolicy
     validation: ValidationPolicy
+    agent_roles: Any | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ExecutionPolicy":
+        from .agent_roles import AgentRolePolicy
+
         root = _require_mapping(raw, "execution_policy", "POLICY_MISSING_ROOT")
         schema_version = _require_non_empty_string(root, "schema_version", "POLICY_MISSING_SCHEMA_VERSION")
+        agent_roles_raw = root.get("agent_roles")
+        agent_roles = AgentRolePolicy.from_mapping(agent_roles_raw) if agent_roles_raw is not None else None
 
         publication = _require_mapping(root, "publication", "POLICY_MISSING_PUBLICATION")
         merge_strategy = _require_non_empty_string(publication, "merge_strategy", "POLICY_MISSING_MERGE_STRATEGY")
@@ -140,10 +145,13 @@ class ExecutionPolicy:
                 max_recovery_reopens=max_recovery_reopens,
                 max_no_change_recovery_rounds=max_no_change_recovery_rounds,
             ),
+            agent_roles=agent_roles,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["agent_roles"] = self.agent_roles.to_dict() if self.agent_roles is not None else None
+        return data
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True)
