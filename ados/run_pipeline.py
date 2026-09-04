@@ -468,7 +468,7 @@ class RunPipeline:
             if not (Path(record["featureWorktree"]) / review_scope).exists():
                 review_scope = str(record["featureDescription"])
             review_artifact_snapshot = _review_artifact_snapshot(Path(record["featureWorktree"]), review_scope)
-            independence = _review_independence_violation(record)
+            independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
             if independence is not None:
                 _write_review_block_status(run_record_path, record, _empty_review(candidate_result.candidate_sha), candidate_result, validation_result, block_violations=(independence,), block_cause="reviewer_independence")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, violations=(independence,))
@@ -1790,7 +1790,7 @@ class RunPipeline:
             # Fail closed if the durable reviewer identity is not independent of
             # the durable candidate owner. Exact-HEAD match alone must not let a
             # stored Approved result reach publication on a resumed run.
-            independence = _review_independence_violation(record)
+            independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
             if independence is not None:
                 _write_review_block_status(run_record_path, record, _empty_review(candidate_result.candidate_sha), candidate_result, validation_result, block_violations=(independence,), block_cause="reviewer_independence")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {"reason": "reviewer_independence"})]), _read_json(run_record_path), candidate=candidate_result, validation=validation_result, review=review_result, violations=(independence,))
@@ -1884,7 +1884,7 @@ class RunPipeline:
         if not (worktree / review_scope).exists():
             review_scope = str(record["featureDescription"])
         review_artifact_snapshot = _review_artifact_snapshot(worktree, review_scope)
-        independence = _review_independence_violation(record)
+        independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
         if independence is not None:
             _write_review_block_status(run_record_path, record, _empty_review(candidate.candidate_sha), candidate, validation, block_violations=(independence,), block_cause="reviewer_independence")
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, violations=(independence,))
@@ -2917,11 +2917,26 @@ def _assignment_reviewer_command(record: dict[str, Any]) -> str:
     return ""
 
 
-def _review_independence_violation(record: dict[str, Any]) -> PipelineViolation | None:
-    """Fail closed when the assigned reviewer is not independent of the candidate owner."""
+def _review_independence_violation(record: dict[str, Any], *, adaptive_roles: bool) -> PipelineViolation | None:
+    """Fail closed when the assigned reviewer is not independent of the candidate owner.
+
+    ``adaptive_roles`` is ``True`` when the run's execution policy carries an
+    ``agent_roles`` block. Such a run always persists an ``agentAssignment`` at
+    creation, so an absent, non-dict, or empty assignment means the durable
+    reviewer / candidate-owner identity needed to prove independence is missing
+    or corrupted, and publication must block. Genuine pre-adaptive legacy runs
+    (no ``agent_roles`` policy) never had an assignment and keep the historical
+    fixed-reviewer behavior.
+    """
 
     assignment = record.get("agentAssignment")
     if not isinstance(assignment, dict):
+        if adaptive_roles:
+            return _violation(
+                "NO_INDEPENDENT_REVIEWER",
+                "adaptive-role run is missing the durable agent assignment that proves reviewer independence; publication must block",
+                {"reason": "missing_agent_assignment", "agent_assignment_type": type(assignment).__name__},
+            )
         return None
     reviewer_id = str(assignment.get("reviewerId", ""))
     owner_id = str(assignment.get("candidateOwnerId") or assignment.get("implementerId", ""))

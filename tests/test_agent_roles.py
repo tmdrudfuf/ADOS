@@ -613,28 +613,40 @@ def _review_block(*violations):
 class PublicationResumeIndependenceTests(unittest.TestCase):
     def test_independent_durable_assignment_permits_publication(self):
         record = {"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}}
-        self.assertIsNone(_review_independence_violation(record))
+        self.assertIsNone(_review_independence_violation(record, adaptive_roles=True))
 
     def test_reviewer_equal_to_candidate_owner_is_blocked(self):
         record = {"agentAssignment": {"reviewerId": "codex", "candidateOwnerId": "codex", "reviewerCommand": "codex exec"}}
-        violation = _review_independence_violation(record)
+        violation = _review_independence_violation(record, adaptive_roles=True)
         self.assertIsNotNone(violation)
         self.assertEqual("REVIEWER_NOT_INDEPENDENT", violation.code)
 
     def test_missing_reviewer_or_owner_identity_fails_closed(self):
         # empty reviewer command
-        v1 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": ""}})
+        v1 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": ""}}, adaptive_roles=True)
         self.assertEqual("NO_INDEPENDENT_REVIEWER", v1.code)
         # ambiguous ownership: assignment present but no owner and no implementer id
-        v2 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "reviewerCommand": "claude-cli --print"}})
+        v2 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "reviewerCommand": "claude-cli --print"}}, adaptive_roles=True)
         self.assertEqual("NO_INDEPENDENT_REVIEWER", v2.code)
         # no reviewer id
-        v3 = _review_independence_violation({"agentAssignment": {"candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}})
+        v3 = _review_independence_violation({"agentAssignment": {"candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}}, adaptive_roles=True)
         self.assertEqual("NO_INDEPENDENT_REVIEWER", v3.code)
 
-    def test_absent_assignment_preserves_legacy_publication(self):
-        # legacy durable runs without an agentAssignment stay publishable
-        self.assertIsNone(_review_independence_violation({}))
+    def test_absent_or_corrupt_assignment_fails_closed_under_adaptive_roles(self):
+        # An adaptive-role run always persists an agentAssignment; an absent,
+        # None, or non-dict one means the durable reviewer / candidate-owner
+        # identity is missing or corrupted, so publication must block. Old
+        # Approved + exact-HEAD evidence must not buy a bypass here.
+        for corrupt in ({}, {"agentAssignment": None}, {"agentAssignment": "wiped"}, {"agentAssignment": []}):
+            violation = _review_independence_violation(corrupt, adaptive_roles=True)
+            self.assertIsNotNone(violation, corrupt)
+            self.assertEqual("NO_INDEPENDENT_REVIEWER", violation.code, corrupt)
+
+    def test_absent_assignment_preserves_genuine_pre_adaptive_legacy_publication(self):
+        # A genuine legacy run has no agent_roles policy (adaptive_roles=False)
+        # and never had an assignment; the historical fixed-reviewer path stays
+        # publishable. This is the only compatibility carve-out.
+        self.assertIsNone(_review_independence_violation({}, adaptive_roles=False))
 
 
 class _RoleRunMixin:
@@ -676,6 +688,27 @@ class PublicationResumeIndependenceIntegrationTests(_RoleRunMixin, unittest.Test
 
         self.assertEqual("REVIEW_BLOCKED", blocked.status)
         self.assertIn("REVIEWER_NOT_INDEPENDENT", {v.code for v in blocked.pipeline_result.violations})
+        self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
+
+    def test_resume_blocks_when_agent_assignment_is_missing_even_with_exact_head_match(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            self.assertEqual("READY_FOR_PUBLICATION", first.status)
+
+            path = self._durable_path(fixture)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            # Approved review + exact-HEAD evidence stay intact; only the durable
+            # agent assignment (reviewer / candidate-owner identity proof) is
+            # removed, as it would be by corruption of an adaptive-role record.
+            record.pop("agentAssignment")
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            blocked = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            blocked_record = json.loads(self._durable_path(fixture).read_text(encoding="utf-8"))
+
+        self.assertTrue(blocked.resumed)
+        self.assertEqual("REVIEW_BLOCKED", blocked.status)
+        self.assertIn("NO_INDEPENDENT_REVIEWER", {v.code for v in blocked.pipeline_result.violations})
         self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
 
     def test_normal_independent_resume_still_publishes(self):
