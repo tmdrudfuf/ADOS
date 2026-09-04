@@ -632,6 +632,50 @@ class PublicationResumeIndependenceTests(unittest.TestCase):
         v3 = _review_independence_violation({"agentAssignment": {"candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}}, adaptive_roles=True)
         self.assertEqual("NO_INDEPENDENT_REVIEWER", v3.code)
 
+    def test_corrupt_required_identity_values_fail_closed(self):
+        # dict-shaped assignment, but a required identity/command field holds a
+        # missing / None / empty / whitespace-only / non-string value. None of
+        # these prove durable reviewer independence, so publication must block
+        # with NO_INDEPENDENT_REVIEWER (never coerced to a valid-looking string).
+        def base():
+            return {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}
+
+        bad_values = (None, "", "   ", "\t\n", 42, True, ["claude"], {"id": "claude"})
+        for field in ("reviewerId", "candidateOwnerId", "reviewerCommand"):
+            for bad in bad_values:
+                assignment = base()
+                assignment[field] = bad
+                violation = _review_independence_violation({"agentAssignment": assignment}, adaptive_roles=True)
+                self.assertIsNotNone(violation, (field, bad))
+                self.assertEqual("NO_INDEPENDENT_REVIEWER", violation.code, (field, bad))
+            # field absent entirely
+            assignment = base()
+            assignment.pop(field)
+            violation = _review_independence_violation({"agentAssignment": assignment}, adaptive_roles=True)
+            self.assertIsNotNone(violation, field)
+            self.assertEqual("NO_INDEPENDENT_REVIEWER", violation.code, field)
+
+    def test_corrupt_candidate_owner_is_not_masked_by_implementer_id(self):
+        # candidateOwnerId is explicitly present but corrupt; a valid
+        # implementerId must not launder it into a passing check.
+        for bad in (None, "", "   ", 42):
+            record = {"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": bad, "implementerId": "codex", "reviewerCommand": "claude-cli --print"}}
+            violation = _review_independence_violation(record, adaptive_roles=True)
+            self.assertEqual("NO_INDEPENDENT_REVIEWER", violation.code, bad)
+
+    def test_legacy_assignment_without_candidate_owner_key_uses_implementer_id(self):
+        # Older durable schema: candidateOwnerId key genuinely absent, so
+        # implementerId is the authoritative ownership field.
+        ok = {"agentAssignment": {"reviewerId": "claude", "implementerId": "codex", "reviewerCommand": "claude-cli --print"}}
+        self.assertIsNone(_review_independence_violation(ok, adaptive_roles=True))
+        not_independent = {"agentAssignment": {"reviewerId": "codex", "implementerId": "codex", "reviewerCommand": "codex exec"}}
+        self.assertEqual("REVIEWER_NOT_INDEPENDENT", _review_independence_violation(not_independent, adaptive_roles=True).code)
+
+    def test_whitespace_padded_identities_are_compared_trimmed(self):
+        record = {"agentAssignment": {"reviewerId": "codex ", "candidateOwnerId": " codex", "reviewerCommand": "codex exec"}}
+        violation = _review_independence_violation(record, adaptive_roles=True)
+        self.assertEqual("REVIEWER_NOT_INDEPENDENT", violation.code)
+
     def test_absent_or_corrupt_assignment_fails_closed_under_adaptive_roles(self):
         # An adaptive-role run always persists an agentAssignment; an absent,
         # None, or non-dict one means the durable reviewer / candidate-owner
@@ -701,6 +745,27 @@ class PublicationResumeIndependenceIntegrationTests(_RoleRunMixin, unittest.Test
             # agent assignment (reviewer / candidate-owner identity proof) is
             # removed, as it would be by corruption of an adaptive-role record.
             record.pop("agentAssignment")
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            blocked = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            blocked_record = json.loads(self._durable_path(fixture).read_text(encoding="utf-8"))
+
+        self.assertTrue(blocked.resumed)
+        self.assertEqual("REVIEW_BLOCKED", blocked.status)
+        self.assertIn("NO_INDEPENDENT_REVIEWER", {v.code for v in blocked.pipeline_result.violations})
+        self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
+
+    def test_resume_blocks_when_reviewer_identity_value_is_corrupt_even_with_exact_head_match(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            self.assertEqual("READY_FOR_PUBLICATION", first.status)
+
+            path = self._durable_path(fixture)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            # agentAssignment stays dict-shaped and the key stays present; only
+            # the reviewerId VALUE is corrupted to whitespace. Stored Approved +
+            # exact-HEAD evidence must not buy a bypass.
+            record["agentAssignment"]["reviewerId"] = "   "
             path.write_text(json.dumps(record), encoding="utf-8")
 
             blocked = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))

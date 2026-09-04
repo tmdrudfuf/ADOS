@@ -2938,14 +2938,26 @@ def _review_independence_violation(record: dict[str, Any], *, adaptive_roles: bo
                 {"reason": "missing_agent_assignment", "agent_assignment_type": type(assignment).__name__},
             )
         return None
-    reviewer_id = str(assignment.get("reviewerId", ""))
-    owner_id = str(assignment.get("candidateOwnerId") or assignment.get("implementerId", ""))
-    if not reviewer_id or not assignment.get("reviewerCommand") or not owner_id:
-        return _violation(
-            "NO_INDEPENDENT_REVIEWER",
-            "no independent reviewer is available for the exact candidate; publication must block",
-            {"candidate_owner": owner_id, "reviewer": reviewer_id},
-        )
+
+    reviewer_id = _durable_identity_field(assignment, "reviewerId")
+    reviewer_command = _durable_identity_field(assignment, "reviewerCommand")
+    if "candidateOwnerId" in assignment:
+        # A record serialized by AgentAssignment.to_record always carries
+        # candidateOwnerId; its presence with a corrupt value is tampering, not
+        # a legacy schema, so it must not silently fall back to implementerId.
+        owner_id = _durable_identity_field(assignment, "candidateOwnerId")
+    else:
+        # Older durable schemas omitted candidateOwnerId; implementerId is the
+        # authoritative backward-compatible ownership field for those records.
+        owner_id = _durable_identity_field(assignment, "implementerId")
+
+    for field_name, value in (("reviewerId", reviewer_id), ("reviewerCommand", reviewer_command), ("candidateOwnerId", owner_id)):
+        if value is None:
+            return _violation(
+                "NO_INDEPENDENT_REVIEWER",
+                "durable reviewer independence evidence is missing, blank, or malformed; publication must block",
+                {"reason": "invalid_durable_identity", "field": field_name},
+            )
     if reviewer_id == owner_id:
         return _violation(
             "REVIEWER_NOT_INDEPENDENT",
@@ -2953,6 +2965,18 @@ def _review_independence_violation(record: dict[str, Any], *, adaptive_roles: bo
             {"reviewer": reviewer_id, "candidate_owner": owner_id},
         )
     return None
+
+
+def _durable_identity_field(assignment: dict[str, Any], key: str) -> str | None:
+    """Return the trimmed value of a required durable-identity field, or ``None``
+    when it is absent, not a string, empty, or whitespace-only. Never coerces a
+    non-string (e.g. ``None``, ``42``) into a string that would read as valid."""
+    if key not in assignment:
+        return None
+    value = assignment[key]
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def _review_artifact_candidates(worktree: Path, scope: str) -> tuple[Path, ...]:
