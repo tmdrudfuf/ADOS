@@ -1787,6 +1787,13 @@ class RunPipeline:
         validation_result = _validation_from_mapping(validation)
         review_result = _review_from_mapping(review)
         if candidate_result.candidate_sha and validation_result.status == "PASS" and review_result.decision == "Approved":
+            # Fail closed if the durable reviewer identity is not independent of
+            # the durable candidate owner. Exact-HEAD match alone must not let a
+            # stored Approved result reach publication on a resumed run.
+            independence = _review_independence_violation(record)
+            if independence is not None:
+                _write_review_block_status(run_record_path, record, _empty_review(candidate_result.candidate_sha), candidate_result, validation_result, block_violations=(independence,), block_cause="reviewer_independence")
+                return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {"reason": "reviewer_independence"})]), _read_json(run_record_path), candidate=candidate_result, validation=validation_result, review=review_result, violations=(independence,))
             exact = self.exact_head.verify(repository_path=Path(record["featureWorktree"]), approved_review_sha=review_result.reviewed_sha, validated_sha=validation_result.head_after)
             stages.append(_stage("exact_head", exact.status, {"approved_review_sha": review_result.reviewed_sha, "validated_sha": validation_result.head_after}))
             if exact.status != "MATCH":
@@ -2918,11 +2925,11 @@ def _review_independence_violation(record: dict[str, Any]) -> PipelineViolation 
         return None
     reviewer_id = str(assignment.get("reviewerId", ""))
     owner_id = str(assignment.get("candidateOwnerId") or assignment.get("implementerId", ""))
-    if not reviewer_id or not assignment.get("reviewerCommand"):
+    if not reviewer_id or not assignment.get("reviewerCommand") or not owner_id:
         return _violation(
             "NO_INDEPENDENT_REVIEWER",
             "no independent reviewer is available for the exact candidate; publication must block",
-            {"candidate_owner": owner_id},
+            {"candidate_owner": owner_id, "reviewer": reviewer_id},
         )
     if reviewer_id == owner_id:
         return _violation(
@@ -2997,6 +3004,7 @@ def _write_review_block_status(
         "reviewedSha": review.reviewed_sha,
         "exitCode": review.exit_code,
         "timedOut": reason_code == "REVIEWER_TIMED_OUT",
+        "runtimeCategory": _review_runtime_category(review),
     }
     _write_json(path, updated)
 
@@ -3768,13 +3776,37 @@ def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[Pipelin
     return ()
 
 
+# Runtime failure categories that genuinely warrant an unattended review retry.
+# Auth / quota / usage / command-not-found / unknown are NOT retried here: they
+# fail closed and require operator or recovery action.
+_TRANSIENT_RUNTIME_CATEGORIES = frozenset({"TRANSIENT_RUNTIME_UNAVAILABLE", "CAPACITY_UNAVAILABLE"})
+
+
+def _review_runtime_category(review: ReviewResult) -> str:
+    """The normalized runtime availability category of a reviewer command failure."""
+
+    for violation in review.violations:
+        if violation.code == "REVIEWER_COMMAND_FAILED":
+            category = str(violation.evidence.get("runtime_category", ""))
+            if category:
+                return category
+    return ""
+
+
+def _review_violation_is_transient(violation: ReviewViolation) -> bool:
+    if violation.code != "REVIEWER_COMMAND_FAILED":
+        return violation.code in TRANSIENT_REVIEW_FAILURE_CODES
+    category = str(violation.evidence.get("runtime_category", ""))
+    # Missing category means a durable record written before runtime
+    # classification existed: preserve the prior transient-resume semantics.
+    return category == "" or category in _TRANSIENT_RUNTIME_CATEGORIES
+
+
 def _is_transient_review_block(review: ReviewResult) -> bool:
-    codes = tuple(violation.code for violation in review.violations)
-    if not codes:
+    violations = review.violations
+    if not violations:
         return False
-    if all(code in TRANSIENT_REVIEW_FAILURE_CODES for code in codes):
-        return True
-    return False
+    return all(_review_violation_is_transient(violation) for violation in violations)
 
 
 def _review_block_reason_code(review: ReviewResult, block_violations: tuple[PipelineViolation, ...] = ()) -> str:

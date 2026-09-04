@@ -23,9 +23,9 @@ from ados.agent_roles import (
 from ados.cli_app import _format_run_human
 from ados.execution_policy import ExecutionPolicy, PolicyValidationError
 from ados.project_config import load_project_config
-from ados.review_engine import ReviewEngine, ReviewRequest
+from ados.review_engine import ReviewEngine, ReviewRequest, ReviewResult, ReviewViolation
 from ados.run_command import RunRequest, RunService
-from ados.run_pipeline import RunPipeline
+from ados.run_pipeline import RunPipeline, _is_transient_review_block, _review_independence_violation
 
 from tests.test_cli_run import FakePublisher
 
@@ -599,6 +599,234 @@ class DurableAssignmentIntegrationTests(unittest.TestCase):
         self.assertEqual([], record.get("agentAvailabilityEvents", []))
         self.assertNotIn("implementer_failover", stages)
         self.assertIn("implementer_fix", stages)
+
+
+# --------------------------------------------------------------------------- #
+# Blocking finding 1: publication-resume implementer/reviewer independence     #
+# --------------------------------------------------------------------------- #
+
+
+def _review_block(*violations):
+    return ReviewResult("BLOCK", "Unavailable", "sha", 1, "", "", tuple(violations))
+
+
+class PublicationResumeIndependenceTests(unittest.TestCase):
+    def test_independent_durable_assignment_permits_publication(self):
+        record = {"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}}
+        self.assertIsNone(_review_independence_violation(record))
+
+    def test_reviewer_equal_to_candidate_owner_is_blocked(self):
+        record = {"agentAssignment": {"reviewerId": "codex", "candidateOwnerId": "codex", "reviewerCommand": "codex exec"}}
+        violation = _review_independence_violation(record)
+        self.assertIsNotNone(violation)
+        self.assertEqual("REVIEWER_NOT_INDEPENDENT", violation.code)
+
+    def test_missing_reviewer_or_owner_identity_fails_closed(self):
+        # empty reviewer command
+        v1 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "candidateOwnerId": "codex", "reviewerCommand": ""}})
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", v1.code)
+        # ambiguous ownership: assignment present but no owner and no implementer id
+        v2 = _review_independence_violation({"agentAssignment": {"reviewerId": "claude", "reviewerCommand": "claude-cli --print"}})
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", v2.code)
+        # no reviewer id
+        v3 = _review_independence_violation({"agentAssignment": {"candidateOwnerId": "codex", "reviewerCommand": "claude-cli --print"}})
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", v3.code)
+
+    def test_absent_assignment_preserves_legacy_publication(self):
+        # legacy durable runs without an agentAssignment stay publishable
+        self.assertIsNone(_review_independence_violation({}))
+
+
+class _RoleRunMixin:
+    """Integration helpers for driving RunService against a _RoleProject fixture.
+
+    A plain mixin (not a TestCase) so subclasses do not re-run the base
+    DurableAssignmentIntegrationTests suite.
+    """
+
+    def git(self, repo, *args):
+        return subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True, text=True)
+
+    def head(self, repo):
+        return self.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def _run(self, fixture, **kwargs):
+        service = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo)))
+        return service.run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config, **kwargs))
+
+    def _durable_path(self, fixture):
+        return max(fixture.root.rglob("ados-run.json"), key=lambda p: p.stat().st_mtime)
+
+
+class PublicationResumeIndependenceIntegrationTests(_RoleRunMixin, unittest.TestCase):
+    def test_resume_blocks_when_reviewer_is_candidate_owner_even_with_exact_head_match(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            self.assertEqual("READY_FOR_PUBLICATION", first.status)
+
+            path = self._durable_path(fixture)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            # exact-HEAD evidence is untouched; only the durable reviewer identity
+            # is tampered to match the candidate owner.
+            record["agentAssignment"]["reviewerId"] = record["agentAssignment"]["candidateOwnerId"]
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            blocked = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            blocked_record = json.loads(self._durable_path(fixture).read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", blocked.status)
+        self.assertIn("REVIEWER_NOT_INDEPENDENT", {v.code for v in blocked.pipeline_result.violations})
+        self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
+
+    def test_normal_independent_resume_still_publishes(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            second = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+
+        self.assertEqual("READY_FOR_PUBLICATION", first.status)
+        self.assertTrue(second.resumed)
+        self.assertEqual("READY_FOR_PUBLICATION", second.status)
+
+    def test_fresh_publication_path_is_unaffected(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            result = self._run(fixture)
+        self.assertIn(result.status, {"COMPLETE", "READY_FOR_PUBLICATION"})
+
+
+# --------------------------------------------------------------------------- #
+# Blocking finding 2: deterministic reviewer runtime failure classification    #
+# --------------------------------------------------------------------------- #
+
+
+class ReviewerRuntimeClassificationTests(unittest.TestCase):
+    def _run_reviewer(self, *, stdout="", stderr="", returncode=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            for args in (("init", "-b", "main"), ("config", "user.email", "t@t.invalid"), ("config", "user.name", "T")):
+                subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True)
+            (repo / "a.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "commit", "-m", "base"), cwd=repo, check=True, capture_output=True)
+            sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+            def fake_run(args, **kwargs):
+                if args[0] == "git":
+                    return subprocess.CompletedProcess(args, 0, "ok", "")
+                return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+            with mock.patch("ados.review_engine.subprocess.run", side_effect=fake_run):
+                return ReviewEngine().run(
+                    policy=ExecutionPolicy.from_mapping(
+                        {
+                            "execution_policy": {
+                                "schema_version": "1",
+                                "publication": {"merge_strategy": "merge"},
+                                "review": {"reviewer": "reviewer-cli", "max_rounds": 5},
+                                "cleanup": {"autonomous": True},
+                                "guardian": {"stop_on_uncertain": True},
+                                "validation": {"commands": ["git diff --check"]},
+                            }
+                        }
+                    ),
+                    request=ReviewRequest(repository_path=repo, candidate_sha=sha, base_sha=sha, scope="a.txt"),
+                )
+
+    def _category(self, result):
+        self.assertEqual("REVIEWER_COMMAND_FAILED", result.violations[0].code)
+        return result.violations[0].evidence["runtime_category"]
+
+    def test_oauth_session_expired_is_authentication_unavailable(self):
+        result = self._run_reviewer(stderr="OAuth session expired and could not be refreshed")
+        self.assertEqual("AUTHENTICATION_UNAVAILABLE", self._category(result))
+
+    def test_reviewer_quota_error(self):
+        result = self._run_reviewer(stderr="Error: quota exceeded for this account")
+        self.assertIn(self._category(result), {"QUOTA_EXHAUSTED", "USAGE_LIMIT_REACHED"})
+
+    def test_reviewer_capacity_error(self):
+        result = self._run_reviewer(stderr="503 service unavailable: server is overloaded")
+        self.assertEqual("CAPACITY_UNAVAILABLE", self._category(result))
+
+    def test_reviewer_transient_runtime_error(self):
+        result = self._run_reviewer(stderr="connection reset by peer")
+        self.assertEqual("TRANSIENT_RUNTIME_UNAVAILABLE", self._category(result))
+
+    def test_unknown_reviewer_command_failure(self):
+        result = self._run_reviewer(stderr="AssertionError: reviewer plugin crashed")
+        self.assertEqual("UNKNOWN_RUNTIME_FAILURE", self._category(result))
+
+    def test_transient_gate_does_not_blindly_trust_reviewer_command_failed(self):
+        unknown = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1", "runtime_category": "UNKNOWN_RUNTIME_FAILURE"})
+        auth = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1", "runtime_category": "AUTHENTICATION_UNAVAILABLE"})
+        transient = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1", "runtime_category": "TRANSIENT_RUNTIME_UNAVAILABLE"})
+        self.assertFalse(_is_transient_review_block(_review_block(unknown)))
+        self.assertFalse(_is_transient_review_block(_review_block(auth)))
+        self.assertTrue(_is_transient_review_block(_review_block(transient)))
+        # legacy record without a classified category keeps prior transient-resume semantics
+        legacy = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1"})
+        self.assertTrue(_is_transient_review_block(_review_block(legacy)))
+
+
+_REVIEWER_UNKNOWN_FAILURE = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    f"c = Path(r'@COUNTER@')\n"
+    "c.write_text(str((int(c.read_text()) if c.exists() else 0) + 1))\n"
+    "print('AssertionError: reviewer plugin crashed', file=sys.stderr)\n"
+    "sys.exit(1)\n"
+)
+
+
+class ReviewerRuntimeClassificationIntegrationTests(_RoleRunMixin, unittest.TestCase):
+    def test_unknown_reviewer_failure_is_durable_and_not_auto_resumed(self):
+        with _RoleProject(self, codex_script=IMPL_SUCCESS, claude_script=IMPL_SUCCESS) as fixture:
+            counter = fixture.root / "rcount.txt"
+            reviewer = fixture.root / "unknown_reviewer.py"
+            reviewer.write_text(_REVIEWER_UNKNOWN_FAILURE.replace("@COUNTER@", str(counter)), encoding="utf-8")
+            reviewer_cmd = f'"{sys.executable}" "{reviewer}"'
+            raw = json.loads(fixture.config.read_text(encoding="utf-8"))
+            raw["execution_policy"]["review"]["reviewer"] = reviewer_cmd
+            raw["execution_policy"]["agent_roles"]["agents"]["claude"] = reviewer_cmd
+            fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+
+            first = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            record = json.loads(self._durable_path(fixture).read_text(encoding="utf-8"))
+            invocations_after_first = int(counter.read_text(encoding="utf-8"))
+
+            second = RunService().run(RunRequest(fixture.repo, "Adaptive role selection", None, fixture.config))
+            invocations_after_resume = int(counter.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        # durably represented well enough to reason about on resume
+        self.assertFalse(record["reviewBlock"]["transient"])
+        self.assertEqual("UNKNOWN_RUNTIME_FAILURE", record["reviewBlock"]["runtimeCategory"])
+        # an unknown reviewer failure is conservative: not auto-resumed, reviewer
+        # not silently re-invoked, and nothing reaches publication
+        self.assertEqual(1, invocations_after_first)
+        self.assertEqual(invocations_after_first, invocations_after_resume)
+        self.assertNotIn(second.status, {"COMPLETE", "READY_FOR_PUBLICATION", "MERGED", "PR_CREATED", "PR_READY"})
+
+
+# --------------------------------------------------------------------------- #
+# Blocking finding 2: reviewer failover never breaks independence              #
+# (acceptance also covered by SelectAssignmentTests / FailoverTests above)     #
+# --------------------------------------------------------------------------- #
+
+
+class ReviewerFailoverIndependenceTests(unittest.TestCase):
+    def test_candidate_implementer_is_never_its_own_fallback_reviewer(self):
+        # codex implements -> claude must review; codex may not be reused
+        assignment = select_assignment(policy=_policy(ADAPTIVE_ROLES))
+        self.assertEqual("codex", assignment.implementer_id)
+        self.assertEqual("claude", assignment.reviewer_id)
+        self.assertNotEqual(assignment.implementer_id, assignment.reviewer_id)
+
+    def test_no_independent_reviewer_fails_closed(self):
+        roles = {**ADAPTIVE_ROLES, "reviewer_preference": ["codex"]}
+        with self.assertRaises(RoleSelectionError) as ctx:
+            select_assignment(policy=_policy(roles))
+        self.assertEqual("NO_INDEPENDENT_REVIEWER", ctx.exception.code)
 
 
 if __name__ == "__main__":

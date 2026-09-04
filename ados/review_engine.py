@@ -105,11 +105,20 @@ class ReviewEngine:
         violations: list[ReviewViolation] = []
         if completed.returncode != 0:
             decision = "Unavailable"
+            # Local import: agent_roles imports from this module, so importing the
+            # shared classifier at module scope would be circular.
+            from .agent_roles import classify_runtime_failure
+
+            category = classify_runtime_failure(
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
             violations.append(
                 ReviewViolation(
                     "REVIEWER_COMMAND_FAILED",
                     "reviewer command exited nonzero",
-                    {"exit_code": str(completed.returncode)},
+                    {"exit_code": str(completed.returncode), "runtime_category": category},
                 )
             )
         elif decision == "Unavailable":

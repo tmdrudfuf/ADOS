@@ -14,7 +14,19 @@ persisted durably and preserved across resume. If Codex implements a candidate
 (for example after failover), Codex cannot review it and Claude reviews; if
 Claude implements, Codex reviews. If no independent reviewer can be selected,
 review is `REVIEW_BLOCKED` and publication is blocked — implementer self-review
-is never substituted.
+is never substituted. This independence check is re-applied before publication on
+resumed durable runs; a stored Approved result is never trusted on exact-HEAD
+match alone, and missing or ambiguous reviewer / candidate-owner identity fails
+closed.
+
+Reviewer command failures are classified with the same provider-neutral runtime
+categories as implementer failures (`AUTHENTICATION_UNAVAILABLE`,
+`QUOTA_EXHAUSTED`, `USAGE_LIMIT_REACHED`, `CAPACITY_UNAVAILABLE`,
+`COMMAND_NOT_FOUND`, `TRANSIENT_RUNTIME_UNAVAILABLE`, `UNKNOWN_RUNTIME_FAILURE`)
+and the normalized category is persisted on the review block. Only genuinely
+transient categories are retried unattended; authentication, quota, usage, and
+unknown reviewer failures block conservatively rather than being treated as
+transient.
 
 ## Decision contract
 

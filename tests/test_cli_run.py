@@ -166,7 +166,7 @@ class CliRunTests(unittest.TestCase):
                 "counter.write_text(str(count + 1), encoding='utf-8')\n"
                 "prompt = sys.stdin.read()\n"
                 "if count == 0:\n"
-                "    print('temporary outage', file=sys.stderr)\n"
+                "    print('connection reset by peer', file=sys.stderr)\n"
                 "    sys.exit(3)\n"
                 f"Path(r'{reviewer_prompt}').write_text(prompt, encoding='utf-8')\n"
                 "print('Approved')\n",
