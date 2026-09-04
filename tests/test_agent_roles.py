@@ -756,6 +756,35 @@ class ReviewerRuntimeClassificationTests(unittest.TestCase):
         result = self._run_reviewer(stderr="AssertionError: reviewer plugin crashed")
         self.assertEqual("UNKNOWN_RUNTIME_FAILURE", self._category(result))
 
+    def test_missing_reviewer_executable_is_command_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            for args in (("init", "-b", "main"), ("config", "user.email", "t@t.invalid"), ("config", "user.name", "T")):
+                subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True)
+            (repo / "a.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "commit", "-m", "base"), cwd=repo, check=True, capture_output=True)
+            sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            policy = ExecutionPolicy.from_mapping(
+                {
+                    "execution_policy": {
+                        "schema_version": "1",
+                        "publication": {"merge_strategy": "merge"},
+                        "review": {"reviewer": "definitely-not-a-real-binary-xyz --flag", "max_rounds": 5},
+                        "cleanup": {"autonomous": True},
+                        "guardian": {"stop_on_uncertain": True},
+                        "validation": {"commands": ["git diff --check"]},
+                    }
+                }
+            )
+            result = ReviewEngine().run(
+                policy=policy,
+                request=ReviewRequest(repository_path=repo, candidate_sha=sha, base_sha=sha, scope="a.txt"),
+            )
+        self.assertEqual("REVIEWER_EXECUTABLE_NOT_FOUND", result.violations[0].code)
+        self.assertEqual("COMMAND_NOT_FOUND", result.violations[0].evidence["runtime_category"])
+
     def test_transient_gate_does_not_blindly_trust_reviewer_command_failed(self):
         unknown = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1", "runtime_category": "UNKNOWN_RUNTIME_FAILURE"})
         auth = ReviewViolation("REVIEWER_COMMAND_FAILED", "x", {"exit_code": "1", "runtime_category": "AUTHENTICATION_UNAVAILABLE"})

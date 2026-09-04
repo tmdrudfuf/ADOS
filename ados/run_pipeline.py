@@ -3783,13 +3783,12 @@ _TRANSIENT_RUNTIME_CATEGORIES = frozenset({"TRANSIENT_RUNTIME_UNAVAILABLE", "CAP
 
 
 def _review_runtime_category(review: ReviewResult) -> str:
-    """The normalized runtime availability category of a reviewer command failure."""
+    """The normalized runtime availability category of a reviewer runtime failure."""
 
     for violation in review.violations:
-        if violation.code == "REVIEWER_COMMAND_FAILED":
-            category = str(violation.evidence.get("runtime_category", ""))
-            if category:
-                return category
+        category = str(violation.evidence.get("runtime_category", ""))
+        if category:
+            return category
     return ""
 
 

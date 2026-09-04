@@ -2585,7 +2585,7 @@ class CliRunTests(unittest.TestCase):
     def test_review_blocked_sha_mismatch_does_not_resume(self):
         with self.project(implementer_mode="count") as fixture:
             reviewer = fixture.root / "reviewer.py"
-            reviewer.write_text("import sys\nprint('temporary outage', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
+            reviewer.write_text("import sys\nprint('connection reset by peer', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
             fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
             first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Corrupt review resume", None, fixture.config))
             worktree = Path(first.run_record.feature_worktree)
@@ -2607,7 +2607,7 @@ class CliRunTests(unittest.TestCase):
     def test_review_blocked_without_transient_code_does_not_resume(self):
         with self.project(implementer_mode="count") as fixture:
             reviewer = fixture.root / "reviewer.py"
-            reviewer.write_text("import sys\nprint('temporary outage', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
+            reviewer.write_text("import sys\nprint('connection reset by peer', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
             fixture.config = self.write_config(fixture.root / "project-config.json", fixture.repo, implementer_mode="count", reviewer=f'"{sys.executable}" "{reviewer}"')
             first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Malformed review block", None, fixture.config))
             worktree = Path(first.run_record.feature_worktree)

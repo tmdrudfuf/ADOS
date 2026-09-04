@@ -89,7 +89,7 @@ class ReviewEngine:
                 0,
                 "",
                 "",
-                (ReviewViolation("REVIEWER_EXECUTABLE_NOT_FOUND", "reviewer executable was not found", {"executable": command_or_violation[0]}),),
+                (ReviewViolation("REVIEWER_EXECUTABLE_NOT_FOUND", "reviewer executable was not found", {"executable": command_or_violation[0], "runtime_category": "COMMAND_NOT_FOUND"}),),
             )
         except OSError as exc:
             return ReviewResult(
