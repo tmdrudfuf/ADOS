@@ -13,6 +13,7 @@ import shlex
 import subprocess
 from typing import Any
 
+from .agent_roles import classify_runtime_failure
 from .git_provider import GitRepositoryProvider
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig
@@ -85,6 +86,7 @@ class ImplementerRuntimeResult:
     head_after: str
     changed_files: tuple[str, ...]
     violations: tuple[ImplementerViolation, ...]
+    runtime_failure_category: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -99,6 +101,7 @@ class ImplementerRuntimeResult:
             "headAfter": self.head_after,
             "changedFiles": list(self.changed_files),
             "violations": [violation.to_dict() for violation in self.violations],
+            "runtimeFailureCategory": self.runtime_failure_category,
         }
 
 
@@ -193,9 +196,13 @@ class ImplementerRuntime:
             violations.append(_violation("RUN_NOT_READY_FOR_IMPLEMENTATION", "run is not ready for implementer invocation", {"status": record["status"]}))
         if record["projectId"] != config.project_id:
             violations.append(_violation("RUN_PROJECT_MISMATCH", "run project does not match configuration", {"run": record["projectId"], "config": config.project_id}))
-        expected_implementer = config.implementer or "Unavailable"
+        assignment = record.get("agentAssignment")
+        if isinstance(assignment, dict) and isinstance(assignment.get("implementerCommand"), str) and assignment["implementerCommand"].strip():
+            expected_implementer = assignment["implementerCommand"]
+        else:
+            expected_implementer = config.implementer or "Unavailable"
         if record["implementer"] != expected_implementer:
-            violations.append(_violation("IMPLEMENTER_ROLE_MISMATCH", "run implementer does not match configuration", {"run": record["implementer"], "config": expected_implementer}))
+            violations.append(_violation("IMPLEMENTER_ROLE_MISMATCH", "run implementer does not match the durable assignment", {"run": record["implementer"], "expected": expected_implementer}))
         primary = Path(record["primaryRepository"]).resolve()
         worktree = Path(record["featureWorktree"]).resolve()
         if primary != Path(config.primary_repository_path).resolve():
@@ -248,7 +255,8 @@ class ImplementerRuntime:
         head_after = _safe_head(self.git, worktree)
         changed = _changed_files(self.git, worktree)
         if isinstance(completed, ImplementerViolation):
-            return ImplementerRuntimeResult(runtime.runtime_id, runtime.run_id, "BLOCKED", None, False, "", "", head_before, head_after, changed, (completed,))
+            category = "COMMAND_NOT_FOUND" if completed.code == "IMPLEMENTER_EXECUTABLE_NOT_FOUND" else ""
+            return ImplementerRuntimeResult(runtime.runtime_id, runtime.run_id, "BLOCKED", None, False, "", "", head_before, head_after, changed, (completed,), category)
         if isinstance(completed, subprocess.TimeoutExpired):
             return ImplementerRuntimeResult(
                 runtime.runtime_id,
@@ -262,6 +270,7 @@ class ImplementerRuntime:
                 head_after,
                 changed,
                 (_violation("IMPLEMENTER_TIMED_OUT", "implementer command timed out", {"timeout_ms": str(runtime.command.timeout_ms)}),),
+                classify_runtime_failure(stdout=_bounded(completed.stdout or ""), stderr=_bounded(completed.stderr or ""), timed_out=True),
             )
         if completed.returncode != 0:
             return ImplementerRuntimeResult(
@@ -276,6 +285,7 @@ class ImplementerRuntime:
                 head_after,
                 changed,
                 (_violation("IMPLEMENTER_COMMAND_FAILED", "implementer exited nonzero", {"exit_code": str(completed.returncode)}),),
+                classify_runtime_failure(exit_code=completed.returncode, stdout=_bounded(completed.stdout), stderr=_bounded(completed.stderr)),
             )
         return ImplementerRuntimeResult(
             runtime.runtime_id,

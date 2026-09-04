@@ -15,6 +15,13 @@ import shutil
 import subprocess
 from typing import Any, Protocol
 
+from .agent_roles import (
+    AgentAssignment,
+    RoleSelectionError,
+    availability_state_for_category,
+    failover_implementer,
+    is_external_availability_failure,
+)
 from .exact_head_gate import ExactHeadGate
 from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, ImplementerRuntimeResult, ImplementerViolation
@@ -461,6 +468,10 @@ class RunPipeline:
             if not (Path(record["featureWorktree"]) / review_scope).exists():
                 review_scope = str(record["featureDescription"])
             review_artifact_snapshot = _review_artifact_snapshot(Path(record["featureWorktree"]), review_scope)
+            independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
+            if independence is not None:
+                _write_review_block_status(run_record_path, record, _empty_review(candidate_result.candidate_sha), candidate_result, validation_result, block_violations=(independence,), block_cause="reviewer_independence")
+                return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, violations=(independence,))
             review_result = self.review.run(
                 policy=config.execution_policy,
                 request=ReviewRequest(
@@ -472,6 +483,7 @@ class RunPipeline:
                     requirements_content=read_durable_requirements_content(run_record_path, record),
                     requirements_sha=str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
                     requirements_source=str(record.get("requirements", {}).get("sourcePath", "")) if isinstance(record.get("requirements"), dict) else "",
+                    reviewer_command=_assignment_reviewer_command(record),
                 ),
             )
             _write_json(run_record_path.with_name("review-runtime.json"), review_result.to_dict())
@@ -553,7 +565,21 @@ class RunPipeline:
     ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
         current = failed_implementer
         current_record = record
-        while current.status in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
+        adaptive_roles = config.execution_policy.agent_roles is not None
+        while (
+            current.status in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}
+            or (adaptive_roles and current.status == "BLOCKED" and _is_external_availability_failure(current))
+        ):
+            if adaptive_roles and _is_external_availability_failure(current):
+                handled = self._handle_external_implementer_failure(
+                    config, run_record_path, current_record, current, stages, bootstrap, timeout_ms
+                )
+                if isinstance(handled, PipelineOutcome):
+                    return handled
+                current, current_record = handled
+                if current.status == "READY_FOR_VALIDATION":
+                    return current, current_record
+                continue
             max_rounds = config.execution_policy.implementation.max_recovery_rounds
             round_number = _implementation_recovery_attempt_count(current_record) + 1
             _write_implementation_failure_status(run_record_path, current_record, current)
@@ -625,6 +651,138 @@ class RunPipeline:
             bootstrap=bootstrap,
             implementer_result=current,
             violations=tuple(_from_implementer(item) for item in current.violations),
+        )
+
+    def _handle_external_implementer_failure(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        outcome: ImplementerRuntimeOutcome,
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        timeout_ms: int,
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        """Route a classified external availability failure.
+
+        External quota/capacity/auth/runtime failures are recorded as agent
+        availability events (never as implementation-defect recovery rounds). In
+        adaptive mode, with a clean worktree and an independent alternate, the
+        implementer is switched; otherwise the run fails closed.
+        """
+
+        category = _runtime_failure_category(outcome)
+        assignment = AgentAssignment.from_record(record.get("agentAssignment"))
+        policy = config.execution_policy.agent_roles
+        agent_id = assignment.implementer_id if assignment else str(record.get("implementer", ""))
+        sequence = assignment.sequence if assignment else 1
+        record = _append_agent_availability_event(
+            run_record_path, record, agent_id=agent_id, category=category, sequence=sequence
+        )
+        stages.append(_stage("agent_availability_event", "PASS", {"agent": agent_id, "category": category}))
+
+        if assignment is None or policy is None:
+            return self._external_runtime_block(
+                run_record_path,
+                record,
+                stages,
+                bootstrap,
+                outcome,
+                _violation(
+                    "EXTERNAL_RUNTIME_UNAVAILABLE",
+                    "implementer runtime is externally unavailable and no adaptive assignment exists to fail over",
+                    {"category": category, "agent": agent_id},
+                ),
+            )
+
+        # Failover is only safe at a pre-candidate boundary: the worktree must be
+        # clean AND no candidate may have been committed for this run yet
+        # (HEAD still at the authoritative base). Otherwise the previous
+        # implementer owns real work that must not be discarded or silently
+        # transferred (requirement 10 / 24).
+        result = outcome.result
+        base_sha = str(record.get("authoritativeBaseSha", ""))
+        worktree_clean = result is not None and result.head_before == result.head_after and not result.changed_files
+        no_candidate = result is not None and result.head_after == base_sha
+        if not worktree_clean or not no_candidate:
+            if not worktree_clean and result is not None and result.changed_files:
+                reason = "FAILOVER_DIRTY_WORKTREE"
+            elif not no_candidate:
+                reason = "FAILOVER_CANDIDATE_ALREADY_PRODUCED"
+            else:
+                reason = "FAILOVER_WORKTREE_AMBIGUOUS"
+            return self._external_runtime_block(
+                run_record_path,
+                record,
+                stages,
+                bootstrap,
+                outcome,
+                _violation(
+                    reason,
+                    "cannot switch implementer without discarding or ambiguously transferring committed or in-progress feature work",
+                    {
+                        "category": category,
+                        "base_sha": base_sha,
+                        "head_before": result.head_before if result is not None else "",
+                        "head_after": result.head_after if result is not None else "",
+                        "changed_files": ",".join(result.changed_files) if result is not None else "",
+                    },
+                ),
+            )
+
+        unavailable = _externally_unavailable_agent_ids(record) | {assignment.implementer_id}
+        try:
+            new_assignment = failover_implementer(
+                policy=policy, current=assignment, unavailable_ids=unavailable, category=category
+            )
+        except RoleSelectionError as exc:
+            return self._external_runtime_block(
+                run_record_path,
+                record,
+                stages,
+                bootstrap,
+                outcome,
+                _violation(exc.code, exc.message, {**exc.evidence, "category": category}),
+            )
+
+        updated = dict(record)
+        updated["agentAssignment"] = new_assignment.to_record()
+        updated["implementer"] = new_assignment.implementer_command
+        updated["reviewer"] = new_assignment.reviewer_command
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "implementation_handoff"
+        updated.pop("implementationFailure", None)
+        _write_json(run_record_path, updated)
+        stages.append(
+            _stage(
+                "implementer_failover",
+                "PASS",
+                {"from": assignment.implementer_id, "to": new_assignment.implementer_id, "category": category},
+            )
+        )
+
+        retry = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+        next_record = _read_json(run_record_path) or retry.run_record or updated
+        stages.append(_stage("implementer_failover_run", retry.status, {"implementer": new_assignment.implementer_id}))
+        return retry, next_record
+
+    def _external_runtime_block(
+        self,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        outcome: ImplementerRuntimeOutcome,
+        violation: PipelineViolation,
+    ) -> PipelineOutcome:
+        _write_implementation_recovery_block_status(run_record_path, record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple([*stages, _stage("implementer_failover", "BLOCKED", {"reason": violation.code})]),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=outcome,
+            violations=(violation,),
         )
 
     def _recover_validation_failure(
@@ -1629,6 +1787,13 @@ class RunPipeline:
         validation_result = _validation_from_mapping(validation)
         review_result = _review_from_mapping(review)
         if candidate_result.candidate_sha and validation_result.status == "PASS" and review_result.decision == "Approved":
+            # Fail closed if the durable reviewer identity is not independent of
+            # the durable candidate owner. Exact-HEAD match alone must not let a
+            # stored Approved result reach publication on a resumed run.
+            independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
+            if independence is not None:
+                _write_review_block_status(run_record_path, record, _empty_review(candidate_result.candidate_sha), candidate_result, validation_result, block_violations=(independence,), block_cause="reviewer_independence")
+                return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {"reason": "reviewer_independence"})]), _read_json(run_record_path), candidate=candidate_result, validation=validation_result, review=review_result, violations=(independence,))
             exact = self.exact_head.verify(repository_path=Path(record["featureWorktree"]), approved_review_sha=review_result.reviewed_sha, validated_sha=validation_result.head_after)
             stages.append(_stage("exact_head", exact.status, {"approved_review_sha": review_result.reviewed_sha, "validated_sha": validation_result.head_after}))
             if exact.status != "MATCH":
@@ -1719,6 +1884,10 @@ class RunPipeline:
         if not (worktree / review_scope).exists():
             review_scope = str(record["featureDescription"])
         review_artifact_snapshot = _review_artifact_snapshot(worktree, review_scope)
+        independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
+        if independence is not None:
+            _write_review_block_status(run_record_path, record, _empty_review(candidate.candidate_sha), candidate, validation, block_violations=(independence,), block_cause="reviewer_independence")
+            return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, violations=(independence,))
         review = self.review.run(
             policy=config.execution_policy,
             request=ReviewRequest(
@@ -1730,6 +1899,7 @@ class RunPipeline:
                 requirements_content=read_durable_requirements_content(run_record_path, record),
                 requirements_sha=str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
                 requirements_source=str(record.get("requirements", {}).get("sourcePath", "")) if isinstance(record.get("requirements"), dict) else "",
+                reviewer_command=_assignment_reviewer_command(record),
             ),
         )
         _write_json(run_record_path.with_name("review-runtime.json"), review.to_dict())
@@ -2045,6 +2215,7 @@ def _implementation_failure_payload(implementer: ImplementerRuntimeOutcome) -> d
         "headAfter": result.head_after if result is not None else "",
         "changedFiles": list(result.changed_files) if result is not None else [],
         "reasonCodes": [item.code for item in implementer.violations],
+        "runtimeFailureCategory": result.runtime_failure_category if result is not None else "",
         "recoveryStage": "implementation_recovery",
     }
 
@@ -2079,8 +2250,49 @@ def _implementer_outcome_from_record_failure(run_record_path: Path, record: dict
         head_after=str(failure.get("headAfter", "")),
         changed_files=changed_files,
         violations=violations,
+        runtime_failure_category=str(failure.get("runtimeFailureCategory", "")),
     )
     return ImplementerRuntimeOutcome(status, None, result, record, violations)
+
+
+def _runtime_failure_category(outcome: ImplementerRuntimeOutcome) -> str:
+    result = outcome.result
+    return result.runtime_failure_category if result is not None else ""
+
+
+def _is_external_availability_failure(outcome: ImplementerRuntimeOutcome) -> bool:
+    return is_external_availability_failure(_runtime_failure_category(outcome))
+
+
+def _external_availability_events(record: dict[str, Any]) -> list[dict[str, Any]]:
+    events = record.get("agentAvailabilityEvents")
+    return [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+
+
+def _externally_unavailable_agent_ids(record: dict[str, Any]) -> set[str]:
+    return {
+        str(event.get("agentId"))
+        for event in _external_availability_events(record)
+        if event.get("role") == "implementer" and event.get("agentId")
+    }
+
+
+def _append_agent_availability_event(path: Path, record: dict[str, Any], *, agent_id: str, category: str, sequence: int) -> dict[str, Any]:
+    updated = dict(record)
+    events = list(_external_availability_events(updated))
+    events.append(
+        {
+            "agentId": agent_id,
+            "role": "implementer",
+            "category": category,
+            "state": availability_state_for_category(category),
+            "sequence": sequence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    updated["agentAvailabilityEvents"] = events
+    _write_json(path, updated)
+    return updated
 
 
 def _implementation_recovery_attempt_count(record: dict[str, Any]) -> int:
@@ -2698,6 +2910,75 @@ def _empty_review(candidate_sha: str) -> ReviewResult:
     return ReviewResult("BLOCK", "Unavailable", candidate_sha, 0, "", "", ())
 
 
+def _assignment_reviewer_command(record: dict[str, Any]) -> str:
+    assignment = record.get("agentAssignment")
+    if isinstance(assignment, dict) and isinstance(assignment.get("reviewerCommand"), str):
+        return assignment["reviewerCommand"]
+    return ""
+
+
+def _review_independence_violation(record: dict[str, Any], *, adaptive_roles: bool) -> PipelineViolation | None:
+    """Fail closed when the assigned reviewer is not independent of the candidate owner.
+
+    ``adaptive_roles`` is ``True`` when the run's execution policy carries an
+    ``agent_roles`` block. Such a run always persists an ``agentAssignment`` at
+    creation, so an absent, non-dict, or empty assignment means the durable
+    reviewer / candidate-owner identity needed to prove independence is missing
+    or corrupted, and publication must block. Genuine pre-adaptive legacy runs
+    (no ``agent_roles`` policy) never had an assignment and keep the historical
+    fixed-reviewer behavior.
+    """
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict):
+        if adaptive_roles:
+            return _violation(
+                "NO_INDEPENDENT_REVIEWER",
+                "adaptive-role run is missing the durable agent assignment that proves reviewer independence; publication must block",
+                {"reason": "missing_agent_assignment", "agent_assignment_type": type(assignment).__name__},
+            )
+        return None
+
+    reviewer_id = _durable_identity_field(assignment, "reviewerId")
+    reviewer_command = _durable_identity_field(assignment, "reviewerCommand")
+    if "candidateOwnerId" in assignment:
+        # A record serialized by AgentAssignment.to_record always carries
+        # candidateOwnerId; its presence with a corrupt value is tampering, not
+        # a legacy schema, so it must not silently fall back to implementerId.
+        owner_id = _durable_identity_field(assignment, "candidateOwnerId")
+    else:
+        # Older durable schemas omitted candidateOwnerId; implementerId is the
+        # authoritative backward-compatible ownership field for those records.
+        owner_id = _durable_identity_field(assignment, "implementerId")
+
+    for field_name, value in (("reviewerId", reviewer_id), ("reviewerCommand", reviewer_command), ("candidateOwnerId", owner_id)):
+        if value is None:
+            return _violation(
+                "NO_INDEPENDENT_REVIEWER",
+                "durable reviewer independence evidence is missing, blank, or malformed; publication must block",
+                {"reason": "invalid_durable_identity", "field": field_name},
+            )
+    if reviewer_id == owner_id:
+        return _violation(
+            "REVIEWER_NOT_INDEPENDENT",
+            "assigned reviewer implemented or materially modified the candidate",
+            {"reviewer": reviewer_id, "candidate_owner": owner_id},
+        )
+    return None
+
+
+def _durable_identity_field(assignment: dict[str, Any], key: str) -> str | None:
+    """Return the trimmed value of a required durable-identity field, or ``None``
+    when it is absent, not a string, empty, or whitespace-only. Never coerces a
+    non-string (e.g. ``None``, ``42``) into a string that would read as valid."""
+    if key not in assignment:
+        return None
+    value = assignment[key]
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
 def _review_artifact_candidates(worktree: Path, scope: str) -> tuple[Path, ...]:
     if not _is_path_like_scope(scope):
         return ()
@@ -2762,6 +3043,7 @@ def _write_review_block_status(
         "reviewedSha": review.reviewed_sha,
         "exitCode": review.exit_code,
         "timedOut": reason_code == "REVIEWER_TIMED_OUT",
+        "runtimeCategory": _review_runtime_category(review),
     }
     _write_json(path, updated)
 
@@ -3533,13 +3815,36 @@ def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[Pipelin
     return ()
 
 
+# Runtime failure categories that genuinely warrant an unattended review retry.
+# Auth / quota / usage / command-not-found / unknown are NOT retried here: they
+# fail closed and require operator or recovery action.
+_TRANSIENT_RUNTIME_CATEGORIES = frozenset({"TRANSIENT_RUNTIME_UNAVAILABLE", "CAPACITY_UNAVAILABLE"})
+
+
+def _review_runtime_category(review: ReviewResult) -> str:
+    """The normalized runtime availability category of a reviewer runtime failure."""
+
+    for violation in review.violations:
+        category = str(violation.evidence.get("runtime_category", ""))
+        if category:
+            return category
+    return ""
+
+
+def _review_violation_is_transient(violation: ReviewViolation) -> bool:
+    if violation.code != "REVIEWER_COMMAND_FAILED":
+        return violation.code in TRANSIENT_REVIEW_FAILURE_CODES
+    category = str(violation.evidence.get("runtime_category", ""))
+    # Missing category means a durable record written before runtime
+    # classification existed: preserve the prior transient-resume semantics.
+    return category == "" or category in _TRANSIENT_RUNTIME_CATEGORIES
+
+
 def _is_transient_review_block(review: ReviewResult) -> bool:
-    codes = tuple(violation.code for violation in review.violations)
-    if not codes:
+    violations = review.violations
+    if not violations:
         return False
-    if all(code in TRANSIENT_REVIEW_FAILURE_CODES for code in codes):
-        return True
-    return False
+    return all(_review_violation_is_transient(violation) for violation in violations)
 
 
 def _review_block_reason_code(review: ReviewResult, block_violations: tuple[PipelineViolation, ...] = ()) -> str:

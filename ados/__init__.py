@@ -2,6 +2,14 @@
 
 __version__ = "1.0.0"
 
+from .agent_roles import (
+    AgentAssignment,
+    AgentRolePolicy,
+    RoleSelectionError,
+    classify_runtime_failure,
+    probe_agent,
+    select_assignment,
+)
 from .execution_policy import ExecutionPolicy, PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome
@@ -17,6 +25,12 @@ from .validation_engine import ValidationEngine
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest
 
 __all__ = [
+    "AgentAssignment",
+    "AgentRolePolicy",
+    "RoleSelectionError",
+    "classify_runtime_failure",
+    "probe_agent",
+    "select_assignment",
     "ExecutionPolicy",
     "ExactHeadGate",
     "ImplementerRuntime",

@@ -47,6 +47,7 @@ class CliApplication:
         run.add_argument("--implementer-timeout-ms", type=int, default=300000)
         run.add_argument("--reopen-implementation-recovery", action="store_true")
         run.add_argument("--reopen-review-side-effect-recovery", action="store_true")
+        run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
@@ -155,6 +156,7 @@ class CliApplication:
                     requirements_file=Path(args.requirements_file) if args.requirements_file else None,
                     reopen_implementation_recovery=args.reopen_implementation_recovery,
                     reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
+                    prefer_implementer=args.prefer_implementer,
                 )
             )
             if args.json:
@@ -331,6 +333,18 @@ def _format_run_human(result: RunResult) -> str:
         elif result.adopted:
             lines.extend(["Adopting orphaned feature candidate:", f"run_id: {result.run_record.run_id}", f"status: {result.run_record.status}", ""])
         lines.extend(["Durable stage:", result.run_record.next_stage, ""])
+        assignment = result.run_record.agent_assignment
+        if isinstance(assignment, dict):
+            lines.extend(
+                [
+                    "Agent assignment:",
+                    f"Implementer: {assignment.get('implementerId', 'Unknown')}",
+                    f"Reviewer: {assignment.get('reviewerId', 'Unknown')}",
+                    f"Mode: {assignment.get('mode', 'Unknown')}",
+                    f"Reason: {assignment.get('reason', '')}",
+                    "",
+                ]
+            )
     if result.eligibility.violations:
         lines.append("Violations:")
         for violation in result.eligibility.violations:

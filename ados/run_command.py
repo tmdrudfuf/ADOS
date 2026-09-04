@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .agent_roles import AgentAssignment, RoleSelectionError, select_assignment
 from .doctor import DoctorRequest, DoctorService, discover_project_config
 from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, SAFE_TIMEOUT_MS
@@ -37,6 +38,7 @@ class RunRequest:
     requirements_file: Path | None = None
     reopen_implementation_recovery: bool = False
     reopen_review_side_effect_recovery: bool = False
+    prefer_implementer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class WorkflowRunRecord:
     status: str
     next_stage: str
     requirements: dict[str, Any] | None = None
+    agent_assignment: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -113,6 +116,8 @@ class WorkflowRunRecord:
         }
         if self.requirements is not None:
             record["requirements"] = self.requirements
+        if self.agent_assignment is not None:
+            record["agentAssignment"] = self.agent_assignment
         return record
 
 
@@ -195,6 +200,29 @@ class RunService:
             if requirements_violations:
                 return RunResult("BLOCKED", RunEligibility("BLOCKED", requirements_violations), plan, resume.record, resumed=True)
         adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description, requirements)
+        if request.prefer_implementer and (resume is not None or adoption is not None):
+            return RunResult(
+                "BLOCKED",
+                RunEligibility(
+                    "BLOCKED",
+                    (
+                        RunViolation(
+                            "ROLE_OVERRIDE_ON_EXISTING_RUN",
+                            "--prefer-implementer cannot change an existing run; resume/adoption preserves the durable agent assignment",
+                            {"prefer_implementer": request.prefer_implementer},
+                        ),
+                    ),
+                ),
+                plan,
+            )
+        # Role assignment is selected only for a genuinely new run. Resume and
+        # orphan adoption honor the durable assignment already on the record.
+        assignment: AgentAssignment | None = None
+        if resume is None and adoption is None:
+            try:
+                assignment = self._select_assignment(config, request)
+            except RoleSelectionError as exc:
+                return RunResult("BLOCKED", RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),)), plan)
         eligibility = self._eligibility(
             project_path,
             config,
@@ -210,7 +238,7 @@ class RunService:
         if eligibility.status != "ELIGIBLE":
             return RunResult("INVALID" if eligibility.status == "INVALID" else "BLOCKED", eligibility, plan)
         if request.dry_run:
-            planned_record = resume.record if resume else adoption.record if adoption is not None else self._record(config, request, plan, requirements)
+            planned_record = resume.record if resume else adoption.record if adoption is not None else self._record(config, request, plan, requirements, assignment)
             return RunResult("PLANNED", eligibility, plan, planned_record, resumed=resume is not None, adopted=adoption is not None)
 
         if resume is not None:
@@ -258,7 +286,7 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", tuple(RunViolation(item.code, item.message, item.evidence) for item in created.violations))
             return RunResult("BLOCKED", eligibility, plan, worktree_result=created)
 
-        record = self._record(config, request, plan, requirements)
+        record = self._record(config, request, plan, requirements, assignment)
         record_path = self._record_path(Path(plan.feature_worktree), plan.spec_number, plan.feature_slug)
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
@@ -721,19 +749,41 @@ class RunService:
             or record.feature_branch != expected.feature_branch
             or Path(record.feature_worktree).resolve() != Path(expected.feature_worktree).resolve()
             or record.execution_policy_version != expected.execution_policy_version
-            or record.implementer != expected.implementer
-            or record.reviewer != expected.reviewer
+            # Durable agent assignment is authoritative on resume; only compare the
+            # legacy role fields when no assignment was persisted.
+            or (record.agent_assignment is None and record.implementer != expected.implementer)
+            or (record.agent_assignment is None and record.reviewer != expected.reviewer)
             or (worktree_record is not None and worktree_record.branch != expected.feature_branch)
             or (worktree_record is not None and worktree_record.path != Path(expected.feature_worktree).resolve())
         ):
             return None
         return _ResumeCandidate(record_path=record_path, record=record)
 
-    def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan, requirements: RequirementsSource | None = None) -> WorkflowRunRecord:
-        return self._record_from_plan(config, plan, request.feature_description, requirements)
+    def _select_assignment(self, config: ProjectConfig, request: RunRequest) -> AgentAssignment | None:
+        policy = config.execution_policy.agent_roles
+        if policy is None:
+            if request.prefer_implementer:
+                raise RoleSelectionError(
+                    "ROLE_OVERRIDE_UNSUPPORTED",
+                    "--prefer-implementer requires an execution_policy.agent_roles block",
+                    {"prefer_implementer": request.prefer_implementer},
+                )
+            return None
+        return select_assignment(policy=policy, prefer_implementer=request.prefer_implementer, sequence=1)
 
-    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str, requirements: RequirementsSource | None = None) -> WorkflowRunRecord:
+    def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan, requirements: RequirementsSource | None = None, assignment: AgentAssignment | None = None) -> WorkflowRunRecord:
+        return self._record_from_plan(config, plan, request.feature_description, requirements, assignment)
+
+    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str, requirements: RequirementsSource | None = None, assignment: AgentAssignment | None = None) -> WorkflowRunRecord:
         run_id = _run_id(config.project_id, plan.spec_number, plan.feature_slug, plan.authoritative_base_sha)
+        if assignment is not None:
+            implementer = assignment.implementer_command
+            reviewer = assignment.reviewer_command
+            agent_assignment = assignment.to_record()
+        else:
+            implementer = config.implementer or "Unavailable"
+            reviewer = config.reviewer or config.execution_policy.review.reviewer
+            agent_assignment = None
         return WorkflowRunRecord(
             run_id=run_id,
             project_id=config.project_id,
@@ -744,12 +794,13 @@ class RunService:
             primary_repository=plan.project_path,
             feature_branch=plan.feature_branch,
             feature_worktree=plan.feature_worktree,
-            implementer=config.implementer or "Unavailable",
-            reviewer=config.reviewer or config.execution_policy.review.reviewer,
+            implementer=implementer,
+            reviewer=reviewer,
             execution_policy_version=config.execution_policy.schema_version,
             status="READY_FOR_IMPLEMENTATION",
             next_stage="implementation_handoff",
             requirements=requirements.to_record() if requirements is not None else None,
+            agent_assignment=agent_assignment,
         )
 
     def _record_path(self, worktree: Path, spec: str, slug: str) -> Path:
@@ -778,6 +829,7 @@ def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
         status=str(raw["status"]),
         next_stage=str(raw["nextStage"]),
         requirements=dict(requirements) if isinstance(requirements, dict) else None,
+        agent_assignment=dict(raw["agentAssignment"]) if isinstance(raw.get("agentAssignment"), dict) else None,
     )
 
 

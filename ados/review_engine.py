@@ -25,6 +25,7 @@ class ReviewRequest:
     requirements_content: str = ""
     requirements_sha: str = ""
     requirements_source: str = ""
+    reviewer_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,8 @@ class ReviewEngine:
         if violations:
             return ReviewResult("BLOCK", "Unavailable", request.candidate_sha, 0, "", "", violations)
 
-        command_or_violation = _reviewer_command(policy.review.reviewer)
+        reviewer = request.reviewer_command.strip() or policy.review.reviewer
+        command_or_violation = _reviewer_command(reviewer)
         if isinstance(command_or_violation, ReviewViolation):
             return ReviewResult("BLOCK", "Unavailable", request.candidate_sha, 0, "", "", (command_or_violation,))
 
@@ -87,7 +89,7 @@ class ReviewEngine:
                 0,
                 "",
                 "",
-                (ReviewViolation("REVIEWER_EXECUTABLE_NOT_FOUND", "reviewer executable was not found", {"executable": command_or_violation[0]}),),
+                (ReviewViolation("REVIEWER_EXECUTABLE_NOT_FOUND", "reviewer executable was not found", {"executable": command_or_violation[0], "runtime_category": "COMMAND_NOT_FOUND"}),),
             )
         except OSError as exc:
             return ReviewResult(
@@ -103,11 +105,20 @@ class ReviewEngine:
         violations: list[ReviewViolation] = []
         if completed.returncode != 0:
             decision = "Unavailable"
+            # Local import: agent_roles imports from this module, so importing the
+            # shared classifier at module scope would be circular.
+            from .agent_roles import classify_runtime_failure
+
+            category = classify_runtime_failure(
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
             violations.append(
                 ReviewViolation(
                     "REVIEWER_COMMAND_FAILED",
                     "reviewer command exited nonzero",
-                    {"exit_code": str(completed.returncode)},
+                    {"exit_code": str(completed.returncode), "runtime_category": category},
                 )
             )
         elif decision == "Unavailable":
