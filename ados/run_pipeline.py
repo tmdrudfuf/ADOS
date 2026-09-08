@@ -3020,6 +3020,7 @@ def _write_review_block_status(
     block_cause: str = "",
 ) -> None:
     transient = _is_transient_review_block(review)
+    runtime_resumable = transient or _is_resumable_review_runtime_block(review)
     reason_code = _review_block_reason_code(review, block_violations)
     changes_requested = reason_code == "REVIEW_CHANGES_REQUESTED"
     side_effect_recoverable = block_cause == "review_side_effect" and reason_code == "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"
@@ -3027,7 +3028,7 @@ def _write_review_block_status(
     durable_cause = block_cause or ("review_decision" if changes_requested else "review_runtime")
     updated = dict(record)
     updated["status"] = "REVIEW_BLOCKED"
-    updated["nextStage"] = "review" if transient or side_effect_recoverable else "implementation_recovery" if changes_requested else "recovery"
+    updated["nextStage"] = "review" if runtime_resumable or side_effect_recoverable else "implementation_recovery" if changes_requested else "recovery"
     updated["reviewBlock"] = {
         "status": review.status,
         "decision": review.decision,
@@ -3035,7 +3036,7 @@ def _write_review_block_status(
         "reasonCodes": reason_codes,
         "blockCause": durable_cause,
         "transient": transient,
-        "resumeStage": "review" if transient or side_effect_recoverable else "implementation_recovery" if changes_requested else "",
+        "resumeStage": "review" if runtime_resumable or side_effect_recoverable else "implementation_recovery" if changes_requested else "",
         "reviewer": str(record.get("reviewer", "")),
         "candidateSha": candidate.candidate_sha,
         "validatedSha": validation.head_after,
@@ -3568,10 +3569,24 @@ def review_runtime_unavailable_evidence(record: Any, candidate: Any, validation:
         return (_violation("REVIEW_RUNTIME_RESUME_BLOCK_MISSING", "review runtime retry requires durable review block evidence", {}),)
     if str(block.get("blockCause", "")) != "review_runtime":
         return (_violation("REVIEW_RUNTIME_RESUME_BLOCK_CAUSE_UNSAFE", "review runtime retry requires review_runtime block cause", {"blockCause": str(block.get("blockCause", ""))}),)
-    if str(block.get("reasonCode", "")) != "REVIEW_DECISION_UNAVAILABLE":
-        return (_violation("REVIEW_RUNTIME_RESUME_REASON_UNSAFE", "review runtime retry requires decision-unavailable runtime evidence", {"reasonCode": str(block.get("reasonCode", ""))}),)
-    if block.get("reasonCodes", []) not in ([], ["REVIEW_DECISION_UNAVAILABLE"]):
-        return (_violation("REVIEW_RUNTIME_RESUME_REASON_CODES_UNSAFE", "review runtime retry requires only REVIEW_DECISION_UNAVAILABLE reason codes", {}),)
+    runtime_category = _review_runtime_category(review_result)
+    block_runtime_category = str(block.get("runtimeCategory", ""))
+    if block_runtime_category and block_runtime_category != runtime_category:
+        return (
+            _violation(
+                "REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH",
+                "review runtime retry durable block runtime category does not match review evidence",
+                {"runtimeCategory": block_runtime_category, "reviewRuntimeCategory": runtime_category},
+            ),
+        )
+    quota_runtime = runtime_category in _REVIEW_RUNTIME_RESUMABLE_CATEGORIES
+    allowed_reason_codes = ["REVIEWER_COMMAND_FAILED", runtime_category] if quota_runtime else ["REVIEW_DECISION_UNAVAILABLE"]
+    allowed_reason_codes = [code for code in allowed_reason_codes if code]
+    if str(block.get("reasonCode", "")) not in allowed_reason_codes:
+        return (_violation("REVIEW_RUNTIME_RESUME_REASON_UNSAFE", "review runtime retry requires decision-unavailable or quota runtime evidence", {"reasonCode": str(block.get("reasonCode", "")), "runtimeCategory": runtime_category}),)
+    reason_codes = block.get("reasonCodes", [])
+    if reason_codes not in ([], allowed_reason_codes[:1], allowed_reason_codes):
+        return (_violation("REVIEW_RUNTIME_RESUME_REASON_CODES_UNSAFE", "review runtime retry requires only compatible review runtime reason codes", {}),)
     if str(block.get("candidateSha", "")) != candidate_result.candidate_sha or str(block.get("validatedSha", "")) != validation_result.head_after or str(block.get("reviewedSha", "")) != review_result.reviewed_sha:
         return (
             _violation(
@@ -3584,13 +3599,15 @@ def review_runtime_unavailable_evidence(record: Any, candidate: Any, validation:
                 },
             ),
         )
-    if str(block.get("exitCode", "0")) != "0" or str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
+    if (not quota_runtime and str(block.get("exitCode", "0")) != "0") or str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
         return (_violation("REVIEW_RUNTIME_RESUME_PROCESS_UNSAFE", "review runtime retry requires successful non-transient process evidence", {}),)
-    if review_result.exit_code != 0 or review_result.stderr:
+    if not quota_runtime and (review_result.exit_code != 0 or review_result.stderr):
         return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_PROCESS_UNSAFE", "review runtime retry requires successful review process evidence", {"exit_code": str(review_result.exit_code)}),)
     codes = tuple(violation.code for violation in review_result.violations)
-    if codes != ("REVIEW_DECISION_UNAVAILABLE",):
-        return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_CODES_UNSAFE", "review runtime retry requires only REVIEW_DECISION_UNAVAILABLE review violation", {"codes": ",".join(codes)}),)
+    if codes != (allowed_reason_codes[0],):
+        return (_violation("REVIEW_RUNTIME_RESUME_REVIEW_CODES_UNSAFE", "review runtime retry requires only compatible review runtime violation", {"codes": ",".join(codes), "runtimeCategory": runtime_category}),)
+    if quota_runtime:
+        return ()
     if parse_review_decision(review_result.stdout) != "Unavailable":
         return (_violation("REVIEW_RUNTIME_RESUME_DECISION_PRESENT", "review runtime retry is not used when current parser can classify a decision", {}),)
     if not _review_runtime_output_indicates_incomplete_decision(review_result.stdout):
@@ -3815,20 +3832,27 @@ def validation_failed_evidence(candidate: Any, validation: Any) -> tuple[Pipelin
     return ()
 
 
-# Runtime failure categories that genuinely warrant an unattended review retry.
-# Auth / quota / usage / command-not-found / unknown are NOT retried here: they
-# fail closed and require operator or recovery action.
+# Runtime failure categories that genuinely warrant an unattended in-process
+# retry. Quota / usage exhaustion is handled only by durable cross-invocation
+# review resume, not by keeping the current ADOS process alive.
 _TRANSIENT_RUNTIME_CATEGORIES = frozenset({"TRANSIENT_RUNTIME_UNAVAILABLE", "CAPACITY_UNAVAILABLE"})
+_REVIEW_RUNTIME_RESUMABLE_CATEGORIES = frozenset({"QUOTA_EXHAUSTED", "USAGE_LIMIT_REACHED"})
 
 
 def _review_runtime_category(review: ReviewResult) -> str:
     """The normalized runtime availability category of a reviewer runtime failure."""
 
     for violation in review.violations:
+        if violation.code != "REVIEWER_COMMAND_FAILED":
+            continue
         category = str(violation.evidence.get("runtime_category", ""))
         if category:
             return category
     return ""
+
+
+def _is_resumable_review_runtime_block(review: ReviewResult) -> bool:
+    return _review_runtime_category(review) in _REVIEW_RUNTIME_RESUMABLE_CATEGORIES
 
 
 def _review_violation_is_transient(violation: ReviewViolation) -> bool:

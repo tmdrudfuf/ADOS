@@ -2178,6 +2178,170 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("2", reviewer_count)
         self.assertEqual(candidate_before, second.pipeline_result.review.reviewed_sha)
 
+    def test_review_usage_limit_reached_resumes_at_review_and_completes(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validation_counter = fixture.root / "validation-count.txt"
+            reviewer_counter = fixture.root / "review-count.txt"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{validation_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "if value == 0:\n"
+                "    print('Error: usage limit reached. Please try again later.', file=sys.stderr)\n"
+                "    sys.exit(1)\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            publisher = FakePublisher(fixture.repo)
+            service = RunService(pipeline=RunPipeline(publisher=publisher))
+            first = service.run(RunRequest(fixture.repo, "Reviewer usage limit", None, fixture.config))
+            worktree = Path(first.run_record.feature_worktree)
+            run_dir = worktree / ".agent-workflow" / "runs" / "001-reviewer-usage-limit"
+            blocked_record = json.loads((run_dir / "ados-run.json").read_text(encoding="utf-8"))
+            review_runtime = json.loads((run_dir / "review-runtime.json").read_text(encoding="utf-8"))
+            candidate_before = json.loads((run_dir / "candidate.json").read_text(encoding="utf-8"))["candidate_sha"]
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+
+            second = service.run(RunRequest(fixture.repo, "Reviewer usage limit", None, fixture.config))
+            implementer_count = implementer_counter.read_text(encoding="utf-8")
+            validation_count = validation_counter.read_text(encoding="utf-8")
+            reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+            collision_codes = self.codes(second)
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
+        self.assertEqual("review_runtime", blocked_record["reviewBlock"]["blockCause"])
+        self.assertFalse(blocked_record["reviewBlock"]["transient"])
+        self.assertEqual("review", blocked_record["reviewBlock"]["resumeStage"])
+        self.assertEqual("REVIEWER_COMMAND_FAILED", blocked_record["reviewBlock"]["reasonCode"])
+        self.assertEqual("USAGE_LIMIT_REACHED", blocked_record["reviewBlock"]["runtimeCategory"])
+        self.assertEqual("USAGE_LIMIT_REACHED", review_runtime["violations"][0]["evidence"]["runtime_category"])
+        self.assertEqual(candidate_before, blocked_record["reviewBlock"]["candidateSha"])
+        self.assertEqual(candidate_before, blocked_record["reviewBlock"]["validatedSha"])
+        self.assertEqual("True", status.workflow.evidence["resumable"])
+        self.assertEqual("review", status.workflow.evidence["resume_stage"])
+        self.assertTrue(second.resumed)
+        self.assertEqual(blocked_record["runId"], second.run_record.run_id)
+        self.assertEqual("COMPLETE", second.status)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("1", validation_count)
+        self.assertEqual("2", reviewer_count)
+        self.assertEqual(candidate_before, second.pipeline_result.review.reviewed_sha)
+        self.assertNotIn("ACTIVE_WORKTREE_PRESENT", collision_codes)
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", collision_codes)
+        self.assertNotIn("WORKTREE_PATH_EXISTS", collision_codes)
+        self.assertNotIn("CONFLICTING_WORKTREE", collision_codes)
+
+    def review_runtime_resume_violations(self, *, review_category="", block_category=None, reason_codes=None, review_violation_code="REVIEWER_COMMAND_FAILED"):
+        candidate_sha = "a" * 40
+        block = {
+            "blockCause": "review_runtime",
+            "reasonCode": "REVIEWER_COMMAND_FAILED",
+            "reasonCodes": ["REVIEWER_COMMAND_FAILED"] if reason_codes is None else reason_codes,
+            "candidateSha": candidate_sha,
+            "validatedSha": candidate_sha,
+            "reviewedSha": candidate_sha,
+            "exitCode": 1,
+            "timedOut": False,
+            "transient": False,
+        }
+        if block_category is not None:
+            block["runtimeCategory"] = block_category
+        record = {
+            "status": "REVIEW_BLOCKED",
+            "reviewBlock": block,
+        }
+        candidate = {"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": ["implementation.txt"]}
+        validation = {"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}
+        evidence = {"runtime_category": review_category} if review_category else {}
+        review = {
+            "status": "BLOCK",
+            "decision": "Unavailable",
+            "reviewed_sha": candidate_sha,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "usage limit reached",
+            "violations": [{"code": review_violation_code, "message": "reviewer command exited nonzero", "evidence": evidence}],
+        }
+        return run_pipeline.review_runtime_unavailable_evidence(record, candidate, validation, review)
+
+    def test_review_runtime_resume_accepts_usage_limit_as_secondary_reason_code_with_structured_evidence(self):
+        violations = self.review_runtime_resume_violations(
+            review_category="USAGE_LIMIT_REACHED",
+            block_category="USAGE_LIMIT_REACHED",
+            reason_codes=["REVIEWER_COMMAND_FAILED", "USAGE_LIMIT_REACHED"],
+        )
+
+        self.assertEqual((), violations)
+
+    def test_review_runtime_resume_accepts_structured_usage_limit_with_matching_block_category(self):
+        violations = self.review_runtime_resume_violations(review_category="USAGE_LIMIT_REACHED", block_category="USAGE_LIMIT_REACHED")
+
+        self.assertEqual((), violations)
+
+    def test_review_runtime_resume_accepts_structured_quota_with_matching_block_category(self):
+        violations = self.review_runtime_resume_violations(review_category="QUOTA_EXHAUSTED", block_category="QUOTA_EXHAUSTED")
+
+        self.assertEqual((), violations)
+
+    def test_review_runtime_resume_accepts_structured_quota_when_block_category_absent(self):
+        violations = self.review_runtime_resume_violations(review_category="USAGE_LIMIT_REACHED", block_category=None)
+
+        self.assertEqual((), violations)
+
+    def test_review_runtime_resume_rejects_block_category_without_structured_review_category(self):
+        violations = self.review_runtime_resume_violations(review_category="", block_category="USAGE_LIMIT_REACHED")
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH", {violation.code for violation in violations})
+
+    def test_review_runtime_resume_rejects_reason_codes_without_structured_review_category(self):
+        violations = self.review_runtime_resume_violations(review_category="", block_category=None, reason_codes=["REVIEWER_COMMAND_FAILED", "USAGE_LIMIT_REACHED"])
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_REASON_UNSAFE", {violation.code for violation in violations})
+
+    def test_review_runtime_resume_rejects_runtime_category_on_non_reviewer_command_violation(self):
+        violations = self.review_runtime_resume_violations(
+            review_category="USAGE_LIMIT_REACHED",
+            block_category="USAGE_LIMIT_REACHED",
+            review_violation_code="REVIEW_DECISION_UNAVAILABLE",
+        )
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH", {violation.code for violation in violations})
+
+    def test_review_runtime_resume_rejects_authentication_even_when_block_says_usage_limit(self):
+        violations = self.review_runtime_resume_violations(review_category="AUTHENTICATION_UNAVAILABLE", block_category="USAGE_LIMIT_REACHED")
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH", {violation.code for violation in violations})
+
+    def test_review_runtime_resume_rejects_unknown_even_when_block_says_quota(self):
+        violations = self.review_runtime_resume_violations(review_category="UNKNOWN_RUNTIME_FAILURE", block_category="QUOTA_EXHAUSTED")
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH", {violation.code for violation in violations})
+
+    def test_review_runtime_resume_rejects_conflicting_block_runtime_category(self):
+        violations = self.review_runtime_resume_violations(review_category="USAGE_LIMIT_REACHED", block_category="QUOTA_EXHAUSTED")
+
+        self.assertIn("REVIEW_RUNTIME_RESUME_RUNTIME_CATEGORY_MISMATCH", {violation.code for violation in violations})
+
     def test_review_changes_requested_block_adopts_clean_new_worktree_head_without_implementer(self):
         with self.project(implementer_mode="count") as fixture:
             implementer_counter = fixture.root / "implementer-count.txt"
