@@ -23,10 +23,18 @@ Reviewer command failures are classified with the same provider-neutral runtime
 categories as implementer failures (`AUTHENTICATION_UNAVAILABLE`,
 `QUOTA_EXHAUSTED`, `USAGE_LIMIT_REACHED`, `CAPACITY_UNAVAILABLE`,
 `COMMAND_NOT_FOUND`, `TRANSIENT_RUNTIME_UNAVAILABLE`, `UNKNOWN_RUNTIME_FAILURE`)
-and the normalized category is persisted on the review block. Only genuinely
-transient categories are retried unattended; authentication, quota, usage, and
-unknown reviewer failures block conservatively rather than being treated as
-transient.
+and the normalized category is persisted in durable review evidence. Genuinely
+transient categories may use existing transient handling. `QUOTA_EXHAUSTED` and
+`USAGE_LIMIT_REACHED` remain non-transient: ADOS does not wait for quota
+recovery or retry in the same process, and the current invocation ends
+`REVIEW_BLOCKED`. On a later explicit `ados run` invocation, ADOS may discover
+and resume the same durable run at review when the candidate, validation,
+SHA, worktree, branch, reviewer-independence, exact-HEAD, publication, and
+recovery gates all pass. That resume reviews the same validated candidate again
+without rerunning implementation or validation. Authentication failures,
+command-not-found failures, and unknown or unclassified reviewer failures remain
+conservatively blocked according to policy and do not receive the quota/usage
+durable-resume path merely because they are reviewer runtime failures.
 
 ## Decision contract
 
