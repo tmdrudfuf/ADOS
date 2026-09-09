@@ -26,6 +26,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--feature", completed.stdout)
         self.assertIn("--requirements-file", completed.stdout)
         self.assertIn("--reopen-implementation-recovery", completed.stdout)
+        self.assertIn("--reopen-validation-recovery", completed.stdout)
         self.assertIn("--reopen-review-side-effect-recovery", completed.stdout)
 
     def test_valid_run_start(self):
@@ -1387,6 +1388,195 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(1, len(run_record["validationRecoveryAttempts"]))
         self.assertEqual("True", status.workflow.evidence["resumable"])
         self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", status.workflow.evidence["validation_recovery_block_reason"])
+
+    def test_validation_recovery_no_changes_requires_explicit_reopen(self):
+        with self.project() as fixture:
+            self.create_validation_no_changes_block(fixture, "Validation no changes blocked", 1)
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Validation no changes blocked", 1, fixture.config)
+            )
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_NO_CHANGES", self.pipeline_codes(result))
+        self.assertNotIn("validation_recovery_reopen", [stage.id for stage in result.pipeline_result.stages])
+
+    def test_reopen_validation_recovery_retries_same_candidate_without_implementer(self):
+        with self.project() as fixture:
+            record_path, blocked_record, candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Reopen validation no changes",
+                1,
+            )
+            original_attempts = list(blocked_record["validationRecoveryAttempts"])
+            head_before = self.head(Path(blocked_record["featureWorktree"]))
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Reopen validation no changes", 1, fixture.config, reopen_validation_recovery=True)
+            )
+            final_record = result.pipeline_result.run_record
+            stages = [stage.id for stage in result.pipeline_result.stages]
+
+        self.assertTrue(result.resumed)
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(blocked_record["runId"], result.run_record.run_id)
+        self.assertEqual(candidate_sha, head_before)
+        self.assertEqual(candidate_sha, result.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(candidate_sha, result.pipeline_result.validation.head_after)
+        self.assertIn("validation_recovery_reopen", stages)
+        self.assertIn(("implementer", "SKIPPED"), [(stage.id, stage.status) for stage in result.pipeline_result.stages])
+        self.assertNotIn("validation_recovery_implementer", stages)
+        self.assertEqual(original_attempts, final_record["validationRecoveryReopens"][0]["previousRecoveryAttempts"])
+        self.assertEqual("BLOCK", final_record["validationRecoveryReopens"][0]["previousValidation"]["status"])
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", final_record["validationRecoveryReopens"][0]["previousBlockReason"])
+        self.assertEqual("validation", final_record["validationRecoveryReopens"][0]["selectedNextStage"])
+        self.assertEqual(1, final_record["validationRecoveryReopens"][0]["round"])
+        self.assertEqual(1, final_record["validationRecoveryReopens"][0]["maxReopens"])
+        self.assertEqual(candidate_sha, final_record["validationRecoveryReopens"][0]["candidateSha"])
+
+    def test_reopen_validation_recovery_wrong_head_fails_closed(self):
+        with self.project() as fixture:
+            record_path, _record, candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Wrong head validation reopen",
+                1,
+            )
+            worktree = record_path.parents[3]
+            self.git(worktree, "commit", "--allow-empty", "-m", "different head")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Wrong head validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_HEAD_MISMATCH", self.pipeline_codes(result))
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", reopened_record["validationRecoveryBlock"]["reasonCode"])
+        self.assertNotIn("validationRecoveryReopens", reopened_record)
+        self.assertEqual(candidate_sha, result.pipeline_result.violations[0].evidence["candidate_sha"])
+
+    def test_reopen_validation_recovery_dirty_worktree_fails_closed(self):
+        with self.project() as fixture:
+            record_path, _record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Dirty validation reopen",
+                1,
+            )
+            worktree = record_path.parents[3]
+            (worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Dirty validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+            reopened_record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_WORKTREE_DIRTY", self.pipeline_codes(result))
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", reopened_record["validationRecoveryBlock"]["reasonCode"])
+        self.assertNotIn("validationRecoveryReopens", reopened_record)
+
+    def test_reopen_validation_recovery_wrong_branch_fails_closed(self):
+        with self.project() as fixture:
+            record_path, _record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Wrong branch validation reopen",
+                1,
+            )
+            worktree = record_path.parents[3]
+            self.git(worktree, "checkout", "-b", "wrong-validation-reopen")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Wrong branch validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_reopen_validation_recovery_wrong_worktree_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Wrong worktree validation reopen",
+                1,
+            )
+            record["featureWorktree"] = str(fixture.repo)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Wrong worktree validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_reopen_validation_recovery_malformed_block_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Malformed validation reopen",
+                1,
+            )
+            record.pop("validationRecoveryBlock", None)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Malformed validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_BLOCK_MISSING", self.pipeline_codes(result))
+
+    def test_reopen_validation_recovery_unsupported_reason_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Unsupported validation reopen",
+                1,
+            )
+            record["validationRecoveryBlock"]["reasonCode"] = "VALIDATION_RECOVERY_BRANCH_MISMATCH"
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Unsupported validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_UNSUPPORTED_REASON", self.pipeline_codes(result))
+
+    def test_reopen_validation_recovery_beyond_configured_bound_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Bound validation reopen",
+                1,
+            )
+            record["validationRecoveryReopens"] = [{"status": "REOPENED", "candidateSha": candidate_sha}]
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Bound validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED", self.pipeline_codes(result))
+
+    def test_reopen_validation_recovery_missing_attempts_fails_closed(self):
+        with self.project() as fixture:
+            record_path, record, _candidate_sha, _validator_count, _implementer_count = self.create_validation_no_changes_block(
+                fixture,
+                "Missing attempts validation reopen",
+                1,
+            )
+            record.pop("validationRecoveryAttempts", None)
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Missing attempts validation reopen", 1, fixture.config, reopen_validation_recovery=True)
+            )
+
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertIn("VALIDATION_RECOVERY_REOPEN_ATTEMPTS_INVALID", self.pipeline_codes(result))
 
     def test_validation_timeout_persists_evidence_and_does_not_review(self):
         with self.project() as fixture:
@@ -4125,6 +4315,46 @@ class CliRunTests(unittest.TestCase):
     def project(self, **kwargs):
         return TemporaryProject(self, **kwargs)
 
+    def create_validation_no_changes_block(self, fixture, feature, spec):
+        implementer_counter = fixture.root / "implementer-count.txt"
+        validator_counter = fixture.root / "validator-count.txt"
+        implementer = fixture.root / "implementer-validation-no-changes.py"
+        validator = fixture.root / "validator-flaky.py"
+        implementer.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"counter = Path(r'{implementer_counter}')\n"
+            "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+            "counter.write_text(str(value + 1), encoding='utf-8')\n"
+            "handoff = sys.stdin.read()\n"
+            "if 'Implementation recovery context:' not in handoff:\n"
+            "    Path('implementation.txt').write_text('implemented', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        validator.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"counter = Path(r'{validator_counter}')\n"
+            "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+            "counter.write_text(str(value + 1), encoding='utf-8')\n"
+            "if value == 0:\n"
+            "    sys.exit(4)\n",
+            encoding="utf-8",
+        )
+        fixture.config = self.write_config(
+            fixture.root / "project-config.json",
+            fixture.repo,
+            implementer=f'"{sys.executable}" "{implementer}"',
+            validation_commands=[f'"{sys.executable}" "{validator}"'],
+        )
+        result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, feature, spec, fixture.config))
+        record_path = Path(result.run_record.feature_worktree) / ".agent-workflow" / "runs" / f"{spec:03d}-{result.run_record.feature_slug}" / "ados-run.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        candidate_sha = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))["candidate_sha"]
+        self.assertEqual("VALIDATION_FAILED", result.status)
+        self.assertEqual("VALIDATION_RECOVERY_NO_CHANGES", record["validationRecoveryBlock"]["reasonCode"])
+        return record_path, record, candidate_sha, validator_counter, implementer_counter
+
     def init_repo(self, repo):
         repo.mkdir(parents=True)
         self.git(repo, "init", "-b", "main")
@@ -4137,7 +4367,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None, review_max_recovery_reopens=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, validation_max_recovery_reopens=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None, review_max_recovery_reopens=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -4185,6 +4415,8 @@ class CliRunTests(unittest.TestCase):
         }
         if validation_max_recovery_rounds is not None:
             config["execution_policy"]["validation"]["max_recovery_rounds"] = validation_max_recovery_rounds
+        if validation_max_recovery_reopens is not None:
+            config["execution_policy"]["validation"]["max_recovery_reopens"] = validation_max_recovery_reopens
         implementation = {}
         if implementation_max_recovery_rounds is not None:
             implementation["max_recovery_rounds"] = implementation_max_recovery_rounds
@@ -4221,6 +4453,9 @@ class CliRunTests(unittest.TestCase):
 
     def codes(self, result):
         return {violation.code for violation in result.eligibility.violations}
+
+    def pipeline_codes(self, result):
+        return {violation.code for violation in result.pipeline_result.violations}
 
     def git(self, repo, *args):
         return subprocess.run(("git", *args), cwd=repo, check=True, capture_output=True, text=True)

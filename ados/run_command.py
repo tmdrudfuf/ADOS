@@ -37,6 +37,7 @@ class RunRequest:
     implementer_timeout_ms: int = SAFE_TIMEOUT_MS
     requirements_file: Path | None = None
     reopen_implementation_recovery: bool = False
+    reopen_validation_recovery: bool = False
     reopen_review_side_effect_recovery: bool = False
     prefer_implementer: str | None = None
 
@@ -194,7 +195,14 @@ class RunService:
             eligibility = RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),))
             return RunResult("BLOCKED", eligibility)
 
-        resume = self._resumable_run(project_path, config, plan, requirements, reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery)
+        resume = self._resumable_run(
+            project_path,
+            config,
+            plan,
+            requirements,
+            reopen_validation_recovery=request.reopen_validation_recovery,
+            reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+        )
         if resume is not None:
             requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
             if requirements_violations:
@@ -231,6 +239,7 @@ class RunService:
             resume,
             adoption if adoption and adoption.status == "ADOPTABLE" else None,
             reopen_implementation_recovery=request.reopen_implementation_recovery,
+            reopen_validation_recovery=request.reopen_validation_recovery,
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
         )
         if adoption is not None and adoption.status == "REFUSED":
@@ -247,6 +256,7 @@ class RunService:
                 run_record_path=resume.record_path,
                 timeout_ms=request.implementer_timeout_ms,
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
+                reopen_validation_recovery=request.reopen_validation_recovery,
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
@@ -259,6 +269,7 @@ class RunService:
                 run_record_path=record_path,
                 timeout_ms=request.implementer_timeout_ms,
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
+                reopen_validation_recovery=request.reopen_validation_recovery,
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
@@ -296,6 +307,7 @@ class RunService:
             run_record_path=record_path,
             timeout_ms=request.implementer_timeout_ms,
             reopen_implementation_recovery=request.reopen_implementation_recovery,
+            reopen_validation_recovery=request.reopen_validation_recovery,
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
@@ -359,6 +371,7 @@ class RunService:
         resume: "_ResumeCandidate | None" = None,
         adoption: "_OrphanedCandidateAdoption | None" = None,
         reopen_implementation_recovery: bool = False,
+        reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
@@ -402,6 +415,12 @@ class RunService:
             reopen_review_side_effect_recovery
             and resume is not None
             and set(blocking_recovery) == {"REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+        ):
+            blocking_recovery = ()
+        if (
+            reopen_validation_recovery
+            and resume is not None
+            and set(blocking_recovery) == {"VALIDATION_RECOVERY_NO_CHANGES"}
         ):
             blocking_recovery = ()
         if blocking_recovery:
@@ -672,14 +691,35 @@ class RunService:
         plan: RunPlan,
         requirements: RequirementsSource | None = None,
         *,
+        reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
     ) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
         primary_runs = project_path / ".agent-workflow" / "runs"
-        candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, None, primary_runs, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery))
+        candidates.extend(
+            self._resume_candidates_in_run_dir(
+                config,
+                plan,
+                requirements,
+                None,
+                primary_runs,
+                reopen_validation_recovery=reopen_validation_recovery,
+                reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+            )
+        )
         for record in self.worktrees.list_worktrees(project_path):
             runs = record.path / ".agent-workflow" / "runs"
-            candidates.extend(self._resume_candidates_in_run_dir(config, plan, requirements, record, runs, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery))
+            candidates.extend(
+                self._resume_candidates_in_run_dir(
+                    config,
+                    plan,
+                    requirements,
+                    record,
+                    runs,
+                    reopen_validation_recovery=reopen_validation_recovery,
+                    reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+                )
+            )
         deduped: dict[tuple[str, str], _ResumeCandidate] = {}
         for candidate in candidates:
             deduped.setdefault((candidate.record.run_id, str(Path(candidate.record.feature_worktree).resolve())), candidate)
@@ -696,6 +736,7 @@ class RunService:
         worktree_record: Any | None,
         runs: Path,
         *,
+        reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
     ) -> list["_ResumeCandidate"]:
         candidates: list[_ResumeCandidate] = []
@@ -705,7 +746,16 @@ class RunService:
             raw = _read_mapping(candidate_path)
             if raw is None:
                 continue
-            candidate = self._resume_candidate(config, plan, requirements, worktree_record, candidate_path, raw, reopen_review_side_effect_recovery=reopen_review_side_effect_recovery)
+            candidate = self._resume_candidate(
+                config,
+                plan,
+                requirements,
+                worktree_record,
+                candidate_path,
+                raw,
+                reopen_validation_recovery=reopen_validation_recovery,
+                reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+            )
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
@@ -719,6 +769,7 @@ class RunService:
         record_path: Path,
         raw: dict[str, Any],
         *,
+        reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
     ) -> "_ResumeCandidate | None":
         try:
@@ -734,11 +785,13 @@ class RunService:
             and not (reopen_review_side_effect_recovery and _review_side_effect_reopen_candidate(record_path))
         ):
             return None
-        if record.status == "VALIDATION_FAILED" and validation_failed_evidence(
+        validation_resume_blocked = record.status == "VALIDATION_FAILED" and validation_failed_evidence(
             _read_mapping(record_path.with_name("candidate.json")),
             _read_mapping(record_path.with_name("validation-runtime.json")),
-        ):
+        )
+        if validation_resume_blocked and not reopen_validation_recovery:
             return None
+        allow_explicit_validation_reopen_mismatch = reopen_validation_recovery and validation_resume_blocked
         cleanup_resume = record.status in {"MERGED", "CLEANUP_INCOMPLETE", "NO_CHANGES_CLEANUP_INCOMPLETE"}
         if (
             (record.run_id != expected.run_id and record.authoritative_base_sha == expected.authoritative_base_sha and not cleanup_resume)
@@ -753,8 +806,8 @@ class RunService:
             # legacy role fields when no assignment was persisted.
             or (record.agent_assignment is None and record.implementer != expected.implementer)
             or (record.agent_assignment is None and record.reviewer != expected.reviewer)
-            or (worktree_record is not None and worktree_record.branch != expected.feature_branch)
-            or (worktree_record is not None and worktree_record.path != Path(expected.feature_worktree).resolve())
+            or (worktree_record is not None and worktree_record.branch != expected.feature_branch and not allow_explicit_validation_reopen_mismatch)
+            or (worktree_record is not None and worktree_record.path != Path(expected.feature_worktree).resolve() and not allow_explicit_validation_reopen_mismatch)
         ):
             return None
         return _ResumeCandidate(record_path=record_path, record=record)
