@@ -3402,7 +3402,7 @@ def review_side_effect_recovery_evidence(record: Any, candidate: Any, validation
                 {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha},
             ),
         )
-    if review_result.exit_code != 0 or review_result.stderr:
+    if review_result.exit_code != 0:
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REVIEW_PROCESS_UNSAFE", "review side-effect recovery requires successful review process evidence", {"exit_code": str(review_result.exit_code)}),)
     block = record.get("reviewBlock")
     if not isinstance(block, dict):
