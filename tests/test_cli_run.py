@@ -3451,13 +3451,26 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(["implementation.txt"], attempts[0]["dirtyTrackedPaths"])
 
     def test_existing_review_side_effect_block_resumes_restores_and_retries_review(self):
-        with self.project() as fixture:
+        with self.project(implementer_mode="count") as fixture:
+            validation_counter = fixture.root / "validation-count.txt"
+            validator = fixture.root / "validator.py"
             reviewer = fixture.root / "reviewer.py"
-            reviewer.write_text("print('Approved')\n", encoding="utf-8")
+            validator.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{validation_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
             fixture.config = self.write_config(
                 fixture.root / "project-config.json",
                 fixture.repo,
                 reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
             )
             record_path, record = self.create_durable_run(fixture, "Resume review side effect", 1, "REVIEW_BLOCKED")
             worktree = Path(record["featureWorktree"])
@@ -3465,14 +3478,15 @@ class CliRunTests(unittest.TestCase):
             spec_dir.mkdir(parents=True)
             (spec_dir / "spec.md").write_text("# Resume review side effect\n", encoding="utf-8")
             (worktree / "implementation.txt").write_text("candidate\n", encoding="utf-8")
-            self.git(worktree, "add", "specs", "implementation.txt")
+            (worktree / "next-env.d.ts").write_text("candidate generated type reference\n", encoding="utf-8")
+            self.git(worktree, "add", "specs", "implementation.txt", "next-env.d.ts")
             self.git(worktree, "commit", "-m", "spec 001: Resume review side effect")
             candidate_sha = self.head(worktree)
             record["status"] = "REVIEW_BLOCKED"
             record["nextStage"] = "review"
             record["reviewBlock"] = {
                 "status": "PASS",
-                "decision": "Approved",
+                "decision": "Changes Requested",
                 "reasonCode": "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE",
                 "reasonCodes": ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"],
                 "blockCause": "review_side_effect",
@@ -3486,21 +3500,33 @@ class CliRunTests(unittest.TestCase):
                 "exitCode": 0,
                 "timedOut": False,
             }
+            self.assertNotIn("reviewSideEffectRecoveryAttempts", record)
+            self.assertNotIn("reviewSideEffectRecoveryBlock", record)
             record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": ["specs/001-resume-review-side-effect/spec.md", "implementation.txt"]}, indent=2, sort_keys=True), encoding="utf-8")
-            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
-            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "Approved", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Approved", "stderr": "", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
-            (worktree / "implementation.txt").write_text("reviewer side effect\n", encoding="utf-8")
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": ["specs/001-resume-review-side-effect/spec.md", "implementation.txt", "next-env.d.ts"]}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [f'"{sys.executable}" "{validator}"'], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "Changes Requested", "reviewed_sha": candidate_sha, "exit_code": 0, "stdout": "Changes Requested", "stderr": "OpenAI Codex reviewer runtime log\n", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            (worktree / "next-env.d.ts").write_text("reviewer side effect\n", encoding="utf-8")
             status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Resume review side effect", 1, fixture.config))
             stages = [(stage.id, stage.status) for stage in result.pipeline_result.stages]
+            final_record = result.pipeline_result.run_record
 
         self.assertEqual("True", status.workflow.evidence["resumable"])
         self.assertEqual("review", status.workflow.evidence["resume_stage"])
         self.assertTrue(result.resumed)
+        self.assertEqual(record["runId"], result.run_record.run_id)
         self.assertEqual("COMPLETE", result.status)
         self.assertIn(("review_side_effect_recovery", "PASS"), stages)
+        self.assertFalse((fixture.root / "implementer-count.txt").exists())
+        self.assertFalse(validation_counter.exists())
+        self.assertEqual(1, len(final_record.get("reviewSideEffectRecoveryAttempts", [])))
+        self.assertEqual("RESTORED", final_record["reviewSideEffectRecoveryAttempts"][0]["status"])
+        self.assertEqual(["next-env.d.ts"], final_record["reviewSideEffectRecoveryAttempts"][0]["dirtyTrackedPaths"])
         self.assertNotIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+        self.assertNotIn("FEATURE_BRANCH_EXISTS", self.codes(result))
+        self.assertNotIn("WORKTREE_PATH_EXISTS", self.codes(result))
+        self.assertNotIn("CONFLICTING_WORKTREE", self.codes(result))
 
     def test_review_side_effect_recovery_removes_untracked_files(self):
         with self.project() as fixture:
@@ -3567,6 +3593,45 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual("False", status.workflow.evidence["resumable"])
         self.assertEqual("", status.workflow.evidence["resume_stage"])
+        self.assertEqual("BLOCKED", result.status)
+        self.assertFalse(result.resumed)
+        self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
+
+    def test_review_side_effect_failed_review_runtime_is_not_resumable(self):
+        with self.project() as fixture:
+            record_path, record = self.create_durable_run(fixture, "Failed review side effect", 1, "REVIEW_BLOCKED")
+            worktree = Path(record["featureWorktree"])
+            (worktree / "implementation.txt").write_text("candidate\n", encoding="utf-8")
+            self.git(worktree, "add", "implementation.txt")
+            self.git(worktree, "commit", "-m", "spec 001: Failed review side effect")
+            candidate_sha = self.head(worktree)
+            record["status"] = "REVIEW_BLOCKED"
+            record["nextStage"] = "review"
+            record["reviewBlock"] = {
+                "status": "PASS",
+                "decision": "Approved",
+                "reasonCode": "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE",
+                "reasonCodes": ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"],
+                "blockCause": "review_side_effect",
+                "transient": False,
+                "resumeStage": "review",
+                "reviewer": record["reviewer"],
+                "candidateSha": candidate_sha,
+                "validatedSha": candidate_sha,
+                "baseSha": record["authoritativeBaseSha"],
+                "reviewedSha": candidate_sha,
+                "exitCode": 0,
+                "timedOut": False,
+            }
+            record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("candidate.json").write_text(json.dumps({"status": "COMMITTED", "candidate_sha": candidate_sha, "changed_files": ["implementation.txt"]}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("validation-runtime.json").write_text(json.dumps({"status": "PASS", "head_before": candidate_sha, "head_after": candidate_sha, "commands": [], "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            record_path.with_name("review-runtime.json").write_text(json.dumps({"status": "PASS", "decision": "Approved", "reviewed_sha": candidate_sha, "exit_code": 7, "stdout": "Approved", "stderr": "failed reviewer process", "violations": []}, indent=2, sort_keys=True), encoding="utf-8")
+            (worktree / "implementation.txt").write_text("reviewer side effect\n", encoding="utf-8")
+            status = StatusService().run(StatusRequest(fixture.repo, fixture.config))
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(RunRequest(fixture.repo, "Failed review side effect", 1, fixture.config, dry_run=True))
+
+        self.assertEqual("False", status.workflow.evidence["resumable"])
         self.assertEqual("BLOCKED", result.status)
         self.assertFalse(result.resumed)
         self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
