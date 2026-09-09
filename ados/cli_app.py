@@ -46,6 +46,11 @@ class CliApplication:
         run.add_argument("--dry-run", action="store_true")
         run.add_argument("--implementer-timeout-ms", type=int, default=300000)
         run.add_argument("--reopen-implementation-recovery", action="store_true")
+        run.add_argument(
+            "--reopen-validation-recovery",
+            action="store_true",
+            help="explicitly retry validation for an unchanged candidate blocked by validation recovery no-changes evidence",
+        )
         run.add_argument("--reopen-review-side-effect-recovery", action="store_true")
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
@@ -155,6 +160,7 @@ class CliApplication:
                     implementer_timeout_ms=args.implementer_timeout_ms,
                     requirements_file=Path(args.requirements_file) if args.requirements_file else None,
                     reopen_implementation_recovery=args.reopen_implementation_recovery,
+                    reopen_validation_recovery=args.reopen_validation_recovery,
                     reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
                     prefer_implementer=args.prefer_implementer,
                 )

@@ -304,6 +304,7 @@ class RunPipeline:
         run_record_path: Path,
         timeout_ms: int,
         reopen_implementation_recovery: bool = False,
+        reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
@@ -356,10 +357,16 @@ class RunPipeline:
                 candidate_artifact,
                 validation_artifact,
             )
-            if resumable:
+            if resumable and not reopen_validation_recovery:
                 return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("validation_resume", "BLOCKED", {})]), record, violations=resumable)
             _ensure_validation_failure_evidence(run_record_path, record, candidate_artifact, validation_artifact)
             record = _read_json(run_record_path) or record
+            if reopen_validation_recovery:
+                reopened = self._reopen_validation_recovery_without_changes(config, run_record_path, record, candidate_artifact, validation_artifact, stages)
+                if isinstance(reopened, PipelineOutcome):
+                    return reopened
+                record = reopened
+                stages.append(_stage("validation_recovery_reopen", "PASS", {"reopen": str(_validation_recovery_reopen_count(record))}))
             adoption = self._adopt_validation_recovery_candidate(config, run_record_path, record, candidate_artifact, validation_artifact, stages)
             if isinstance(adoption, PipelineOutcome):
                 return adoption
@@ -1356,6 +1363,179 @@ class RunPipeline:
         _clear_resolved_recovery_fields(updated, "READY_FOR_VALIDATION")
         _write_json(run_record_path, updated)
         return updated, candidate
+
+    def _reopen_validation_recovery_without_changes(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        candidate_artifact: Any,
+        validation_artifact: Any,
+        stages: list[PipelineStage],
+    ) -> dict[str, Any] | PipelineOutcome:
+        block = record.get("validationRecoveryBlock")
+        if not isinstance(block, dict) or str(block.get("status", "")) != "BLOCKED":
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_BLOCK_MISSING",
+                "validation recovery reopen requires durable blocked recovery evidence",
+                {"status": str(record.get("status", ""))},
+            )
+        if str(block.get("reasonCode", "")) != "VALIDATION_RECOVERY_NO_CHANGES":
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_UNSUPPORTED_REASON",
+                "validation recovery reopen only supports no-changes recovery blocks",
+                {"reasonCode": str(block.get("reasonCode", ""))},
+            )
+
+        candidate = _candidate_from_mapping(candidate_artifact)
+        validation = _validation_from_mapping(validation_artifact) if isinstance(validation_artifact, dict) else None
+        evidence_violations = validation_failed_evidence(candidate_artifact, validation_artifact)
+        if candidate is None or validation is None or evidence_violations:
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("validation_recovery_reopen", "BLOCKED", {"reason": "invalid_evidence"})]),
+                record,
+                violations=tuple(evidence_violations or (_violation("VALIDATION_RECOVERY_REOPEN_EVIDENCE_INVALID", "validation recovery reopen requires matching failed validation evidence", {}),)),
+            )
+
+        attempts_raw = record.get("validationRecoveryAttempts")
+        if not isinstance(attempts_raw, list) or not all(isinstance(item, dict) for item in attempts_raw):
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_ATTEMPTS_INVALID",
+                "validation recovery reopen requires durable validation recovery attempts",
+                {},
+            )
+        attempts = list(attempts_raw)
+        block_evidence = block.get("evidence")
+        block_candidate = str(block_evidence.get("candidate_sha", "")) if isinstance(block_evidence, dict) else ""
+        if not attempts or not block_candidate or block_candidate != candidate.candidate_sha:
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_BLOCK_SHA_MISMATCH",
+                "validation recovery reopen block evidence must match the failed candidate",
+                {"block_candidate_sha": block_candidate, "candidate_sha": candidate.candidate_sha},
+            )
+        latest_attempt = attempts[-1]
+        if str(latest_attempt.get("failedCandidateSha", "")) != candidate.candidate_sha or str(latest_attempt.get("status", "")) not in {"RECOVERY_IMPLEMENTER_PENDING", "READY_FOR_VALIDATION"}:
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_ATTEMPT_UNSAFE",
+                "validation recovery reopen requires no-changes recovery attempt evidence for the failed candidate",
+                {"failedCandidateSha": str(latest_attempt.get("failedCandidateSha", "")), "status": str(latest_attempt.get("status", ""))},
+            )
+
+        max_reopens = config.execution_policy.validation.max_recovery_reopens
+        reopen_number = _validation_recovery_reopen_count(record) + 1
+        if reopen_number > max_reopens:
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED",
+                "validation recovery reopen reached the configured maximum reopen count",
+                {"max_recovery_reopens": str(max_reopens), "reopen": str(reopen_number - 1)},
+            )
+
+        worktree = Path(str(record.get("featureWorktree", "")))
+        try:
+            status = self.git.status(worktree)
+            current_head = self.git.current_head(worktree)
+            branch = self.git.current_branch(worktree)
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("validation_recovery_reopen", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+        if branch != str(record.get("featureBranch", "")):
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_BRANCH_MISMATCH",
+                "validation recovery reopen requires the expected feature branch",
+                {"expected": str(record.get("featureBranch", "")), "actual": branch},
+            )
+        if status.staged or status.dirty_tracked or status.untracked:
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_WORKTREE_DIRTY",
+                "validation recovery reopen requires a clean feature worktree",
+                {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)},
+            )
+        if current_head != candidate.candidate_sha:
+            return _validation_recovery_reopen_blocked(
+                stages,
+                record,
+                "VALIDATION_RECOVERY_REOPEN_HEAD_MISMATCH",
+                "validation recovery reopen requires current HEAD to match failed candidate evidence",
+                {"candidate_sha": candidate.candidate_sha, "current_head": current_head},
+            )
+
+        guardian = self.guardian.audit(
+            policy=config.execution_policy,
+            repository_path=Path(str(record.get("primaryRepository", ""))),
+            expected_repository_path=config.primary_repository_path,
+            expected_branch=config.default_branch,
+            allowed_local_paths=config.allowed_primary_local_paths,
+        )
+        if guardian.status == "BLOCK":
+            return PipelineOutcome(
+                "VALIDATION_FAILED",
+                tuple([*stages, _stage("validation_recovery_reopen", "BLOCKED", {})]),
+                record,
+                violations=tuple(PipelineViolation(f"PRIMARY_{item.code}", item.message, item.evidence) for item in guardian.violations),
+            )
+
+        try:
+            if not self.git.is_ancestor(worktree, str(record.get("authoritativeBaseSha", "")), current_head):
+                return _validation_recovery_reopen_blocked(
+                    stages,
+                    record,
+                    "VALIDATION_RECOVERY_REOPEN_BASE_STALE",
+                    "validation recovery reopen requires candidate to descend from authoritative base",
+                    {"base": str(record.get("authoritativeBaseSha", "")), "current_head": current_head},
+                )
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("VALIDATION_FAILED", tuple([*stages, _stage("validation_recovery_reopen", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+
+        previous_validation_archive = run_record_path.with_name(f"validation-runtime-before-validation-recovery-reopen-{reopen_number}.json")
+        if isinstance(validation_artifact, dict):
+            _write_json(previous_validation_archive, validation_artifact)
+        reopen = {
+            "round": reopen_number,
+            "maxReopens": max_reopens,
+            "status": "REOPENED",
+            "reason": "explicit_human_reopen_after_validation_recovery_no_changes",
+            "reopenedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(worktree),
+            "authoritativeBaseSha": str(record.get("authoritativeBaseSha", "")),
+            "candidateSha": candidate.candidate_sha,
+            "previousBlockReason": str(block.get("reasonCode", "")),
+            "previousBlock": block,
+            "previousValidation": validation_artifact,
+            "previousRecoveryAttempts": attempts,
+            "previousRecoveryAttemptCount": len(attempts),
+            "previousValidationArtifact": str(previous_validation_archive),
+            "selectedNextStage": "validation",
+        }
+        reopens_raw = record.get("validationRecoveryReopens")
+        reopens = list(reopens_raw) if isinstance(reopens_raw, list) else []
+        reopens.append(reopen)
+        updated = dict(record)
+        updated["status"] = "READY_FOR_VALIDATION"
+        updated["nextStage"] = "validation"
+        updated["validationRecoveryReopens"] = reopens
+        updated["validationRecoveryReopen"] = reopen
+        updated.pop("validationRecoveryBlock", None)
+        _write_json(run_record_path.with_name(f"validation-recovery-reopen-{reopen_number}.json"), reopen)
+        _write_json(run_record_path, updated)
+        return updated
 
     def _reopen_exhausted_validation_recovery(
         self,
@@ -2564,6 +2744,21 @@ def _validation_recovery_block_violation(record: dict[str, Any]) -> PipelineViol
     evidence_raw = block.get("evidence")
     evidence = {str(key): str(value) for key, value in evidence_raw.items()} if isinstance(evidence_raw, dict) else {}
     return _violation(str(block.get("reasonCode", "VALIDATION_RECOVERY_BLOCKED")), str(block.get("message", "validation recovery is blocked")), evidence)
+
+
+def _validation_recovery_reopen_blocked(
+    stages: list[PipelineStage],
+    record: dict[str, Any],
+    code: str,
+    message: str,
+    evidence: dict[str, str],
+) -> PipelineOutcome:
+    return PipelineOutcome(
+        "VALIDATION_FAILED",
+        tuple([*stages, _stage("validation_recovery_reopen", "BLOCKED", evidence)]),
+        record,
+        violations=(_violation(code, message, evidence),),
+    )
 
 
 def _implementation_recovery_block_violation(record: dict[str, Any]) -> PipelineViolation | None:
