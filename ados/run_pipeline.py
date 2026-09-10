@@ -306,6 +306,7 @@ class RunPipeline:
         reopen_implementation_recovery: bool = False,
         reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
+        reopen_review_convergence: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -348,6 +349,14 @@ class RunPipeline:
                 return reopened
             record = reopened
             stages.append(_stage("review_side_effect_recovery_reopen", "PASS", {"reopen": str(_review_side_effect_recovery_reopen_count(record)), "candidate_sha": str(record.get("reviewSideEffectRecoveryReopen", {}).get("adoptedCandidateSha", ""))}))
+        review_convergence_reopened = False
+        if record.get("status") == "REVIEW_BLOCKED" and reopen_review_convergence:
+            reopened = self._reopen_review_convergence(config, run_record_path, record, stages)
+            if isinstance(reopened, PipelineOutcome):
+                return reopened
+            record = reopened
+            review_convergence_reopened = True
+            stages.append(_stage("review_convergence_reopen", "PASS", {"reopen": str(_review_convergence_reopen_count(record)), "candidate_sha": str(record.get("reviewConvergenceReopen", {}).get("candidateSha", ""))}))
         if record.get("status") == "REVIEW_BLOCKED":
             return self._resume_review(config, run_record_path, record, stages, timeout_ms)
         if record.get("status") == "VALIDATION_FAILED":
@@ -390,7 +399,7 @@ class RunPipeline:
         if any(item.exit_code != 0 for item in bootstrap):
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
-        implementation_recovery_reopened = False
+        implementation_recovery_reopened = review_convergence_reopened
         if record.get("status") in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
             blocked = _implementation_recovery_block_violation(record)
             if blocked is not None:
@@ -411,7 +420,7 @@ class RunPipeline:
 
         if record.get("status") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "VALIDATION_FAILED"}:
             if implementation_recovery_reopened:
-                prior_failure = _implementer_outcome_from_record_failure(run_record_path, record)
+                prior_failure = _review_convergence_prior_failure(record) if review_convergence_reopened else _implementer_outcome_from_record_failure(run_record_path, record)
                 recovery = self._recover_implementation_failure(config, run_record_path, record, stages, bootstrap, prior_failure, timeout_ms)
                 if isinstance(recovery, PipelineOutcome):
                     return recovery
@@ -1957,6 +1966,190 @@ class RunPipeline:
         _write_json(run_record_path, updated)
         return updated
 
+    def _reopen_review_convergence(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+    ) -> dict[str, Any] | PipelineOutcome:
+        candidate_artifact = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation_artifact = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review_artifact = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        evidence_violations = review_convergence_reopen_evidence(record, candidate_artifact, validation_artifact, review_artifact)
+        if evidence_violations:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "not_eligible"})]),
+                record,
+                violations=evidence_violations,
+            )
+
+        candidate = _candidate_from_mapping(candidate_artifact)
+        validation = _validation_from_mapping(validation_artifact) if isinstance(validation_artifact, dict) else None
+        review = _review_from_mapping(review_artifact) if isinstance(review_artifact, dict) else None
+        if candidate is None or validation is None or review is None:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "invalid_evidence"})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_EVIDENCE_INVALID", "review convergence reopen requires candidate, validation, and review evidence", {}),),
+            )
+
+        worktree = Path(str(record.get("featureWorktree", "")))
+        required = ("runId", "projectId", "featureBranch", "featureWorktree", "primaryRepository", "authoritativeBaseSha")
+        missing = [key for key in required if not isinstance(record.get(key), str) or not str(record.get(key, ""))]
+        requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+        if missing or (isinstance(record.get("requirements"), dict) and not requirements_sha):
+            violations = tuple(
+                _violation("REVIEW_CONVERGENCE_REOPEN_RECORD_INVALID", "review convergence reopen requires durable run identity fields", {"field": key})
+                for key in missing
+            )
+            if isinstance(record.get("requirements"), dict) and not requirements_sha:
+                violations = (*violations, _violation("REVIEW_CONVERGENCE_REOPEN_REQUIREMENTS_SHA_MISSING", "review convergence reopen requires durable requirements SHA evidence when requirements are supplied", {}))
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "record_invalid"})]), record, violations=violations)
+        if not worktree.is_dir():
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_WORKTREE_MISSING", "review convergence reopen requires the recorded feature worktree", {"worktree": str(worktree)}),),
+            )
+
+        try:
+            status = self.git.status(worktree)
+            current_head = self.git.current_head(worktree)
+            branch = self.git.current_branch(worktree)
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+        if branch != str(record.get("featureBranch", "")):
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"branch": branch})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_BRANCH_MISMATCH", "review convergence reopen requires the recorded feature branch", {"expected": str(record.get("featureBranch", "")), "actual": branch}),),
+            )
+        if status.root != worktree.resolve():
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"root": str(status.root)})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_WORKTREE_MISMATCH", "review convergence reopen requires the recorded feature worktree root", {"expected": str(worktree.resolve()), "actual": str(status.root)}),),
+            )
+        if current_head != candidate.candidate_sha:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"current_head": current_head})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_HEAD_MISMATCH", "review convergence reopen requires current HEAD to match reviewed candidate evidence", {"candidate_sha": candidate.candidate_sha, "current_head": current_head}),),
+            )
+        if status.staged or status.dirty_tracked:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {})]),
+                record,
+                violations=(_violation("REVIEW_CONVERGENCE_REOPEN_WORKTREE_DIRTY", "review convergence reopen requires a clean tracked feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),),
+            )
+
+        independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
+        if independence is not None:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "reviewer_independence"})]), record, violations=(independence,))
+
+        guardian = self.guardian.audit(
+            policy=config.execution_policy,
+            repository_path=Path(str(record.get("primaryRepository", ""))),
+            expected_repository_path=config.primary_repository_path,
+            expected_branch=config.default_branch,
+            allowed_local_paths=config.allowed_primary_local_paths,
+        )
+        if guardian.status == "BLOCK":
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {})]),
+                record,
+                violations=tuple(PipelineViolation(f"PRIMARY_{item.code}", item.message, item.evidence) for item in guardian.violations),
+            )
+
+        try:
+            if not self.git.is_ancestor(worktree, str(record.get("authoritativeBaseSha", "")), current_head):
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    violations=(_violation("REVIEW_CONVERGENCE_REOPEN_BASE_STALE", "review convergence reopen requires current HEAD to descend from recorded authoritative base", {"base": str(record.get("authoritativeBaseSha", "")), "current_head": current_head}),),
+                )
+        except RepositoryProviderError as exc:
+            return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {})]), record, violations=(_violation(exc.code, exc.message, {"worktree": str(worktree)}),))
+
+        existing_reopens = _review_convergence_reopens(record)
+        max_reopens = config.execution_policy.review.max_convergence_reopens
+        reopen_number = len(existing_reopens) + 1
+        if reopen_number > max_reopens:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reopen": str(reopen_number - 1)})]),
+                record,
+                violations=(
+                    _violation(
+                        "REVIEW_CONVERGENCE_REOPEN_MAX_ROUNDS_EXCEEDED",
+                        "review convergence reopen reached the configured maximum reopen count",
+                        {"max_convergence_reopens": str(max_reopens), "reopen": str(reopen_number - 1)},
+                    ),
+                ),
+            )
+
+        attempts_raw = record.get("implementationRecoveryAttempts")
+        attempts = list(attempts_raw) if isinstance(attempts_raw, list) else []
+        block = record.get("reviewBlock") if isinstance(record.get("reviewBlock"), dict) else {}
+        primary_run_dir = Path(str(record["primaryRepository"])) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}"
+        primary_run_dir.mkdir(parents=True, exist_ok=True)
+        candidate_archive = primary_run_dir / f"candidate-before-review-convergence-reopen-{candidate.candidate_sha[:12]}.json"
+        validation_archive = primary_run_dir / f"validation-runtime-before-review-convergence-reopen-{candidate.candidate_sha[:12]}.json"
+        review_archive = primary_run_dir / f"review-runtime-before-review-convergence-reopen-{candidate.candidate_sha[:12]}.json"
+        _write_json(candidate_archive, candidate_artifact)
+        _write_json(validation_archive, validation_artifact)
+        _write_json(review_archive, review_artifact)
+        reopen = {
+            "round": reopen_number,
+            "maxReopens": max_reopens,
+            "status": "REOPENED",
+            "reason": "explicit_human_reopen_after_review_convergence_exhaustion",
+            "reopenedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "projectId": str(record.get("projectId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(worktree),
+            "authoritativeBaseSha": str(record.get("authoritativeBaseSha", "")),
+            "requirementsSha": requirements_sha,
+            "agentAssignment": record.get("agentAssignment") if isinstance(record.get("agentAssignment"), dict) else None,
+            "candidateSha": candidate.candidate_sha,
+            "validatedSha": validation.head_after,
+            "reviewedSha": review.reviewed_sha,
+            "reviewDecision": review.decision,
+            "previousBlock": block,
+            "previousImplementationRecoveryAttempts": attempts,
+            "previousImplementationRecoveryAttemptCount": len(attempts),
+            "previousCandidateArtifact": str(candidate_archive),
+            "previousValidationArtifact": str(validation_archive),
+            "previousReviewArtifact": str(review_archive),
+            "newEpoch": _implementation_recovery_epoch(record) + 1,
+            "newRecoveryBudget": config.execution_policy.implementation.max_recovery_rounds,
+            "selectedNextStage": "implementation_recovery",
+        }
+        reopen_artifact = primary_run_dir / f"review-convergence-reopen-{reopen_number}.json"
+        reopen["artifact"] = str(reopen_artifact)
+        reopens = [*existing_reopens, reopen]
+        updated = dict(record)
+        updated["status"] = "IMPLEMENTATION_FAILED"
+        updated["nextStage"] = "implementation_recovery"
+        updated["reviewConvergenceReopens"] = reopens
+        updated["reviewConvergenceReopen"] = reopen
+        updated.pop("implementationRecoveryBlock", None)
+        _write_json(run_record_path.with_name(f"review-convergence-reopen-{reopen_number}.json"), reopen)
+        _write_json(reopen_artifact, reopen)
+        _write_json(run_record_path, updated)
+        return updated
+
     def _resume_publication(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage]) -> PipelineOutcome | None:
         candidate = _read_run_artifact(run_record_path, record, "candidate.json")
         validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
@@ -2058,6 +2251,23 @@ class RunPipeline:
                 stages.append(_stage("review_changes_recovery_adoption", "PASS", {"candidate_sha": str(adoption.get("candidate_sha", ""))}))
                 return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {"current_head": current_head})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_SHA_MISMATCH", "review resume HEAD does not match validated candidate", {"current_head": current_head, "candidate_sha": candidate.candidate_sha}),))
+        if not review_convergence_reopen_evidence(record, candidate_raw, validation_raw, review_raw):
+            block = record.get("implementationRecoveryBlock")
+            if isinstance(block, dict) and str(block.get("reasonCode", "")) == "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED":
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "explicit_reopen_required"})]),
+                    record,
+                    candidate=candidate,
+                    validation=validation,
+                    violations=(
+                        _violation(
+                            "REVIEW_CONVERGENCE_REOPEN_REQUIRED",
+                            "exhausted review convergence recovery requires explicit human reopen",
+                            {"candidate_sha": candidate.candidate_sha, "max_rounds": str(block.get("evidence", {}).get("max_recovery_rounds", "")) if isinstance(block.get("evidence"), dict) else ""},
+                        ),
+                    ),
+                )
 
         diff = _git_output(worktree, "diff", "--no-ext-diff", "--no-color", f"{record['authoritativeBaseSha']}..{candidate.candidate_sha}")
         review_scope = f"specs/{record['specNumber']}-{record['featureSlug']}"
@@ -2491,12 +2701,53 @@ def _implementation_recovery_attempt_count(record: dict[str, Any]) -> int:
 
 
 def _implementation_recovery_epoch(record: dict[str, Any]) -> int:
+    implementation_reopens = record.get("implementationRecoveryReopens")
+    convergence_reopens = record.get("reviewConvergenceReopens")
+    implementation_count = len(implementation_reopens) if isinstance(implementation_reopens, list) else 0
+    convergence_count = len(convergence_reopens) if isinstance(convergence_reopens, list) else 0
+    return implementation_count + convergence_count
+
+
+def _implementation_recovery_reopen_count(record: dict[str, Any]) -> int:
     reopens = record.get("implementationRecoveryReopens")
     return len(reopens) if isinstance(reopens, list) else 0
 
 
-def _implementation_recovery_reopen_count(record: dict[str, Any]) -> int:
-    return _implementation_recovery_epoch(record)
+def _review_convergence_reopens(record: dict[str, Any]) -> list[dict[str, Any]]:
+    reopens = record.get("reviewConvergenceReopens")
+    if not isinstance(reopens, list):
+        return []
+    return [item for item in reopens if isinstance(item, dict)]
+
+
+def _review_convergence_reopen_count(record: dict[str, Any]) -> int:
+    return len(_review_convergence_reopens(record))
+
+
+def _review_convergence_prior_failure(record: dict[str, Any]) -> ImplementerRuntimeOutcome:
+    head = ""
+    reopen = record.get("reviewConvergenceReopen")
+    if isinstance(reopen, dict):
+        head = str(reopen.get("candidateSha", ""))
+    violation = ImplementerViolation(
+        "REVIEW_CHANGES_REQUESTED",
+        "review convergence reopen routes the blocked reviewed candidate through implementation recovery",
+        {"candidate_sha": head},
+    )
+    result = ImplementerRuntimeResult(
+        runtime_id="review-convergence-reopen",
+        run_id=str(record.get("runId", "")),
+        status="IMPLEMENTATION_FAILED",
+        exit_code=0,
+        timed_out=False,
+        stdout="",
+        stderr="Changes Requested",
+        head_before=head,
+        head_after=head,
+        changed_files=(),
+        violations=(violation,),
+    )
+    return ImplementerRuntimeOutcome("IMPLEMENTATION_FAILED", None, result, record, (violation,))
 
 
 def _append_implementation_recovery_attempt(path: Path, record: dict[str, Any], implementer: ImplementerRuntimeOutcome, round_number: int, max_rounds: int) -> None:
@@ -3869,6 +4120,56 @@ def review_changes_requested_evidence(record: Any, candidate: Any, validation: A
     block_sha = _review_changes_requested_block_sha_evidence(record, candidate_result, validation_result, review_result)
     if block_sha:
         return block_sha
+    return ()
+
+
+def review_convergence_reopen_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict) or str(record.get("status", "")) != "REVIEW_BLOCKED":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_RECORD_INVALID", "review convergence reopen requires REVIEW_BLOCKED durable state", {"status": str(record.get("status", "")) if isinstance(record, dict) else ""}),)
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_BLOCK_MISSING", "review convergence reopen requires durable review block evidence", {}),)
+    if str(block.get("blockCause", "")) != "review_decision":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_BLOCK_CAUSE_UNSAFE", "review convergence reopen requires a normal review decision block cause", {"blockCause": str(block.get("blockCause", ""))}),)
+    if str(block.get("reasonCode", "")) != "REVIEW_CHANGES_REQUESTED":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REASON_UNSAFE", "review convergence reopen only supports REVIEW_CHANGES_REQUESTED", {"reasonCode": str(block.get("reasonCode", ""))}),)
+    if str(block.get("decision", "")) != "Changes Requested" or str(block.get("status", "")) != "PASS":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_BLOCK_STATE_INVALID", "review convergence reopen requires a successful Changes Requested review block", {"status": str(block.get("status", "")), "decision": str(block.get("decision", ""))}),)
+    reason_codes = block.get("reasonCodes", [])
+    if reason_codes not in ([], ["REVIEW_CHANGES_REQUESTED"]):
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REASON_CODES_UNSAFE", "review convergence reopen requires only Changes Requested reason codes", {}),)
+    if str(block.get("exitCode", "0")) != "0" or str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_PROCESS_UNSAFE", "review convergence reopen requires successful non-transient reviewer process evidence", {}),)
+
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_CANDIDATE_INVALID", "review convergence reopen requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_VALIDATION_MISSING", "review convergence reopen requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "PASS":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_VALIDATION_NOT_PASSED", "review convergence reopen requires previously passed validation", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_VALIDATION_SHA_MISMATCH", "review convergence reopen validation evidence does not match candidate", {"candidate_sha": candidate_result.candidate_sha, "head_before": validation_result.head_before, "head_after": validation_result.head_after}),)
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REVIEW_MISSING", "review convergence reopen requires review evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "PASS" or review_result.decision != "Changes Requested":
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REVIEW_STATE_INVALID", "review convergence reopen requires successful Changes Requested review evidence", {"status": review_result.status, "decision": review_result.decision}),)
+    if review_result.exit_code != 0 or review_result.violations:
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REVIEW_PROCESS_UNSAFE", "review convergence reopen requires clean successful reviewer process evidence", {"exit_code": str(review_result.exit_code), "violation_count": str(len(review_result.violations))}),)
+    if review_result.reviewed_sha != candidate_result.candidate_sha:
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_REVIEW_SHA_MISMATCH", "review convergence reopen review evidence does not match candidate", {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha}),)
+
+    block_candidate = str(block.get("candidateSha", ""))
+    block_validated = str(block.get("validatedSha", ""))
+    block_reviewed = str(block.get("reviewedSha", ""))
+    if not block_candidate or not block_validated or not block_reviewed:
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_BLOCK_SHA_MISSING", "review convergence reopen requires candidate, validated, and reviewed SHA block evidence", {"candidateSha": block_candidate, "validatedSha": block_validated, "reviewedSha": block_reviewed}),)
+    if block_candidate != candidate_result.candidate_sha or block_validated != validation_result.head_after or block_reviewed != review_result.reviewed_sha:
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_BLOCK_SHA_MISMATCH", "review convergence reopen durable block SHA evidence does not match artifacts", {"candidate_sha": candidate_result.candidate_sha, "validated_sha": validation_result.head_after, "reviewed_sha": review_result.reviewed_sha}),)
+    if not (candidate_result.candidate_sha == validation_result.head_after == review_result.reviewed_sha):
+        return (_violation("REVIEW_CONVERGENCE_REOPEN_SHA_MISMATCH", "review convergence reopen requires candidate, validated, and reviewed SHA to match", {"candidate_sha": candidate_result.candidate_sha, "validated_sha": validation_result.head_after, "reviewed_sha": review_result.reviewed_sha}),)
     return ()
 
 

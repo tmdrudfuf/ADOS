@@ -28,6 +28,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--reopen-implementation-recovery", completed.stdout)
         self.assertIn("--reopen-validation-recovery", completed.stdout)
         self.assertIn("--reopen-review-side-effect-recovery", completed.stdout)
+        self.assertIn("--reopen-review-convergence", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -2646,6 +2647,217 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(adopted_candidate, second.pipeline_result.review.reviewed_sha)
         self.assertEqual("Approved", second.pipeline_result.review.decision)
 
+    def test_review_convergence_reopen_supported_block_succeeds(self):
+        with self.project(implementer_mode="count") as fixture:
+            counter = fixture.root / "implementer-count.txt"
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Review convergence reopen", 1)
+            record["agentAssignment"] = {
+                "implementerId": "claude",
+                "reviewerId": "codex",
+                "candidateOwnerId": "claude",
+                "implementerCommand": record["implementer"],
+                "reviewerCommand": record["reviewer"],
+                "sequence": 1,
+            }
+            record["reviewFixHistory"] = [{"round": 1, "candidateSha": candidate_sha}]
+            prior_attempt = self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Review convergence reopen", 1, fixture.config, reopen_review_convergence=True)
+            )
+            final_record = result.pipeline_result.run_record
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            reopen = final_record["reviewConvergenceReopen"]
+            counter_value = counter.read_text(encoding="utf-8")
+            reopen_artifact_exists = Path(reopen["artifact"]).exists()
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertTrue(result.resumed)
+        self.assertEqual(record["runId"], final_record["runId"])
+        self.assertEqual(record["featureBranch"], final_record["featureBranch"])
+        self.assertEqual(record["featureWorktree"], final_record["featureWorktree"])
+        self.assertEqual(record["authoritativeBaseSha"], final_record["authoritativeBaseSha"])
+        self.assertEqual(record["agentAssignment"], final_record["agentAssignment"])
+        self.assertEqual(record["requirements"], final_record["requirements"])
+        self.assertEqual([{"round": 1, "candidateSha": candidate_sha}], final_record["reviewFixHistory"])
+        self.assertIn("review_convergence_reopen", stages)
+        self.assertIn("implementation_recovery_implementer", stages)
+        self.assertNotIn("implementer", stages)
+        self.assertEqual("1", counter_value)
+        self.assertEqual(1, len(final_record["reviewConvergenceReopens"]))
+        self.assertEqual(1, reopen["maxReopens"])
+        self.assertEqual(candidate_sha, reopen["candidateSha"])
+        self.assertEqual("implementation_recovery", reopen["selectedNextStage"])
+        self.assertEqual([prior_attempt], reopen["previousImplementationRecoveryAttempts"])
+        self.assertTrue(reopen_artifact_exists)
+        self.assertIn(f"review-runtime-before-review-convergence-reopen-{candidate_sha[:12]}.json", reopen["previousReviewArtifact"])
+        self.assertEqual("Approved", result.pipeline_result.review.decision)
+
+    def test_review_convergence_plain_resume_stays_blocked(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Plain convergence resume", 1)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Plain convergence resume", 1, fixture.config)
+            )
+            unchanged = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_REQUIRED", self.pipeline_codes(result))
+        self.assertNotIn("reviewConvergenceReopens", unchanged)
+
+    def test_review_convergence_second_reopen_is_rejected(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Second convergence reopen", 1)
+            record["reviewConvergenceReopens"] = [{"status": "REOPENED", "candidateSha": candidate_sha}]
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Second convergence reopen", 1, fixture.config, reopen_review_convergence=True)
+            )
+            unchanged = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_MAX_ROUNDS_EXCEEDED", self.pipeline_codes(result))
+        self.assertEqual([{"candidateSha": candidate_sha, "status": "REOPENED"}], unchanged["reviewConvergenceReopens"])
+
+    def test_review_convergence_reopen_wrong_head_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Wrong head convergence reopen", 1)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+            worktree = Path(record["featureWorktree"])
+            (worktree / "manual.txt").write_text("new head\n", encoding="utf-8")
+            self.git(worktree, "add", "manual.txt")
+            self.git(worktree, "commit", "-m", "manual new head")
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_HEAD_MISMATCH", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_sha_mismatch_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Mismatch convergence reopen", 1)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+            validation = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+            validation["head_after"] = record["authoritativeBaseSha"]
+            record_path.with_name("validation-runtime.json").write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_VALIDATION_SHA_MISMATCH", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_dirty_tracked_worktree_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Dirty convergence reopen", 1)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+            Path(record["featureWorktree"], "implementation.txt").write_text("dirty tracked\n", encoding="utf-8")
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_WORKTREE_DIRTY", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_wrong_branch_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Wrong branch convergence reopen", 1)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+            self.git(Path(record["featureWorktree"]), "checkout", "-b", "wrong-convergence-branch")
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_BRANCH_MISMATCH", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_wrong_worktree_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Wrong worktree convergence reopen", 1)
+            worktree = Path(record["featureWorktree"])
+            nested = worktree / "nested"
+            nested.mkdir()
+            record["featureWorktree"] = str(nested)
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_WORKTREE_MISMATCH", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_base_ancestry_failure_fails_closed(self):
+        with self.project(implementer_mode="count") as fixture:
+            record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Base stale convergence reopen", 1)
+            orphan_base = self.git(Path(record["featureWorktree"]), "commit-tree", "HEAD^{tree}", "-m", "unrelated base").stdout.strip()
+            record["authoritativeBaseSha"] = orphan_base
+            record["reviewBlock"]["baseSha"] = orphan_base
+            self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=record_path,
+                timeout_ms=300000,
+                reopen_review_convergence=True,
+            )
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_BASE_STALE", {violation.code for violation in result.violations})
+
+    def test_review_convergence_reopen_rejects_unrelated_blocks(self):
+        cases = [
+            ("Validation block", {}, "validation", "VALIDATION_FAILED", "Unavailable", "REVIEW_CONVERGENCE_REOPEN_BLOCK_CAUSE_UNSAFE"),
+            ("Runtime block", {}, "review_runtime", "REVIEWER_COMMAND_FAILED", "Unavailable", "REVIEW_CONVERGENCE_REOPEN_BLOCK_CAUSE_UNSAFE"),
+            ("Side effect block", {}, "review_side_effect", "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED", "Approved", "REVIEW_CONVERGENCE_REOPEN_BLOCK_CAUSE_UNSAFE"),
+            ("Malformed block", {"reviewBlock": None}, "", "", "", "REVIEW_CONVERGENCE_REOPEN_BLOCK_MISSING"),
+        ]
+        for feature, record_updates, cause, reason, decision, expected_code in cases:
+            with self.subTest(feature=feature):
+                with self.project(implementer_mode="count") as fixture:
+                    record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, feature, 1)
+                    if record_updates.get("reviewBlock", "present") is None:
+                        record["reviewBlock"] = None
+                    else:
+                        record["status"] = record_updates.get("status", "REVIEW_BLOCKED")
+                        record["reviewBlock"]["blockCause"] = cause
+                        record["reviewBlock"]["reasonCode"] = reason
+                        record["reviewBlock"]["decision"] = decision
+                    self.mark_review_convergence_exhausted(record_path, record, candidate_sha)
+
+                    result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                        config=load_project_config(fixture.config),
+                        run_record_path=record_path,
+                        timeout_ms=300000,
+                        reopen_review_convergence=True,
+                    )
+
+                self.assertEqual("REVIEW_BLOCKED", result.status)
+                self.assertIn(expected_code, {violation.code for violation in result.violations})
+
     def test_review_changes_requested_resume_admission_survives_primary_base_drift(self):
         with self.project(implementer_mode="count") as fixture:
             record_path, record, _reviewed_candidate = self.create_review_changes_requested_blocked_run(fixture, "Drifted base review recovery", 1)
@@ -4367,7 +4579,7 @@ class CliRunTests(unittest.TestCase):
         self.git(repo, "remote", "add", "origin", str(repo))
         self.git(repo, "update-ref", "refs/remotes/origin/main", self.head(repo))
 
-    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, validation_max_recovery_reopens=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None, review_max_recovery_reopens=None):
+    def write_config(self, path, repo, *, project_id="example-project", allowed_paths=(), implementer=None, implementer_mode="success", reviewer=None, bootstrap_commands=None, validation_commands=None, validation_max_recovery_rounds=None, validation_max_recovery_reopens=None, implementation_max_recovery_rounds=None, implementation_max_recovery_reopens=None, review_max_side_effect_recovery_rounds=None, review_max_recovery_reopens=None, review_max_convergence_reopens=None):
         if implementer is None:
             runner = path.parent / "implementer.py"
             scripts = {
@@ -4428,6 +4640,8 @@ class CliRunTests(unittest.TestCase):
             config["execution_policy"]["review"]["max_side_effect_recovery_rounds"] = review_max_side_effect_recovery_rounds
         if review_max_recovery_reopens is not None:
             config["execution_policy"]["review"]["max_recovery_reopens"] = review_max_recovery_reopens
+        if review_max_convergence_reopens is not None:
+            config["execution_policy"]["review"]["max_convergence_reopens"] = review_max_convergence_reopens
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config), encoding="utf-8")
         return path
@@ -4543,6 +4757,46 @@ class CliRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         return record_path, record, candidate_sha
+
+    def mark_review_convergence_exhausted(self, record_path, record, candidate_sha):
+        attempt = {
+            "round": 1,
+            "reopenEpoch": 0,
+            "maxRounds": 1,
+            "status": "RECOVERY_IMPLEMENTER_PENDING",
+            "priorStatus": "IMPLEMENTATION_FAILED",
+            "priorExitCode": "1",
+            "priorTimedOut": False,
+            "priorStdout": "",
+            "priorStderr": "review changes requested",
+            "headBefore": candidate_sha,
+            "headAfter": candidate_sha,
+            "changedFiles": [],
+            "reasonCodes": ["REVIEW_CHANGES_REQUESTED"],
+        }
+        record["nextStage"] = "implementation_recovery"
+        record["implementationFailure"] = {
+            "status": "IMPLEMENTATION_FAILED",
+            "exitCode": "1",
+            "timedOut": False,
+            "stdout": "",
+            "stderr": "review changes requested",
+            "headBefore": candidate_sha,
+            "headAfter": candidate_sha,
+            "changedFiles": [],
+            "reasonCodes": ["REVIEW_CHANGES_REQUESTED"],
+        }
+        record["implementationRecoveryAttempts"] = [attempt]
+        record["implementationRecoveryBlock"] = {
+            "status": "BLOCKED",
+            "reasonCode": "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED",
+            "message": "implementation recovery reached the configured maximum recovery rounds",
+            "evidence": {"max_recovery_rounds": "1", "status": "IMPLEMENTATION_FAILED"},
+        }
+        if "requirements" not in record:
+            record["requirements"] = {"supplied": False, "sha256": record["authoritativeBaseSha"], "identity": "default"}
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        return attempt
 
     def create_exhausted_review_side_effect_blocked_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_BLOCKED")
