@@ -2252,22 +2252,20 @@ class RunPipeline:
                 return self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
             return PipelineOutcome("REVIEW_BLOCKED", tuple([*stages, _stage("review_resume", "BLOCKED", {"current_head": current_head})]), record, candidate=candidate, validation=validation, violations=(_violation("REVIEW_RESUME_SHA_MISMATCH", "review resume HEAD does not match validated candidate", {"current_head": current_head, "candidate_sha": candidate.candidate_sha}),))
         if not review_convergence_reopen_evidence(record, candidate_raw, validation_raw, review_raw):
-            block = record.get("implementationRecoveryBlock")
-            if isinstance(block, dict) and str(block.get("reasonCode", "")) == "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED":
-                return PipelineOutcome(
-                    "REVIEW_BLOCKED",
-                    tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "explicit_reopen_required"})]),
-                    record,
-                    candidate=candidate,
-                    validation=validation,
-                    violations=(
-                        _violation(
-                            "REVIEW_CONVERGENCE_REOPEN_REQUIRED",
-                            "exhausted review convergence recovery requires explicit human reopen",
-                            {"candidate_sha": candidate.candidate_sha, "max_rounds": str(block.get("evidence", {}).get("max_recovery_rounds", "")) if isinstance(block.get("evidence"), dict) else ""},
-                        ),
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_convergence_reopen", "BLOCKED", {"reason": "explicit_reopen_required"})]),
+                record,
+                candidate=candidate,
+                validation=validation,
+                violations=(
+                    _violation(
+                        "REVIEW_CONVERGENCE_REOPEN_REQUIRED",
+                        "exhausted review convergence recovery requires explicit human reopen",
+                        {"candidate_sha": candidate.candidate_sha, "max_rounds": str(config.execution_policy.review.max_rounds)},
                     ),
-                )
+                ),
+            )
 
         diff = _git_output(worktree, "diff", "--no-ext-diff", "--no-color", f"{record['authoritativeBaseSha']}..{candidate.candidate_sha}")
         review_scope = f"specs/{record['specNumber']}-{record['featureSlug']}"

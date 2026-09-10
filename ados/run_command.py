@@ -427,7 +427,7 @@ class RunService:
         if (
             reopen_review_convergence
             and resume is not None
-            and set(blocking_recovery) <= {"REVIEW_CHANGES_REQUESTED", "REVIEW_MAX_ROUNDS_EXCEEDED", "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+            and set(blocking_recovery) == {"REVIEW_CHANGES_REQUESTED"}
         ):
             blocking_recovery = ()
         if (

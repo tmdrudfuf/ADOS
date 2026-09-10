@@ -2707,6 +2707,75 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("REVIEW_CONVERGENCE_REOPEN_REQUIRED", self.pipeline_codes(result))
         self.assertNotIn("reviewConvergenceReopens", unchanged)
 
+    def test_pipeline_produced_review_convergence_plain_resume_requires_explicit_reopen(self):
+        with self.project(implementer_mode="count") as fixture:
+            implementer_counter = fixture.root / "implementer-count.txt"
+            validator_counter = fixture.root / "validator-count.txt"
+            reviewer_counter = fixture.root / "reviewer-count.txt"
+            validator = fixture.root / "validator.py"
+            reviewer = fixture.root / "reviewer.py"
+            validator.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{validator_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            reviewer.write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{reviewer_counter}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "print('Changes Requested')\n",
+                encoding="utf-8",
+            )
+            fixture.config = self.write_config(
+                fixture.root / "project-config.json",
+                fixture.repo,
+                implementer_mode="count",
+                reviewer=f'"{sys.executable}" "{reviewer}"',
+                validation_commands=[f'"{sys.executable}" "{validator}"'],
+            )
+            raw_config = json.loads(fixture.config.read_text(encoding="utf-8"))
+            raw_config["execution_policy"]["review"]["max_rounds"] = 1
+            fixture.config.write_text(json.dumps(raw_config), encoding="utf-8")
+
+            first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Pipeline convergence reopen", 1, fixture.config)
+            )
+            worktree = Path(first.run_record.feature_worktree)
+            record_path = worktree / ".agent-workflow" / "runs" / "001-pipeline-convergence-reopen" / "ados-run.json"
+            blocked_record = json.loads(record_path.read_text(encoding="utf-8"))
+            before_implementer_count = implementer_counter.read_text(encoding="utf-8")
+            before_validator_count = validator_counter.read_text(encoding="utf-8")
+            before_reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Pipeline convergence reopen", 1, fixture.config)
+            )
+            after_record = json.loads(record_path.read_text(encoding="utf-8"))
+            after_implementer_count = implementer_counter.read_text(encoding="utf-8")
+            after_validator_count = validator_counter.read_text(encoding="utf-8")
+            after_reviewer_count = reviewer_counter.read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_BLOCKED", blocked_record["status"])
+        self.assertEqual("review_decision", blocked_record["reviewBlock"]["blockCause"])
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", blocked_record["reviewBlock"]["reasonCode"])
+        self.assertEqual("Changes Requested", blocked_record["reviewBlock"]["decision"])
+        self.assertEqual("PASS", blocked_record["reviewBlock"]["status"])
+        self.assertEqual(blocked_record["reviewBlock"]["candidateSha"], blocked_record["reviewBlock"]["validatedSha"])
+        self.assertEqual(blocked_record["reviewBlock"]["candidateSha"], blocked_record["reviewBlock"]["reviewedSha"])
+        self.assertNotIn("implementationRecoveryBlock", blocked_record)
+        self.assertEqual("REVIEW_BLOCKED", second.status)
+        self.assertTrue(second.resumed)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_REQUIRED", self.pipeline_codes(second))
+        self.assertEqual(before_implementer_count, after_implementer_count)
+        self.assertEqual(before_validator_count, after_validator_count)
+        self.assertEqual(before_reviewer_count, after_reviewer_count)
+        self.assertNotIn("reviewConvergenceReopens", after_record)
+        self.assertEqual(blocked_record["runId"], after_record["runId"])
+
     def test_review_convergence_second_reopen_is_rejected(self):
         with self.project(implementer_mode="count") as fixture:
             record_path, record, candidate_sha = self.create_review_changes_requested_blocked_run(fixture, "Second convergence reopen", 1)
@@ -2942,7 +3011,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("Approved", result.pipeline_result.review.decision)
         self.assertIn("PR_BASE_SHA_MISMATCH", {violation.code for violation in result.pipeline_result.violations})
 
-    def test_review_changes_requested_block_reruns_review_when_head_unchanged(self):
+    def test_review_changes_requested_block_requires_reopen_when_head_unchanged(self):
         with self.project(implementer_mode="count") as fixture:
             reviewer_counter = fixture.root / "review-count.txt"
             reviewer = fixture.root / "reviewer.py"
@@ -2966,12 +3035,13 @@ class CliRunTests(unittest.TestCase):
             stages = [stage.id for stage in result.pipeline_result.stages]
 
         self.assertTrue(result.resumed)
-        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("REVIEW_BLOCKED", result.status)
         self.assertNotIn("review_changes_recovery_adoption", stages)
-        self.assertIn("review", stages)
-        self.assertEqual(reviewed_candidate, result.pipeline_result.review.reviewed_sha)
-        self.assertEqual("Approved", result.pipeline_result.review.decision)
-        self.assertEqual("Approved\n", result.pipeline_result.review.stdout)
+        self.assertNotIn("review", stages)
+        self.assertIn("review_convergence_reopen", stages)
+        self.assertIn("REVIEW_CONVERGENCE_REOPEN_REQUIRED", self.pipeline_codes(result))
+        self.assertEqual(reviewed_candidate, result.pipeline_result.candidate.candidate_sha)
+        self.assertFalse(reviewer_counter.exists())
 
     def test_review_changes_requested_recovery_blocks_dirty_new_head(self):
         with self.project(implementer_mode="count") as fixture:
