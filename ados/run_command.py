@@ -18,7 +18,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
@@ -39,6 +39,7 @@ class RunRequest:
     reopen_implementation_recovery: bool = False
     reopen_validation_recovery: bool = False
     reopen_review_side_effect_recovery: bool = False
+    reopen_review_convergence: bool = False
     prefer_implementer: str | None = None
 
 
@@ -202,6 +203,7 @@ class RunService:
             requirements,
             reopen_validation_recovery=request.reopen_validation_recovery,
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+            reopen_review_convergence=request.reopen_review_convergence,
         )
         if resume is not None:
             requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
@@ -241,6 +243,7 @@ class RunService:
             reopen_implementation_recovery=request.reopen_implementation_recovery,
             reopen_validation_recovery=request.reopen_validation_recovery,
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+            reopen_review_convergence=request.reopen_review_convergence,
         )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
@@ -258,6 +261,7 @@ class RunService:
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
                 reopen_validation_recovery=request.reopen_validation_recovery,
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+                reopen_review_convergence=request.reopen_review_convergence,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -271,6 +275,7 @@ class RunService:
                 reopen_implementation_recovery=request.reopen_implementation_recovery,
                 reopen_validation_recovery=request.reopen_validation_recovery,
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+                reopen_review_convergence=request.reopen_review_convergence,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -309,6 +314,7 @@ class RunService:
             reopen_implementation_recovery=request.reopen_implementation_recovery,
             reopen_validation_recovery=request.reopen_validation_recovery,
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
+            reopen_review_convergence=request.reopen_review_convergence,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -373,6 +379,7 @@ class RunService:
         reopen_implementation_recovery: bool = False,
         reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
+        reopen_review_convergence: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -415,6 +422,12 @@ class RunService:
             reopen_review_side_effect_recovery
             and resume is not None
             and set(blocking_recovery) == {"REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+        ):
+            blocking_recovery = ()
+        if (
+            reopen_review_convergence
+            and resume is not None
+            and set(blocking_recovery) == {"REVIEW_CHANGES_REQUESTED"}
         ):
             blocking_recovery = ()
         if (
@@ -693,6 +706,7 @@ class RunService:
         *,
         reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
+        reopen_review_convergence: bool = False,
     ) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
         primary_runs = project_path / ".agent-workflow" / "runs"
@@ -705,6 +719,7 @@ class RunService:
                 primary_runs,
                 reopen_validation_recovery=reopen_validation_recovery,
                 reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+                reopen_review_convergence=reopen_review_convergence,
             )
         )
         for record in self.worktrees.list_worktrees(project_path):
@@ -718,6 +733,7 @@ class RunService:
                     runs,
                     reopen_validation_recovery=reopen_validation_recovery,
                     reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+                    reopen_review_convergence=reopen_review_convergence,
                 )
             )
         deduped: dict[tuple[str, str], _ResumeCandidate] = {}
@@ -738,6 +754,7 @@ class RunService:
         *,
         reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
+        reopen_review_convergence: bool = False,
     ) -> list["_ResumeCandidate"]:
         candidates: list[_ResumeCandidate] = []
         if not runs.is_dir():
@@ -755,6 +772,7 @@ class RunService:
                 raw,
                 reopen_validation_recovery=reopen_validation_recovery,
                 reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
+                reopen_review_convergence=reopen_review_convergence,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -771,6 +789,7 @@ class RunService:
         *,
         reopen_validation_recovery: bool = False,
         reopen_review_side_effect_recovery: bool = False,
+        reopen_review_convergence: bool = False,
     ) -> "_ResumeCandidate | None":
         try:
             record = _record_from_mapping(raw)
@@ -783,6 +802,7 @@ class RunService:
             record.status == "REVIEW_BLOCKED"
             and not _review_blocked_is_resumable(record_path)
             and not (reopen_review_side_effect_recovery and _review_side_effect_reopen_candidate(record_path))
+            and not (reopen_review_convergence and _review_convergence_reopen_candidate(record_path))
         ):
             return None
         validation_resume_blocked = record.status == "VALIDATION_FAILED" and validation_failed_evidence(
@@ -924,6 +944,15 @@ def _review_blocked_is_resumable(record_path: Path) -> bool:
 
 def _review_side_effect_reopen_candidate(record_path: Path) -> bool:
     return not review_side_effect_recovery_reopen_evidence(
+        _read_mapping(record_path),
+        _read_mapping(record_path.with_name("candidate.json")),
+        _read_mapping(record_path.with_name("validation-runtime.json")),
+        _read_mapping(record_path.with_name("review-runtime.json")),
+    )
+
+
+def _review_convergence_reopen_candidate(record_path: Path) -> bool:
+    return not review_convergence_reopen_evidence(
         _read_mapping(record_path),
         _read_mapping(record_path.with_name("candidate.json")),
         _read_mapping(record_path.with_name("validation-runtime.json")),

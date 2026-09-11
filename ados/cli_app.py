@@ -52,6 +52,11 @@ class CliApplication:
             help="explicitly retry validation for an unchanged candidate blocked by validation recovery no-changes evidence",
         )
         run.add_argument("--reopen-review-side-effect-recovery", action="store_true")
+        run.add_argument(
+            "--reopen-review-convergence",
+            action="store_true",
+            help="explicitly reopen a bounded normal Changes Requested review/fix convergence block",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -162,6 +167,7 @@ class CliApplication:
                     reopen_implementation_recovery=args.reopen_implementation_recovery,
                     reopen_validation_recovery=args.reopen_validation_recovery,
                     reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
+                    reopen_review_convergence=args.reopen_review_convergence,
                     prefer_implementer=args.prefer_implementer,
                 )
             )
