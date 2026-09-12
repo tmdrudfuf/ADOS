@@ -29,6 +29,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--reopen-validation-recovery", completed.stdout)
         self.assertIn("--reopen-review-side-effect-recovery", completed.stdout)
         self.assertIn("--reopen-review-convergence", completed.stdout)
+        self.assertIn("--restore-failed-review-routing-state", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -4233,6 +4234,150 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("1", implementer_count)
         self.assertEqual("1", validation_count)
 
+    def test_explicit_failed_review_routing_state_restoration_is_state_only(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_review_routing_artifact_run(fixture, "Restore failed review routing")
+            original = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            plain = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Restore failed review routing", 1, fixture.config, requirements_file=state["requirements"])
+            )
+            restored = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(
+                    fixture.repo,
+                    "Restore failed review routing",
+                    1,
+                    fixture.config,
+                    requirements_file=state["requirements"],
+                    restore_failed_review_routing_state=True,
+                )
+            )
+            final_record = restored.pipeline_result.run_record
+            review = json.loads(state["record_path"].with_name("review-runtime.json").read_text(encoding="utf-8"))
+            audit = json.loads(state["record_path"].with_name("failed-review-routing-state-restoration.json").read_text(encoding="utf-8"))
+            counters = tuple(path.read_text(encoding="utf-8") for path in (state["implementer_counter"], state["review_counter"], state["validation_counter"]))
+            head = self.head(state["worktree"])
+            second = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(
+                    fixture.repo,
+                    "Restore failed review routing",
+                    1,
+                    fixture.config,
+                    requirements_file=state["requirements"],
+                    restore_failed_review_routing_state=True,
+                )
+            )
+
+        self.assertEqual("IMPLEMENTATION_FAILED", plain.status)
+        self.assertIn("FAILOVER_CANDIDATE_ALREADY_PRODUCED", self.pipeline_codes(plain))
+        self.assertEqual("REVIEW_BLOCKED", restored.status)
+        self.assertEqual("REVIEW_BLOCKED", final_record["status"])
+        self.assertEqual("implementation_recovery", final_record["nextStage"])
+        self.assertEqual("PASS", final_record["reviewBlock"]["status"])
+        self.assertEqual("Changes Requested", final_record["reviewBlock"]["decision"])
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", final_record["reviewBlock"]["reasonCode"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["candidateSha"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["validatedSha"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["reviewedSha"])
+        self.assertEqual(("1", "2", "1"), counters)
+        self.assertEqual(state["candidate_sha"], review["reviewed_sha"])
+        self.assertEqual(state["candidate_sha"], head)
+        self.assertEqual(original["implementationRecoveryBlock"], audit["previousImplementationRecoveryBlock"])
+        self.assertEqual(audit, final_record["failedReviewRoutingStateRestoration"])
+        self.assertNotIn("implementationRecoveryBlock", final_record)
+        self.assertEqual(original.get("reviewSideEffectRecoveryAttempts", []), final_record.get("reviewSideEffectRecoveryAttempts", []))
+        self.assertEqual(original.get("reviewSideEffectRecoveryReopens", []), final_record.get("reviewSideEffectRecoveryReopens", []))
+        self.assertEqual(original.get("reviewConvergenceReopens", []), final_record.get("reviewConvergenceReopens", []))
+        self.assertEqual(original.get("implementationRecoveryAttempts", []), final_record.get("implementationRecoveryAttempts", []))
+        self.assertEqual(original.get("implementationRecoveryReopens", []), final_record.get("implementationRecoveryReopens", []))
+        self.assertEqual(original.get("validationRecoveryAttempts", []), final_record.get("validationRecoveryAttempts", []))
+        self.assertEqual(original.get("validationRecoveryReopens", []), final_record.get("validationRecoveryReopens", []))
+        self.assertEqual(original["requirements"], final_record["requirements"])
+        self.assertEqual(original["agentAssignment"], final_record["agentAssignment"])
+        self.assertNotIn("implementer", [stage.id for stage in restored.pipeline_result.stages])
+        self.assertNotIn("validation", [stage.id for stage in restored.pipeline_result.stages])
+        self.assertNotIn("review", [stage.id for stage in restored.pipeline_result.stages])
+        self.assertEqual("IMPLEMENTATION_FAILED", second.status)
+        self.assertIn("FAILED_REVIEW_ROUTING_RESTORE_ALREADY_APPLIED", self.pipeline_codes(second))
+
+    def test_failed_review_routing_state_restoration_rejects_inexact_evidence(self):
+        mutations = (
+            ("wrong_failover_reason", "FAILED_REVIEW_ROUTING_RESTORE_FAILOVER_BLOCK_INVALID"),
+            ("wrong_review_decision", "FAILED_REVIEW_ROUTING_RESTORE_REVIEW_INVALID"),
+            ("failed_review", "FAILED_REVIEW_ROUTING_RESTORE_REVIEW_INVALID"),
+            ("malformed_review", "FAILED_REVIEW_ROUTING_RESTORE_ARTIFACT_MALFORMED"),
+            ("review_sha", "FAILED_REVIEW_ROUTING_RESTORE_REVIEW_SHA_MISMATCH"),
+            ("failed_validation", "FAILED_REVIEW_ROUTING_RESTORE_VALIDATION_INVALID"),
+            ("changed_files", "FAILED_REVIEW_ROUTING_RESTORE_IMPLEMENTER_EVIDENCE_MISMATCH"),
+            ("implementer_head", "FAILED_REVIEW_ROUTING_RESTORE_IMPLEMENTER_EVIDENCE_MISMATCH"),
+            ("requirements", "FAILED_REVIEW_ROUTING_RESTORE_REQUIREMENTS_MISMATCH"),
+            ("roles", "FAILED_REVIEW_ROUTING_RESTORE_ROLES_MISMATCH"),
+            ("run_identity", "FAILED_REVIEW_ROUTING_RESTORE_RUN_IDENTITY_MISMATCH"),
+            ("unrelated_failure", "FAILED_REVIEW_ROUTING_RESTORE_AUTHORIZATION_INVALID"),
+        )
+        for mutation, expected_code in mutations:
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_failed_review_routing_artifact_run(fixture, f"Reject routing restore {mutation}")
+                record_path = state["record_path"]
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                review_path = record_path.with_name("review-runtime.json")
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                validation_path = record_path.with_name("validation-runtime.json")
+                validation = json.loads(validation_path.read_text(encoding="utf-8"))
+                implementer_path = record_path.with_name("implementer-runtime.json")
+                implementer = json.loads(implementer_path.read_text(encoding="utf-8"))
+                if mutation == "wrong_failover_reason":
+                    record["implementationRecoveryBlock"]["reasonCode"] = "OTHER_FAILURE"
+                elif mutation == "wrong_review_decision":
+                    review["decision"] = "Approved"
+                elif mutation == "failed_review":
+                    review["status"] = "BLOCK"
+                elif mutation == "malformed_review":
+                    review["exit_code"] = "not-an-integer"
+                elif mutation == "review_sha":
+                    review["reviewed_sha"] = record["authoritativeBaseSha"]
+                elif mutation == "failed_validation":
+                    validation["status"] = "BLOCK"
+                elif mutation == "changed_files":
+                    implementer["result"]["changedFiles"] = ["unexpected.txt"]
+                elif mutation == "implementer_head":
+                    implementer["result"]["headAfter"] = record["authoritativeBaseSha"]
+                elif mutation == "requirements":
+                    record["reviewSideEffectRecoveryReopen"]["requirementsSha"] = "0" * 64
+                elif mutation == "roles":
+                    record["reviewSideEffectRecoveryReopen"]["pinnedReviewer"] = "claude -p"
+                elif mutation == "run_identity":
+                    record["reviewSideEffectRecoveryReopen"]["runId"] = "other-run"
+                elif mutation == "unrelated_failure":
+                    record.pop("reviewSideEffectRecoveryReopenAuthorization")
+                record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+                review_path.write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8")
+                validation_path.write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
+                implementer_path.write_text(json.dumps(implementer, indent=2, sort_keys=True), encoding="utf-8")
+                outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=record_path,
+                    timeout_ms=300000,
+                    restore_failed_review_routing_state=True,
+                )
+
+                self.assertEqual("IMPLEMENTATION_FAILED", outcome.status)
+                self.assertIn(expected_code, [violation.code for violation in outcome.violations])
+                self.assertFalse(record_path.with_name("failed-review-routing-state-restoration.json").exists())
+
+    def test_failed_review_routing_state_restoration_rejects_dirty_worktree(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_review_routing_artifact_run(fixture, "Reject dirty routing restore")
+            (state["worktree"] / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=state["record_path"],
+                timeout_ms=300000,
+                restore_failed_review_routing_state=True,
+            )
+
+        self.assertEqual("IMPLEMENTATION_FAILED", outcome.status)
+        self.assertIn("FAILED_REVIEW_ROUTING_RESTORE_WORKTREE_DIRTY", [violation.code for violation in outcome.violations])
+
     def test_failed_reviewer_dirty_side_effect_reopen_rejects_unsafe_evidence(self):
         for mutation, expected_code in (
             ("validation", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED"),
@@ -5192,6 +5337,71 @@ class CliRunTests(unittest.TestCase):
             "validation_counter": validation_counter,
             "implementer_counter": fixture.root / "implementer-count.txt",
         }
+
+    def create_failed_review_routing_artifact_run(self, fixture, feature):
+        state = self.create_failed_reviewer_dirty_side_effect_run(fixture, feature, second_decision="Changes Requested")
+        self.git(state["worktree"], "restore", "--", "implementation.txt")
+        stopped = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+            RunRequest(
+                fixture.repo,
+                feature,
+                1,
+                fixture.config,
+                requirements_file=state["requirements"],
+                reopen_review_side_effect_recovery=True,
+            )
+        )
+        self.assertEqual("REVIEW_BLOCKED", stopped.status)
+        record_path = state["record_path"]
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        candidate_sha = state["candidate_sha"]
+        record["status"] = "IMPLEMENTATION_FAILED"
+        record["nextStage"] = "human_intervention"
+        record.pop("reviewBlock", None)
+        record.pop("implementationFailure", None)
+        record["implementationRecoveryBlock"] = {
+            "status": "BLOCKED",
+            "reasonCode": "FAILOVER_CANDIDATE_ALREADY_PRODUCED",
+            "message": "cannot switch implementer without discarding or ambiguously transferring committed or in-progress feature work",
+            "evidence": {
+                "category": "TRANSIENT_RUNTIME_UNAVAILABLE",
+                "base_sha": record["authoritativeBaseSha"],
+                "head_before": candidate_sha,
+                "head_after": candidate_sha,
+                "changed_files": "",
+            },
+        }
+        assignment = record["agentAssignment"]
+        record["agentAvailabilityEvents"] = [
+            {
+                "agentId": assignment["implementerId"],
+                "role": "implementer",
+                "category": "TRANSIENT_RUNTIME_UNAVAILABLE",
+                "state": "unavailable",
+                "sequence": assignment["sequence"],
+                "timestamp": "2026-09-12T08:23:09+00:00",
+            }
+        ]
+        implementer_runtime = {
+            "status": "IMPLEMENTATION_FAILED",
+            "result": {
+                "runtimeId": "failed-review-routing-artifact",
+                "runId": record["runId"],
+                "status": "IMPLEMENTATION_FAILED",
+                "exitCode": 1,
+                "timedOut": False,
+                "stdout": "",
+                "stderr": "ConnectionRefused",
+                "headBefore": candidate_sha,
+                "headAfter": candidate_sha,
+                "changedFiles": [],
+                "runtimeFailureCategory": "TRANSIENT_RUNTIME_UNAVAILABLE",
+                "violations": [{"code": "IMPLEMENTER_COMMAND_FAILED", "message": "implementer exited nonzero", "evidence": {"exit_code": "1"}}],
+            },
+        }
+        record_path.with_name("implementer-runtime.json").write_text(json.dumps(implementer_runtime, indent=2, sort_keys=True), encoding="utf-8")
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        return state
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")

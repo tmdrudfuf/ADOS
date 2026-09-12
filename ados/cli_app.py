@@ -57,6 +57,11 @@ class CliApplication:
             action="store_true",
             help="explicitly reopen a bounded normal Changes Requested review/fix convergence block",
         )
+        run.add_argument(
+            "--restore-failed-review-routing-state",
+            action="store_true",
+            help="restore an exact failed-review reopen routing artifact without running any agent stage",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -168,6 +173,7 @@ class CliApplication:
                     reopen_validation_recovery=args.reopen_validation_recovery,
                     reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
                     reopen_review_convergence=args.reopen_review_convergence,
+                    restore_failed_review_routing_state=args.restore_failed_review_routing_state,
                     prefer_implementer=args.prefer_implementer,
                 )
             )
