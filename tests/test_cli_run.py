@@ -4108,6 +4108,171 @@ class CliRunTests(unittest.TestCase):
         self.assertFalse(result.resumed)
         self.assertIn("ACTIVE_WORKTREE_PRESENT", self.codes(result))
 
+    def test_failed_reviewer_dirty_side_effect_requires_explicit_clean_reopen_and_retries_only_review(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_reviewer_dirty_side_effect_run(fixture, "Explicit failed review side effect")
+            first = state["first"]
+            record_path = state["record_path"]
+            worktree = state["worktree"]
+            original = json.loads(record_path.read_text(encoding="utf-8"))
+
+            plain = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Explicit failed review side effect", 1, fixture.config, requirements_file=state["requirements"])
+            )
+            dirty_explicit = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Explicit failed review side effect", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
+            )
+            self.git(worktree, "restore", "--", "implementation.txt")
+            clean_plain = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Explicit failed review side effect", 1, fixture.config, requirements_file=state["requirements"])
+            )
+            reopened = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Explicit failed review side effect", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
+            )
+            final_record = reopened.pipeline_result.run_record
+            reopen = final_record["reviewSideEffectRecoveryReopen"]
+            review_count = state["review_counter"].read_text(encoding="utf-8")
+            implementer_count = state["implementer_counter"].read_text(encoding="utf-8")
+            validation_count = state["validation_counter"].read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", first.status)
+        self.assertEqual("REVIEW_SIDE_EFFECT_DIRTY_WORKTREE", original["reviewBlock"]["reasonCode"])
+        self.assertEqual("BLOCKED", plain.status)
+        self.assertFalse(plain.resumed)
+        self.assertEqual("REVIEW_BLOCKED", dirty_explicit.status)
+        self.assertTrue(dirty_explicit.resumed)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_WORKTREE_DIRTY", self.pipeline_codes(dirty_explicit))
+        self.assertEqual("BLOCKED", clean_plain.status)
+        self.assertFalse(clean_plain.resumed)
+        self.assertEqual("COMPLETE", reopened.status)
+        self.assertTrue(reopened.resumed)
+        self.assertEqual("2", review_count)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("1", validation_count)
+        self.assertEqual(original["runId"], final_record["runId"])
+        self.assertEqual(original["featureBranch"], final_record["featureBranch"])
+        self.assertEqual(original["featureWorktree"], final_record["featureWorktree"])
+        self.assertEqual(original["requirements"], final_record["requirements"])
+        self.assertEqual(original["agentAssignment"], final_record["agentAssignment"])
+        self.assertEqual(state["candidate_sha"], reopened.pipeline_result.candidate.candidate_sha)
+        self.assertEqual(state["candidate_sha"], reopened.pipeline_result.validation.head_after)
+        self.assertEqual(state["candidate_sha"], reopened.pipeline_result.review.reviewed_sha)
+        self.assertEqual("failed_reviewer_dirty_side_effect", reopen["mode"])
+        self.assertEqual("review", reopen["selectedNextStage"])
+        self.assertEqual("BLOCK", reopen["previousReviewStatus"])
+        self.assertEqual(1, reopen["previousReviewExitCode"])
+        self.assertNotIn("validation", [stage.id for stage in reopened.pipeline_result.stages])
+        self.assertNotIn("implementer", [stage.id for stage in reopened.pipeline_result.stages])
+
+    def test_failed_reviewer_dirty_side_effect_reopen_does_not_bypass_changes_requested(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_reviewer_dirty_side_effect_run(fixture, "Failed side effect then changes", second_decision="Changes Requested")
+            self.git(state["worktree"], "restore", "--", "implementation.txt")
+            result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Failed side effect then changes", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
+            )
+            review_count = state["review_counter"].read_text(encoding="utf-8")
+            implementer_count = state["implementer_counter"].read_text(encoding="utf-8")
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("3", review_count)
+        self.assertEqual("2", implementer_count)
+        self.assertIn("implementer", [stage.id for stage in result.pipeline_result.stages])
+
+    def test_failed_reviewer_dirty_side_effect_reopen_continues_durably_after_authorization(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_reviewer_dirty_side_effect_run(fixture, "Durable failed side effect authorization")
+            self.git(state["worktree"], "restore", "--", "implementation.txt")
+            config = load_project_config(fixture.config)
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            original = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            authorized = pipeline._reopen_review_side_effect_recovery(config, state["record_path"], original, [])
+            continued = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Durable failed side effect authorization", 1, fixture.config, requirements_file=state["requirements"])
+            )
+            review_count = state["review_counter"].read_text(encoding="utf-8")
+            implementer_count = state["implementer_counter"].read_text(encoding="utf-8")
+            validation_count = state["validation_counter"].read_text(encoding="utf-8")
+
+        self.assertIsInstance(authorized, dict)
+        self.assertEqual("READY_FOR_REVIEW", authorized["status"])
+        self.assertEqual("review", authorized["nextStage"])
+        self.assertEqual("COMPLETE", continued.status)
+        self.assertTrue(continued.resumed)
+        self.assertEqual("2", review_count)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("1", validation_count)
+
+    def test_failed_reviewer_dirty_side_effect_reopen_rejects_unsafe_evidence(self):
+        for mutation, expected_code in (
+            ("validation", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED"),
+            ("sha", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_BLOCK_SHA_MISMATCH"),
+            ("decision", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_DECISION_PRESENT"),
+            ("quota", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_RUNTIME_CATEGORY_UNSAFE"),
+            ("role", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEWER_MISMATCH"),
+        ):
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                feature = f"Unsafe failed side effect {mutation}"
+                state = self.create_failed_reviewer_dirty_side_effect_run(fixture, feature)
+                self.git(state["worktree"], "restore", "--", "implementation.txt")
+                if mutation == "validation":
+                    validation = json.loads(state["record_path"].with_name("validation-runtime.json").read_text(encoding="utf-8"))
+                    validation["status"] = "BLOCK"
+                    state["record_path"].with_name("validation-runtime.json").write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
+                else:
+                    record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+                    review = json.loads(state["record_path"].with_name("review-runtime.json").read_text(encoding="utf-8"))
+                    if mutation == "sha":
+                        record["reviewBlock"]["reviewedSha"] = record["authoritativeBaseSha"]
+                    elif mutation == "decision":
+                        review["stdout"] = "Changes Requested\n"
+                    elif mutation == "quota":
+                        review["violations"][0]["evidence"]["runtime_category"] = "QUOTA_EXHAUSTED"
+                        record["reviewBlock"]["runtimeCategory"] = "QUOTA_EXHAUSTED"
+                    else:
+                        record["reviewBlock"]["reviewer"] = "different reviewer"
+                    state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+                    state["record_path"].with_name("review-runtime.json").write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8")
+                config = load_project_config(fixture.config)
+                outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=config,
+                    run_record_path=state["record_path"],
+                    timeout_ms=1000,
+                    reopen_review_side_effect_recovery=True,
+                )
+
+            self.assertEqual("REVIEW_BLOCKED", outcome.status)
+            self.assertIn(expected_code, {violation.code for violation in outcome.violations})
+
+    def test_failed_reviewer_dirty_side_effect_reopen_uses_existing_numeric_ceiling(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_failed_reviewer_dirty_side_effect_run(fixture, "Bounded failed review side effect")
+            self.git(state["worktree"], "restore", "--", "implementation.txt")
+            state["reviewer"].write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{state['review_counter']}')\n"
+                "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+                "counter.write_text(str(value + 1), encoding='utf-8')\n"
+                "Path('implementation.txt').write_text('another failed reviewer side effect', encoding='utf-8')\n"
+                "print('reviewer process failed again', file=sys.stderr)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            first_reopen = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Bounded failed review side effect", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
+            )
+            self.git(state["worktree"], "restore", "--", "implementation.txt")
+            second_reopen = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                RunRequest(fixture.repo, "Bounded failed review side effect", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
+            )
+            review_count = state["review_counter"].read_text(encoding="utf-8")
+
+        self.assertEqual("REVIEW_BLOCKED", first_reopen.status)
+        self.assertEqual("REVIEW_BLOCKED", second_reopen.status)
+        self.assertIn("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_MAX_ROUNDS_EXCEEDED", self.pipeline_codes(second_reopen))
+        self.assertEqual("2", review_count)
+
     def test_repeated_review_side_effect_respects_recovery_bound(self):
         with self.project() as fixture:
             reviewer = fixture.root / "reviewer.py"
@@ -4934,6 +5099,69 @@ class CliRunTests(unittest.TestCase):
             encoding="utf-8",
         )
         return record_path, record, old_sha, new_sha
+
+    def create_failed_reviewer_dirty_side_effect_run(self, fixture, feature, *, second_decision="Approved"):
+        review_counter = fixture.root / "failed-side-effect-review-count.txt"
+        validation_counter = fixture.root / "failed-side-effect-validation-count.txt"
+        reviewer = fixture.root / "failed-side-effect-reviewer.py"
+        validator = fixture.root / "failed-side-effect-validator.py"
+        reviewer.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"counter = Path(r'{review_counter}')\n"
+            "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+            "counter.write_text(str(value + 1), encoding='utf-8')\n"
+            "if value == 0:\n"
+            "    Path('implementation.txt').write_text('failed reviewer side effect', encoding='utf-8')\n"
+            "    print('reviewer process failed', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+            f"print({second_decision!r} if value == 1 else 'Approved')\n",
+            encoding="utf-8",
+        )
+        validator.write_text(
+            "from pathlib import Path\n"
+            f"counter = Path(r'{validation_counter}')\n"
+            "value = int(counter.read_text(encoding='utf-8')) if counter.exists() else 0\n"
+            "counter.write_text(str(value + 1), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        fixture.config = self.write_config(
+            fixture.root / "project-config.json",
+            fixture.repo,
+            implementer_mode="count",
+            reviewer=f'"{sys.executable}" "{reviewer}"',
+            validation_commands=[f'"{sys.executable}" "{validator}"'],
+        )
+        raw_config = json.loads(fixture.config.read_text(encoding="utf-8"))
+        raw_config["execution_policy"]["agent_roles"] = {
+            "mode": "adaptive",
+            "agents": {
+                "claude": raw_config["roles"]["implementer"],
+                "codex": raw_config["roles"]["reviewer"],
+            },
+            "implementer_preference": ["claude", "codex"],
+            "reviewer_preference": ["codex", "claude"],
+        }
+        fixture.config.write_text(json.dumps(raw_config), encoding="utf-8")
+        requirements = fixture.root / "failed-side-effect-requirements.md"
+        requirements.write_text("preserve exact candidate and independent review\n", encoding="utf-8")
+        first = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+            RunRequest(fixture.repo, feature, 1, fixture.config, requirements_file=requirements, prefer_implementer="claude")
+        )
+        worktree = Path(first.run_record.feature_worktree)
+        record_path = worktree / ".agent-workflow" / "runs" / f"001-{first.run_record.feature_slug}" / "ados-run.json"
+        candidate_sha = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))["candidate_sha"]
+        return {
+            "first": first,
+            "record_path": record_path,
+            "worktree": worktree,
+            "candidate_sha": candidate_sha,
+            "requirements": requirements,
+            "reviewer": reviewer,
+            "review_counter": review_counter,
+            "validation_counter": validation_counter,
+            "implementer_counter": fixture.root / "implementer-count.txt",
+        }
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
