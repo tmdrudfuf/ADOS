@@ -4167,17 +4167,47 @@ class CliRunTests(unittest.TestCase):
     def test_failed_reviewer_dirty_side_effect_reopen_does_not_bypass_changes_requested(self):
         with self.project(implementer_mode="count") as fixture:
             state = self.create_failed_reviewer_dirty_side_effect_run(fixture, "Failed side effect then changes", second_decision="Changes Requested")
+            original = json.loads(state["record_path"].read_text(encoding="utf-8"))
             self.git(state["worktree"], "restore", "--", "implementation.txt")
             result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
                 RunRequest(fixture.repo, "Failed side effect then changes", 1, fixture.config, requirements_file=state["requirements"], reopen_review_side_effect_recovery=True)
             )
+            final_record = result.pipeline_result.run_record
+            candidate = json.loads(state["record_path"].with_name("candidate.json").read_text(encoding="utf-8"))
+            validation = json.loads(state["record_path"].with_name("validation-runtime.json").read_text(encoding="utf-8"))
+            review = json.loads(state["record_path"].with_name("review-runtime.json").read_text(encoding="utf-8"))
             review_count = state["review_counter"].read_text(encoding="utf-8")
             implementer_count = state["implementer_counter"].read_text(encoding="utf-8")
+            validation_count = state["validation_counter"].read_text(encoding="utf-8")
 
-        self.assertEqual("COMPLETE", result.status)
-        self.assertEqual("3", review_count)
-        self.assertEqual("2", implementer_count)
-        self.assertIn("implementer", [stage.id for stage in result.pipeline_result.stages])
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertEqual("2", review_count)
+        self.assertEqual("1", implementer_count)
+        self.assertEqual("1", validation_count)
+        self.assertEqual("REVIEW_BLOCKED", final_record["status"])
+        self.assertEqual("implementation_recovery", final_record["nextStage"])
+        self.assertEqual("PASS", final_record["reviewBlock"]["status"])
+        self.assertEqual("Changes Requested", final_record["reviewBlock"]["decision"])
+        self.assertEqual("REVIEW_CHANGES_REQUESTED", final_record["reviewBlock"]["reasonCode"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["candidateSha"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["validatedSha"])
+        self.assertEqual(state["candidate_sha"], final_record["reviewBlock"]["reviewedSha"])
+        self.assertEqual(state["candidate_sha"], candidate["candidate_sha"])
+        self.assertEqual(state["candidate_sha"], validation["head_before"])
+        self.assertEqual(state["candidate_sha"], validation["head_after"])
+        self.assertEqual("PASS", review["status"])
+        self.assertEqual("Changes Requested", review["decision"])
+        self.assertEqual(state["candidate_sha"], review["reviewed_sha"])
+        self.assertEqual(1, len(final_record["reviewSideEffectRecoveryReopens"]))
+        self.assertEqual(original.get("reviewSideEffectRecoveryAttempts", []), final_record.get("reviewSideEffectRecoveryAttempts", []))
+        self.assertEqual(original.get("implementationRecoveryAttempts", []), final_record.get("implementationRecoveryAttempts", []))
+        self.assertEqual(original.get("implementationRecoveryReopens", []), final_record.get("implementationRecoveryReopens", []))
+        self.assertEqual(original["reviewBlock"], final_record["reviewSideEffectRecoveryReopen"]["previousBlock"])
+        stages = [stage.id for stage in result.pipeline_result.stages]
+        self.assertNotIn("implementer", stages)
+        self.assertNotIn("implementer_fix", stages)
+        self.assertNotIn("implementation_recovery_implementer", stages)
+        self.assertNotIn("validation", stages)
 
     def test_failed_reviewer_dirty_side_effect_reopen_continues_durably_after_authorization(self):
         with self.project(implementer_mode="count") as fixture:

@@ -2370,6 +2370,22 @@ class RunPipeline:
             _write_review_block_status(run_record_path, record, review, candidate, validation)
             return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), candidate=candidate, validation=validation, review=review, violations=tuple(_from_review(item) for item in review.violations))
         if review.decision == "Changes Requested":
+            if explicit_failed_side_effect_reopen:
+                _write_review_block_status(run_record_path, record, review, candidate, validation)
+                violation = _violation(
+                    "REVIEW_CHANGES_REQUESTED",
+                    "independent review requested changes; implementation requires a separate continuation",
+                    {"candidate_sha": candidate.candidate_sha, "reviewed_sha": review.reviewed_sha},
+                )
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple(stages),
+                    _read_json(run_record_path),
+                    candidate=candidate,
+                    validation=validation,
+                    review=review,
+                    violations=(violation,),
+                )
             _write_status(run_record_path, record, "READY_FOR_IMPLEMENTATION")
             return _prepend_stages(self.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms), tuple(stages))
         if review.decision != "Approved":
