@@ -344,7 +344,7 @@ class RunPipeline:
             if resumed is not None:
                 return resumed
         if record.get("status") == "REVIEW_BLOCKED" and reopen_review_side_effect_recovery:
-            reopened = self._reopen_exhausted_review_side_effect_recovery(config, run_record_path, record, stages)
+            reopened = self._reopen_review_side_effect_recovery(config, run_record_path, record, stages)
             if isinstance(reopened, PipelineOutcome):
                 return reopened
             record = reopened
@@ -359,6 +359,21 @@ class RunPipeline:
             stages.append(_stage("review_convergence_reopen", "PASS", {"reopen": str(_review_convergence_reopen_count(record)), "candidate_sha": str(record.get("reviewConvergenceReopen", {}).get("candidateSha", ""))}))
         if record.get("status") == "REVIEW_BLOCKED":
             return self._resume_review(config, run_record_path, record, stages, timeout_ms)
+        if record.get("status") == "READY_FOR_REVIEW":
+            continuation_violations = failed_review_side_effect_reopen_continuation_evidence(
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+            )
+            if continuation_violations:
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {"reason": "continuation_invalid"})]),
+                    record,
+                    violations=continuation_violations,
+                )
+            return self._resume_review(config, run_record_path, record, stages, timeout_ms, explicit_failed_side_effect_reopen=True)
         if record.get("status") == "VALIDATION_FAILED":
             candidate_artifact = _read_run_artifact(run_record_path, record, "candidate.json")
             validation_artifact = _read_run_artifact(run_record_path, record, "validation-runtime.json")
@@ -1786,7 +1801,7 @@ class RunPipeline:
         _write_json(run_record_path, updated)
         return updated
 
-    def _reopen_exhausted_review_side_effect_recovery(
+    def _reopen_review_side_effect_recovery(
         self,
         config: ProjectConfig,
         run_record_path: Path,
@@ -1815,6 +1830,7 @@ class RunPipeline:
                 record,
                 violations=(_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_EVIDENCE_INVALID", "review side-effect recovery reopen requires candidate, validation, and review evidence", {}),),
             )
+        failed_reviewer_side_effect = _failed_reviewer_side_effect_reopen_mode(record)
 
         worktree = Path(str(record.get("featureWorktree", "")))
         required = ("runId", "projectId", "featureBranch", "featureWorktree", "primaryRepository", "authoritativeBaseSha")
@@ -1854,6 +1870,15 @@ class RunPipeline:
                 violations=(_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_WORKTREE_DIRTY", "review side-effect recovery reopen requires a clean feature worktree", {"staged": ",".join(status.staged), "dirty": ",".join(status.dirty_tracked), "untracked": ",".join(status.untracked)}),),
             )
 
+        independence = _review_independence_violation(record, adaptive_roles=config.execution_policy.agent_roles is not None)
+        if independence is not None:
+            return PipelineOutcome(
+                "REVIEW_BLOCKED",
+                tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {"reason": "reviewer_independence"})]),
+                record,
+                violations=(independence,),
+            )
+
         guardian = self.guardian.audit(
             policy=config.execution_policy,
             repository_path=Path(str(record.get("primaryRepository", ""))),
@@ -1876,6 +1901,13 @@ class RunPipeline:
                     tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {"current_head": current_head})]),
                     record,
                     violations=(_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_BASE_STALE", "review side-effect recovery reopen requires current HEAD to descend from recorded authoritative base", {"base": str(record.get("authoritativeBaseSha", "")), "current_head": current_head}),),
+                )
+            if failed_reviewer_side_effect and current_head != candidate.candidate_sha:
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple([*stages, _stage("review_side_effect_recovery_reopen", "BLOCKED", {"current_head": current_head})]),
+                    record,
+                    violations=(_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_EXACT_HEAD_MISMATCH", "failed-review side-effect reopen requires current HEAD to remain the exact validated candidate", {"candidate_sha": candidate.candidate_sha, "current_head": current_head}),),
                 )
             if not self.git.is_ancestor(worktree, candidate.candidate_sha, current_head):
                 return PipelineOutcome(
@@ -1920,11 +1952,18 @@ class RunPipeline:
         _write_json(review_archive, review_artifact)
         block = record.get("reviewBlock") if isinstance(record.get("reviewBlock"), dict) else {}
         attempts = _review_side_effect_recovery_attempts(record)
+        selected_next_stage = "review" if failed_reviewer_side_effect else "validation"
+        reopen_reason = (
+            "explicit_human_reopen_after_failed_reviewer_dirty_side_effect"
+            if failed_reviewer_side_effect
+            else "explicit_human_reopen_after_review_side_effect_recovery_exhaustion"
+        )
         reopen = {
             "round": reopen_number,
             "maxReopens": max_reopens,
             "status": "REOPENED",
-            "reason": "explicit_human_reopen_after_review_side_effect_recovery_exhaustion",
+            "mode": "failed_reviewer_dirty_side_effect" if failed_reviewer_side_effect else "exhausted_side_effect_recovery",
+            "reason": reopen_reason,
             "reopenedAt": _utc_now(),
             "runId": str(record.get("runId", "")),
             "projectId": str(record.get("projectId", "")),
@@ -1935,32 +1974,50 @@ class RunPipeline:
             "previousValidatedSha": validation.head_after,
             "previousReviewedSha": review.reviewed_sha,
             "previousReviewDecision": review.decision,
+            "previousReviewStatus": review.status,
+            "previousReviewExitCode": review.exit_code,
             "adoptedCandidateSha": current_head,
             "adoptedChangedFiles": list(changed_files),
+            "requirementsSha": str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
+            "pinnedImplementer": str(record.get("implementer", "")),
+            "pinnedReviewer": str(record.get("reviewer", "")),
+            "pinnedAgentAssignment": record.get("agentAssignment") if isinstance(record.get("agentAssignment"), dict) else None,
             "previousBlock": block,
             "previousRecoveryAttempts": attempts,
             "previousRecoveryAttemptCount": len(attempts),
             "previousCandidateArtifact": str(candidate_archive),
             "previousValidationArtifact": str(validation_archive),
             "previousReviewArtifact": str(review_archive),
-            "selectedNextStage": "validation",
+            "selectedNextStage": selected_next_stage,
         }
         reopens = [*existing_reopens, reopen]
         updated = dict(record)
-        updated["status"] = "READY_FOR_VALIDATION"
-        updated["nextStage"] = "validation"
+        updated["status"] = "READY_FOR_REVIEW" if failed_reviewer_side_effect else "READY_FOR_VALIDATION"
+        updated["nextStage"] = selected_next_stage
         updated["reviewSideEffectRecoveryReopens"] = reopens
         updated["reviewSideEffectRecoveryReopen"] = reopen
         updated["reviewSideEffectRecoveryAttempts"] = attempts
-        updated["reviewSideEffectRecoveryReopenAdoption"] = {
-            "status": "ADOPTED",
-            "runId": str(record.get("runId", "")),
-            "previousReviewedCandidateSha": candidate.candidate_sha,
-            "adoptedCandidateSha": current_head,
-            "adoptedChangedFiles": list(changed_files),
-            "reason": "clean_new_head_after_review_side_effect_recovery_exhaustion",
-        }
-        _clear_resolved_recovery_fields(updated, "READY_FOR_VALIDATION")
+        if failed_reviewer_side_effect:
+            updated["reviewSideEffectRecoveryReopenAuthorization"] = {
+                "status": "AUTHORIZED",
+                "mode": "failed_reviewer_dirty_side_effect",
+                "runId": str(record.get("runId", "")),
+                "candidateSha": candidate.candidate_sha,
+                "validatedSha": validation.head_after,
+                "reviewedSha": review.reviewed_sha,
+                "reopenRound": reopen_number,
+                "requirementsSha": reopen["requirementsSha"],
+            }
+        else:
+            updated["reviewSideEffectRecoveryReopenAdoption"] = {
+                "status": "ADOPTED",
+                "runId": str(record.get("runId", "")),
+                "previousReviewedCandidateSha": candidate.candidate_sha,
+                "adoptedCandidateSha": current_head,
+                "adoptedChangedFiles": list(changed_files),
+                "reason": "clean_new_head_after_review_side_effect_recovery_exhaustion",
+            }
+        _clear_resolved_recovery_fields(updated, updated["status"])
         _write_json(run_record_path.with_name(f"review-side-effect-recovery-reopen-{reopen_number}.json"), reopen)
         _write_json(run_record_path.with_name("candidate.json"), {"status": "COMMITTED", "candidate_sha": current_head, "changed_files": list(changed_files)})
         _write_json(run_record_path, updated)
@@ -2174,7 +2231,16 @@ class RunPipeline:
             return self._publish(config, run_record_path, record, stages, (), None, candidate_result, validation_result, review_result, exact.to_dict())
         return PipelineOutcome("PUBLICATION_BLOCKED", tuple([*stages, _stage("publication_resume", "BLOCKED", {})]), record, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("PUBLICATION_RESUME_EVIDENCE_INVALID", "publication resume requires a committed candidate, passed validation, and approved review", {"candidate_status": candidate_result.status, "validation_status": validation_result.status, "review_decision": review_result.decision}),))
 
-    def _resume_review(self, config: ProjectConfig, run_record_path: Path, record: dict[str, Any], stages: list[PipelineStage], timeout_ms: int) -> PipelineOutcome:
+    def _resume_review(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        timeout_ms: int,
+        *,
+        explicit_failed_side_effect_reopen: bool = False,
+    ) -> PipelineOutcome:
         candidate_raw = _read_json(run_record_path.with_name("candidate.json"))
         validation_raw = _read_json(run_record_path.with_name("validation-runtime.json"))
         review_raw = _read_json(run_record_path.with_name("review-runtime.json"))
@@ -2185,7 +2251,7 @@ class RunPipeline:
             candidate = _candidate_from_mapping(candidate_raw) or CandidatePreparationResult("NO_CHANGES", str(record.get("authoritativeBaseSha", "")), ())
             return self._finalize_no_changes(config, run_record_path, record, [*stages, _stage("no_change_recovery", "PASS", {"candidate_sha": candidate.candidate_sha})], (), None, CandidatePreparationResult("NO_CHANGES", candidate.candidate_sha, candidate.changed_files))
         resumable = transient_review_blocked_evidence(candidate_raw, validation_raw, review_raw)
-        if resumable:
+        if resumable and not explicit_failed_side_effect_reopen:
             review_runtime_resume = review_runtime_unavailable_evidence(record, candidate_raw, validation_raw, review_raw)
             changes_requested_resume = review_changes_requested_evidence(record, candidate_raw, validation_raw, review_raw, run_record_path)
             side_effect_resume_gate = review_side_effect_recovery_evidence(record, candidate_raw, validation_raw, review_raw)
@@ -3880,7 +3946,10 @@ def review_side_effect_recovery_reopen_evidence(record: Any, candidate: Any, val
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_BLOCK_MISSING", "review side-effect recovery reopen requires durable review block evidence", {}),)
     if str(block.get("blockCause", "")) != "review_side_effect":
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_BLOCK_CAUSE_UNSAFE", "review side-effect recovery reopen requires review_side_effect block cause", {"blockCause": str(block.get("blockCause", ""))}),)
-    if str(block.get("reasonCode", "")) != "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED":
+    reason_code = str(block.get("reasonCode", ""))
+    if reason_code == "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE":
+        return _failed_reviewer_dirty_side_effect_reopen_evidence(record, candidate, validation, review)
+    if reason_code != "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED":
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_NOT_EXHAUSTED", "review side-effect recovery reopen requires exhausted side-effect recovery block", {"reasonCode": str(block.get("reasonCode", ""))}),)
     reason_codes = block.get("reasonCodes", [])
     if reason_codes not in ([], ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"]):
@@ -3918,6 +3987,103 @@ def review_side_effect_recovery_reopen_evidence(record: Any, candidate: Any, val
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_ATTEMPTS_NOT_EXHAUSTED", "review side-effect recovery reopen requires exhausted prior attempts for the blocked review cycle", {"attempts": str(len(cycle_attempts)), "max_rounds": "", "review_cycle_key": cycle_key}),)
     if len(cycle_attempts) < max_rounds:
         return (_violation("REVIEW_SIDE_EFFECT_RECOVERY_REOPEN_ATTEMPTS_NOT_EXHAUSTED", "review side-effect recovery reopen requires exhausted prior attempts for the blocked review cycle", {"attempts": str(len(cycle_attempts)), "max_rounds": str(max_rounds), "review_cycle_key": cycle_key}),)
+    return ()
+
+
+def _failed_reviewer_side_effect_reopen_mode(record: dict[str, Any]) -> bool:
+    block = record.get("reviewBlock")
+    return isinstance(block, dict) and str(block.get("reasonCode", "")) == "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"
+
+
+def _failed_reviewer_dirty_side_effect_reopen_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    block = record.get("reviewBlock") if isinstance(record, dict) else None
+    if not isinstance(block, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_BLOCK_MISSING", "failed-review side-effect reopen requires durable review block evidence", {}),)
+    if str(block.get("blockCause", "")) != "review_side_effect" or str(block.get("reasonCode", "")) != "REVIEW_SIDE_EFFECT_DIRTY_WORKTREE":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_BLOCK_CAUSE_UNSAFE", "failed-review side-effect reopen requires the exact dirty-worktree review-side-effect block", {"blockCause": str(block.get("blockCause", "")), "reasonCode": str(block.get("reasonCode", ""))}),)
+    if block.get("reasonCodes") not in ([], ["REVIEW_SIDE_EFFECT_DIRTY_WORKTREE"]):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REASON_CODES_UNSAFE", "failed-review side-effect reopen requires only dirty-worktree side-effect reason codes", {}),)
+    if str(block.get("reviewer", "")) != str(record.get("reviewer", "")):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEWER_MISMATCH", "failed-review side-effect reopen must preserve the durable pinned reviewer", {"block_reviewer": str(block.get("reviewer", "")), "record_reviewer": str(record.get("reviewer", ""))}),)
+    assignment = record.get("agentAssignment")
+    if isinstance(assignment, dict):
+        if str(assignment.get("reviewerCommand", "")) != str(record.get("reviewer", "")) or str(assignment.get("implementerCommand", "")) != str(record.get("implementer", "")):
+            return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_ASSIGNMENT_MISMATCH", "failed-review side-effect reopen requires durable role commands to match the pinned assignment", {}),)
+
+    candidate_result = _candidate_from_mapping(candidate)
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_CANDIDATE_INVALID", "failed-review side-effect reopen requires committed candidate evidence", {}),)
+    if not isinstance(validation, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_MISSING", "failed-review side-effect reopen requires validation evidence", {}),)
+    validation_result = _validation_from_mapping(validation)
+    if validation_result.status != "PASS":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED", "failed-review side-effect reopen requires previously passed validation", {"status": validation_result.status}),)
+    if validation_result.head_before != candidate_result.candidate_sha or validation_result.head_after != candidate_result.candidate_sha:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_SHA_MISMATCH", "failed-review side-effect reopen validation evidence must match the exact candidate", {"candidate_sha": candidate_result.candidate_sha, "head_before": validation_result.head_before, "head_after": validation_result.head_after}),)
+    if not isinstance(review, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEW_MISSING", "failed-review side-effect reopen requires failed reviewer evidence", {}),)
+    review_result = _review_from_mapping(review)
+    if review_result.status != "BLOCK" or review_result.decision != "Unavailable" or review_result.exit_code == 0:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEW_STATE_UNSAFE", "failed-review side-effect reopen requires an honestly failed, unavailable reviewer process", {"status": review_result.status, "decision": review_result.decision, "exit_code": str(review_result.exit_code)}),)
+    if review_result.reviewed_sha != candidate_result.candidate_sha:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEW_SHA_MISMATCH", "failed-review side-effect reopen review target must match the exact candidate", {"candidate_sha": candidate_result.candidate_sha, "reviewed_sha": review_result.reviewed_sha}),)
+    if parse_review_decision(review_result.stdout) != "Unavailable":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_DECISION_PRESENT", "failed-review side-effect reopen cannot bypass an Approved or Changes Requested reviewer decision", {}),)
+    if tuple(item.code for item in review_result.violations) != ("REVIEWER_COMMAND_FAILED",):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_REVIEW_CODES_UNSAFE", "failed-review side-effect reopen requires only REVIEWER_COMMAND_FAILED runtime evidence", {"codes": ",".join(item.code for item in review_result.violations)}),)
+    runtime_category = _review_runtime_category(review_result)
+    if runtime_category != "UNKNOWN_RUNTIME_FAILURE":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_RUNTIME_CATEGORY_UNSAFE", "failed-review side-effect reopen is limited to an unknown non-timeout runtime failure tied to the dirty-worktree block", {"runtimeCategory": runtime_category}),)
+
+    block_shas = (str(block.get("candidateSha", "")), str(block.get("validatedSha", "")), str(block.get("reviewedSha", "")))
+    expected_sha = candidate_result.candidate_sha
+    if block_shas != (expected_sha, expected_sha, expected_sha):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_BLOCK_SHA_MISMATCH", "failed-review side-effect reopen durable block SHA evidence must converge on the exact candidate", {"candidate_sha": expected_sha, "block_candidate_sha": block_shas[0], "block_validated_sha": block_shas[1], "block_reviewed_sha": block_shas[2]}),)
+    if str(block.get("status", "")) != "BLOCK" or str(block.get("decision", "")) != "Unavailable":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_BLOCK_STATE_UNSAFE", "failed-review side-effect reopen requires the durable block to preserve the failed unavailable review state", {"status": str(block.get("status", "")), "decision": str(block.get("decision", ""))}),)
+    if str(block.get("exitCode", "")) != str(review_result.exit_code):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_EXIT_CODE_MISMATCH", "failed-review side-effect reopen durable block exit code must match reviewer evidence", {"block_exit_code": str(block.get("exitCode", "")), "review_exit_code": str(review_result.exit_code)}),)
+    if str(block.get("timedOut", "False")) != "False" or str(block.get("transient", "False")) != "False":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_PROCESS_UNSAFE", "failed-review side-effect reopen does not accept timeout or transient runtime recovery states", {}),)
+    if str(block.get("runtimeCategory", "")) != runtime_category:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_RUNTIME_CATEGORY_MISMATCH", "failed-review side-effect reopen durable runtime category must match reviewer evidence", {"blockRuntimeCategory": str(block.get("runtimeCategory", "")), "reviewRuntimeCategory": runtime_category}),)
+    return ()
+
+
+def failed_review_side_effect_reopen_continuation_evidence(record: Any, candidate: Any, validation: Any, review: Any) -> tuple[PipelineViolation, ...]:
+    if not isinstance(record, dict) or str(record.get("status", "")) != "READY_FOR_REVIEW" or str(record.get("nextStage", "")) != "review":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_INVALID", "failed-review side-effect continuation requires READY_FOR_REVIEW durable state", {"status": str(record.get("status", "")) if isinstance(record, dict) else ""}),)
+    reopen = record.get("reviewSideEffectRecoveryReopen")
+    authorization = record.get("reviewSideEffectRecoveryReopenAuthorization")
+    if not isinstance(reopen, dict) or not isinstance(authorization, dict):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_EVIDENCE_MISSING", "failed-review side-effect continuation requires durable reopen and authorization evidence", {}),)
+    if str(reopen.get("status", "")) != "REOPENED" or str(reopen.get("mode", "")) != "failed_reviewer_dirty_side_effect" or str(reopen.get("selectedNextStage", "")) != "review":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_REOPEN_UNSAFE", "failed-review side-effect continuation requires the explicit failed-review reopen mode", {}),)
+    if str(authorization.get("status", "")) != "AUTHORIZED" or str(authorization.get("mode", "")) != "failed_reviewer_dirty_side_effect":
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_AUTHORIZATION_UNSAFE", "failed-review side-effect continuation authorization is missing or malformed", {}),)
+    if str(reopen.get("runId", "")) != str(record.get("runId", "")) or str(authorization.get("runId", "")) != str(record.get("runId", "")):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_RUN_MISMATCH", "failed-review side-effect continuation must preserve the same durable run", {}),)
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if str(reopen.get("requirementsSha", "")) != requirements_sha or str(authorization.get("requirementsSha", "")) != requirements_sha:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_REQUIREMENTS_MISMATCH", "failed-review side-effect continuation must preserve requirements identity", {}),)
+    if str(reopen.get("pinnedImplementer", "")) != str(record.get("implementer", "")) or str(reopen.get("pinnedReviewer", "")) != str(record.get("reviewer", "")):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_ROLES_MISMATCH", "failed-review side-effect continuation must preserve pinned role commands", {}),)
+    assignment = record.get("agentAssignment") if isinstance(record.get("agentAssignment"), dict) else None
+    if reopen.get("pinnedAgentAssignment") != assignment:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_ASSIGNMENT_MISMATCH", "failed-review side-effect continuation must preserve the pinned agent assignment", {}),)
+    previous_block = reopen.get("previousBlock")
+    prior_record = {**record, "status": "REVIEW_BLOCKED", "nextStage": "review", "reviewBlock": previous_block}
+    prior_violations = _failed_reviewer_dirty_side_effect_reopen_evidence(prior_record, candidate, validation, review)
+    if prior_violations:
+        return prior_violations
+    candidate_result = _candidate_from_mapping(candidate)
+    validation_result = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+    review_result = _review_from_mapping(review) if isinstance(review, dict) else None
+    if candidate_result is None or validation_result is None or review_result is None:
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_ARTIFACTS_INVALID", "failed-review side-effect continuation requires candidate, validation, and review artifacts", {}),)
+    expected_sha = candidate_result.candidate_sha
+    if any(str(authorization.get(key, "")) != expected_sha for key in ("candidateSha", "validatedSha", "reviewedSha")):
+        return (_violation("REVIEW_SIDE_EFFECT_FAILED_RUNTIME_CONTINUATION_SHA_MISMATCH", "failed-review side-effect continuation authorization must remain exact-SHA bound", {"candidate_sha": expected_sha}),)
     return ()
 
 
