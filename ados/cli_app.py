@@ -62,6 +62,11 @@ class CliApplication:
             action="store_true",
             help="restore an exact failed-review reopen routing artifact without running any agent stage",
         )
+        run.add_argument(
+            "--continue-restored-review-changes",
+            action="store_true",
+            help="explicitly continue the deferred Changes Requested handoff from an exact restored routing state",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -174,6 +179,7 @@ class CliApplication:
                     reopen_review_side_effect_recovery=args.reopen_review_side_effect_recovery,
                     reopen_review_convergence=args.reopen_review_convergence,
                     restore_failed_review_routing_state=args.restore_failed_review_routing_state,
+                    continue_restored_review_changes=args.continue_restored_review_changes,
                     prefer_implementer=args.prefer_implementer,
                 )
             )

@@ -41,6 +41,7 @@ class RunRequest:
     reopen_review_side_effect_recovery: bool = False
     reopen_review_convergence: bool = False
     restore_failed_review_routing_state: bool = False
+    continue_restored_review_changes: bool = False
     prefer_implementer: str | None = None
 
 
@@ -265,6 +266,7 @@ class RunService:
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
                 reopen_review_convergence=request.reopen_review_convergence,
                 restore_failed_review_routing_state=request.restore_failed_review_routing_state,
+                continue_restored_review_changes=request.continue_restored_review_changes,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -280,6 +282,7 @@ class RunService:
                 reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
                 reopen_review_convergence=request.reopen_review_convergence,
                 restore_failed_review_routing_state=request.restore_failed_review_routing_state,
+                continue_restored_review_changes=request.continue_restored_review_changes,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -320,6 +323,7 @@ class RunService:
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             reopen_review_convergence=request.reopen_review_convergence,
             restore_failed_review_routing_state=request.restore_failed_review_routing_state,
+            continue_restored_review_changes=request.continue_restored_review_changes,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
