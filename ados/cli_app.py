@@ -67,6 +67,11 @@ class CliApplication:
             action="store_true",
             help="explicitly continue the deferred Changes Requested handoff from an exact restored routing state",
         )
+        run.add_argument(
+            "--retry-pinned-implementer",
+            action="store_true",
+            help="explicitly retry the unchanged pinned implementer within the active recovery epoch",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -180,6 +185,7 @@ class CliApplication:
                     reopen_review_convergence=args.reopen_review_convergence,
                     restore_failed_review_routing_state=args.restore_failed_review_routing_state,
                     continue_restored_review_changes=args.continue_restored_review_changes,
+                    retry_pinned_implementer=args.retry_pinned_implementer,
                     prefer_implementer=args.prefer_implementer,
                 )
             )
