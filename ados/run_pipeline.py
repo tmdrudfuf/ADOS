@@ -308,6 +308,7 @@ class RunPipeline:
         reopen_review_side_effect_recovery: bool = False,
         reopen_review_convergence: bool = False,
         restore_failed_review_routing_state: bool = False,
+        continue_restored_review_changes: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -321,6 +322,23 @@ class RunPipeline:
 
         if restore_failed_review_routing_state:
             return self._restore_failed_review_routing_state(config, run_record_path, record, stages)
+
+        if continue_restored_review_changes:
+            continued = self._continue_restored_review_changes(config, run_record_path, record, stages)
+            if isinstance(continued, PipelineOutcome):
+                return continued
+            record = continued
+            authorization = record.get("restoredReviewChangesContinuation", {})
+            stages.append(
+                _stage(
+                    "restored_review_changes_continuation",
+                    "PASS",
+                    {
+                        "candidate_sha": str(authorization.get("candidateSha", "")),
+                        "implementation_recovery_epoch": str(authorization.get("implementationRecoveryEpoch", "")),
+                    },
+                )
+            )
 
         orphaned_adoption = record.get("orphanedCandidateAdoption")
         if (
@@ -2099,6 +2117,87 @@ class RunPipeline:
             review=review,
             violations=(violation,),
         )
+
+    def _continue_restored_review_changes(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+    ) -> dict[str, Any] | PipelineOutcome:
+        candidate_raw = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation_raw = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review_raw = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer_raw = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        restoration_raw = _read_json(run_record_path.with_name("failed-review-routing-state-restoration.json"))
+        violations = restored_review_changes_continuation_evidence(
+            self.git,
+            config,
+            run_record_path,
+            record,
+            candidate_raw,
+            validation_raw,
+            review_raw,
+            implementer_raw,
+            restoration_raw,
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "REVIEW_BLOCKED")),
+                tuple([*stages, _stage("restored_review_changes_continuation", "BLOCKED", {})]),
+                record,
+                violations=violations,
+            )
+
+        candidate = _candidate_from_mapping(candidate_raw)
+        validation = _validation_from_mapping(validation_raw)
+        review = _review_from_mapping(review_raw)
+        assert candidate is not None and validation is not None and review is not None
+        epoch = _implementation_recovery_epoch(record)
+        attempt_count = _implementation_recovery_attempt_count(record)
+        review_block = record["reviewBlock"]
+        assignment = record["agentAssignment"]
+        primary_audit_path = (
+            Path(str(record["primaryRepository"]))
+            / ".agent-workflow"
+            / "runs"
+            / f"{record['specNumber']}-{record['featureSlug']}"
+            / "restored-review-changes-continuation.json"
+        )
+        authorization = {
+            "status": "AUTHORIZED",
+            "authorization": "EXPLICIT_OPERATOR_REQUEST",
+            "authorizedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(record.get("featureWorktree", "")),
+            "requirementsSha": str(record.get("requirements", {}).get("sha256", "")),
+            "candidateSha": candidate.candidate_sha,
+            "validatedSha": validation.head_after,
+            "reviewedSha": review.reviewed_sha,
+            "reviewDecision": review.decision,
+            "selectedNextStage": "implementation_handoff",
+            "implementationRecoveryEpoch": epoch,
+            "implementationRecoveryAttemptCount": attempt_count,
+            "implementationRecoveryAttemptLimit": config.execution_policy.implementation.max_recovery_rounds,
+            "implementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "reviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "pinnedImplementer": str(record.get("implementer", "")),
+            "pinnedReviewer": str(record.get("reviewer", "")),
+            "pinnedAgentAssignment": assignment,
+            "previousReviewBlock": review_block,
+            "sourceFailedReviewRoutingStateRestoration": record["failedReviewRoutingStateRestoration"],
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        updated["restoredReviewChangesContinuation"] = authorization
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "implementation_handoff"
+        updated.pop("reviewBlock", None)
+        _write_json(run_record_path.with_name("restored-review-changes-continuation.json"), authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        return updated
 
     def _reopen_review_convergence(
         self,
@@ -4323,6 +4422,214 @@ def failed_review_routing_state_restoration_evidence(
         reject("FAILED_REVIEW_ROUTING_RESTORE_ARTIFACT_MISSING", "routing-state restoration requires all exact durable artifacts")
     elif newer_evidence:
         reject("FAILED_REVIEW_ROUTING_RESTORE_NEWER_EVIDENCE_CONFLICT", "candidate, validation, or review evidence is newer than the failed implementer artifact")
+
+    return tuple(violations)
+
+
+def restored_review_changes_continuation_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+    restoration_artifact: Any,
+) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+
+    if not isinstance(record, dict):
+        return (_violation("RESTORED_REVIEW_CHANGES_CONTINUATION_RECORD_INVALID", "restored review continuation requires a durable run record", {}),)
+    if str(record.get("status", "")) != "REVIEW_BLOCKED" or str(record.get("nextStage", "")) != "implementation_recovery":
+        reject(
+            "RESTORED_REVIEW_CHANGES_CONTINUATION_STATE_INVALID",
+            "restored review continuation requires the exact deferred Changes Requested state",
+            {"status": str(record.get("status", "")), "next_stage": str(record.get("nextStage", ""))},
+        )
+    continuation_path = run_record_path.with_name("restored-review-changes-continuation.json")
+    if "restoredReviewChangesContinuation" in record or continuation_path.exists():
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ALREADY_USED", "restored review continuation may be authorized only once")
+
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_BLOCK_MISSING", "restored review continuation requires durable review block evidence")
+        block = {}
+    if (
+        str(block.get("status", "")) != "PASS"
+        or str(block.get("decision", "")) != "Changes Requested"
+        or str(block.get("reasonCode", "")) != "REVIEW_CHANGES_REQUESTED"
+        or str(block.get("blockCause", "")) != "review_decision"
+        or str(block.get("resumeStage", "")) != "implementation_recovery"
+        or str(block.get("baseSha", "")) != str(record.get("authoritativeBaseSha", ""))
+        or block.get("reasonCodes", []) not in ([], ["REVIEW_CHANGES_REQUESTED"])
+        or str(block.get("exitCode", "")) != "0"
+        or block.get("timedOut") is not False
+        or block.get("transient") is not False
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_BLOCK_INVALID", "restored review continuation requires the exact successful Changes Requested review block")
+
+    candidate_result = _candidate_from_mapping(candidate)
+    try:
+        validation_result = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        review_result = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (AttributeError, TypeError, ValueError):
+        validation_result = None
+        review_result = None
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ARTIFACT_MALFORMED", "restored review continuation requires well-formed candidate, validation, and review artifacts")
+    if candidate_result is None or candidate_result.status != "COMMITTED":
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_CANDIDATE_INVALID", "restored review continuation requires a committed candidate")
+    if validation_result is None or validation_result.status != "PASS":
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_VALIDATION_INVALID", "restored review continuation requires passed validation evidence")
+    if review_result is None or review_result.status != "PASS" or review_result.decision != "Changes Requested" or review_result.exit_code != 0:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_REVIEW_INVALID", "restored review continuation requires a successful Changes Requested review")
+
+    exact_sha = candidate_result.candidate_sha if candidate_result is not None else ""
+    if not exact_sha:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_SHA_MISSING", "restored review continuation requires an exact candidate SHA")
+    if validation_result is not None and (validation_result.head_before != exact_sha or validation_result.head_after != exact_sha):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_VALIDATION_SHA_MISMATCH", "validation evidence must match the exact candidate")
+    if review_result is not None and review_result.reviewed_sha != exact_sha:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_REVIEW_SHA_MISMATCH", "review evidence must match the exact candidate")
+    if any(str(block.get(key, "")) != exact_sha for key in ("candidateSha", "validatedSha", "reviewedSha")):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_BLOCK_SHA_MISMATCH", "review block evidence must match the exact candidate")
+
+    restoration = record.get("failedReviewRoutingStateRestoration")
+    if not isinstance(restoration, dict) or not isinstance(restoration_artifact, dict) or restoration != restoration_artifact:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_RESTORATION_MISSING", "restored review continuation requires matching durable restoration audit evidence")
+        restoration = {}
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if (
+        str(restoration.get("status", "")) != "RESTORED"
+        or str(restoration.get("authorization", "")) != "EXPLICIT_OPERATOR_REQUEST"
+        or str(restoration.get("restoredStatus", "")) != "REVIEW_BLOCKED"
+        or str(restoration.get("restoredNextStage", "")) != "implementation_recovery"
+        or str(restoration.get("reviewDecision", "")) != "Changes Requested"
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_RESTORATION_INVALID", "restoration audit does not authorize this exact deferred review state")
+    if (
+        str(restoration.get("runId", "")) != str(record.get("runId", ""))
+        or str(restoration.get("featureBranch", "")) != str(record.get("featureBranch", ""))
+        or Path(str(restoration.get("featureWorktree", ""))).resolve() != Path(str(record.get("featureWorktree", ""))).resolve()
+        or str(restoration.get("requirementsSha", "")) != requirements_sha
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_IDENTITY_MISMATCH", "restoration audit must match run, branch, worktree, and requirements identity")
+    if any(str(restoration.get(key, "")) != exact_sha for key in ("candidateSha", "validatedSha", "reviewedSha")):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_RESTORATION_SHA_MISMATCH", "restoration audit must match the exact reviewed candidate")
+
+    assignment = record.get("agentAssignment") if isinstance(record.get("agentAssignment"), dict) else None
+    source_reopen = restoration.get("sourceReviewSideEffectRecoveryReopen") if isinstance(restoration, dict) else None
+    if assignment is None or _positive_int_from_mapping(assignment, "sequence") is None:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ASSIGNMENT_INVALID", "restored review continuation requires a pinned assignment sequence")
+    elif (
+        str(assignment.get("implementerCommand", "")) != str(record.get("implementer", ""))
+        or str(assignment.get("reviewerCommand", "")) != str(record.get("reviewer", ""))
+        or not str(assignment.get("candidateOwnerId", ""))
+        or str(assignment.get("candidateOwnerId", "")) != str(assignment.get("implementerId", ""))
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ASSIGNMENT_MISMATCH", "pinned roles and candidate ownership must remain unchanged")
+    if not isinstance(source_reopen, dict) or source_reopen != record.get("reviewSideEffectRecoveryReopen"):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_SOURCE_REOPEN_MISMATCH", "restored review continuation must remain tied to the failed-review side-effect reopen")
+    elif (
+        str(source_reopen.get("mode", "")) != "failed_reviewer_dirty_side_effect"
+        or str(source_reopen.get("status", "")) != "REOPENED"
+        or str(source_reopen.get("runId", "")) != str(record.get("runId", ""))
+        or str(source_reopen.get("projectId", "")) != str(record.get("projectId", ""))
+        or str(source_reopen.get("authoritativeBaseSha", "")) != str(record.get("authoritativeBaseSha", ""))
+        or Path(str(source_reopen.get("featureWorktree", ""))).resolve() != Path(str(record.get("featureWorktree", ""))).resolve()
+        or str(source_reopen.get("featureBranch", "")) != str(record.get("featureBranch", ""))
+        or str(source_reopen.get("requirementsSha", "")) != requirements_sha
+        or str(source_reopen.get("pinnedImplementer", "")) != str(record.get("implementer", ""))
+        or str(source_reopen.get("pinnedReviewer", "")) != str(record.get("reviewer", ""))
+        or source_reopen.get("pinnedAgentAssignment") != assignment
+        or str(source_reopen.get("adoptedCandidateSha", "")) != exact_sha
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_SOURCE_REOPEN_INVALID", "source reopen evidence must preserve the exact run, roles, ownership, requirements, and candidate")
+
+    prior_block = restoration.get("previousImplementationRecoveryBlock") if isinstance(restoration, dict) else None
+    prior_evidence = prior_block.get("evidence") if isinstance(prior_block, dict) else None
+    result = implementer.get("result") if isinstance(implementer, dict) else None
+    if (
+        not isinstance(prior_block, dict)
+        or str(prior_block.get("reasonCode", "")) != "FAILOVER_CANDIDATE_ALREADY_PRODUCED"
+        or not isinstance(prior_evidence, dict)
+        or str(prior_evidence.get("category", "")) != "TRANSIENT_RUNTIME_UNAVAILABLE"
+        or str(prior_evidence.get("base_sha", "")) != str(record.get("authoritativeBaseSha", ""))
+        or str(prior_evidence.get("head_before", "")) != exact_sha
+        or str(prior_evidence.get("head_after", "")) != exact_sha
+        or str(prior_evidence.get("changed_files", "")) != ""
+        or not isinstance(result, dict)
+        or str(result.get("runId", "")) != str(record.get("runId", ""))
+        or str(result.get("status", "")) != "IMPLEMENTATION_FAILED"
+        or _positive_int_from_mapping(result, "exitCode") is None
+        or result.get("timedOut") is not False
+        or str(result.get("runtimeFailureCategory", "")) != "TRANSIENT_RUNTIME_UNAVAILABLE"
+        or str(result.get("headBefore", "")) != exact_sha
+        or str(result.get("headAfter", "")) != exact_sha
+        or result.get("changedFiles") != []
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_IMPLEMENTATION_HISTORY_CONFLICT", "historical implementer evidence must remain the unchanged downstream routing artifact")
+    if "implementationRecoveryBlock" in record or "implementationFailure" in record:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_CURRENT_IMPLEMENTATION_CONFLICT", "restored review continuation rejects newer live implementation failure evidence")
+    events = record.get("agentAvailabilityEvents")
+    last_event = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else None
+    if assignment is not None and (
+        not isinstance(last_event, dict)
+        or str(last_event.get("agentId", "")) != str(assignment.get("implementerId", ""))
+        or str(last_event.get("category", "")) != "TRANSIENT_RUNTIME_UNAVAILABLE"
+        or _positive_int_from_mapping(last_event, "sequence") != _positive_int_from_mapping(assignment, "sequence")
+    ):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_AVAILABILITY_MISMATCH", "historical availability evidence must remain tied to the failed pinned implementer")
+
+    epoch = _implementation_recovery_epoch(record)
+    try:
+        attempt_count = _implementation_recovery_attempt_count(record)
+    except (TypeError, ValueError):
+        attempt_count = 0
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ATTEMPT_HISTORY_INVALID", "implementation recovery attempt history must be well formed")
+    max_attempts = config.execution_policy.implementation.max_recovery_rounds
+    implementation_reopens = record.get("implementationRecoveryReopens")
+    convergence_reopens = record.get("reviewConvergenceReopens")
+    if not isinstance(implementation_reopens, list) or len(implementation_reopens) != config.execution_policy.implementation.max_recovery_reopens:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_IMPLEMENTATION_REOPEN_STATE_INVALID", "implementation recovery reopen history must remain exactly exhausted")
+    if not isinstance(convergence_reopens, list) or len(convergence_reopens) != config.execution_policy.review.max_convergence_reopens:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_CONVERGENCE_STATE_INVALID", "review convergence reopen history must remain exactly exhausted")
+    all_reopens = [item for items in (implementation_reopens, convergence_reopens) if isinstance(items, list) for item in items if isinstance(item, dict)]
+    if epoch <= 0 or not any(_positive_int_from_mapping(item, "newEpoch") == epoch for item in all_reopens):
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_EPOCH_INVALID", "restored review continuation requires an existing active implementation recovery epoch")
+    if attempt_count <= 0 or attempt_count >= max_attempts:
+        reject(
+            "RESTORED_REVIEW_CHANGES_CONTINUATION_CAPACITY_EXHAUSTED",
+            "active implementation recovery epoch must have remaining attempt capacity",
+            {"epoch": str(epoch), "attempts": str(attempt_count), "max_attempts": str(max_attempts)},
+        )
+
+    worktree = Path(str(record.get("featureWorktree", "")))
+    try:
+        status = git.status(worktree)
+        current_head = git.current_head(worktree)
+        branch = git.current_branch(worktree)
+    except RepositoryProviderError as exc:
+        reject(exc.code, exc.message, {"worktree": str(worktree)})
+    else:
+        if status.root != worktree.resolve() or branch != str(record.get("featureBranch", "")):
+            reject("RESTORED_REVIEW_CHANGES_CONTINUATION_WORKTREE_IDENTITY_MISMATCH", "feature worktree and branch must match durable identity")
+        if status.staged or status.dirty_tracked or status.untracked:
+            reject("RESTORED_REVIEW_CHANGES_CONTINUATION_WORKTREE_DIRTY", "restored review continuation requires a clean feature worktree")
+        if current_head != exact_sha:
+            reject("RESTORED_REVIEW_CHANGES_CONTINUATION_HEAD_MISMATCH", "current HEAD must match the exact reviewed candidate")
+
+    restoration_path = run_record_path.with_name("failed-review-routing-state-restoration.json")
+    artifact_paths = [run_record_path.with_name(name) for name in ("candidate.json", "validation-runtime.json", "review-runtime.json", "implementer-runtime.json")]
+    try:
+        restoration_time = restoration_path.stat().st_mtime_ns
+        if any(path.stat().st_mtime_ns > restoration_time for path in artifact_paths):
+            reject("RESTORED_REVIEW_CHANGES_CONTINUATION_NEWER_EVIDENCE_CONFLICT", "candidate, validation, review, or implementation evidence changed after restoration")
+    except OSError:
+        reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ARTIFACT_MISSING", "restored review continuation requires all durable evidence artifacts")
 
     return tuple(violations)
 
