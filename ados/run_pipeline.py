@@ -309,6 +309,7 @@ class RunPipeline:
         reopen_review_convergence: bool = False,
         restore_failed_review_routing_state: bool = False,
         continue_restored_review_changes: bool = False,
+        retry_pinned_implementer: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -339,6 +340,26 @@ class RunPipeline:
                     },
                 )
             )
+
+        if retry_pinned_implementer:
+            violations = pinned_implementer_retry_evidence(
+                self.git,
+                config,
+                run_record_path,
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+                _read_run_artifact(run_record_path, record, "implementer-runtime.json"),
+                _read_json(run_record_path.with_name("restored-review-changes-continuation.json")),
+            )
+            if violations:
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("pinned_implementer_retry", "BLOCKED", {})]),
+                    record,
+                    violations=violations,
+                )
 
         orphaned_adoption = record.get("orphanedCandidateAdoption")
         if (
@@ -437,6 +458,13 @@ class RunPipeline:
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
         implementation_recovery_reopened = review_convergence_reopened
+        if retry_pinned_implementer:
+            retried = self._retry_pinned_implementer(config, run_record_path, record, stages, bootstrap, timeout_ms)
+            if isinstance(retried, PipelineOutcome):
+                return retried
+            implementer_result, record = retried
+        else:
+            implementer_result = None
         if record.get("status") in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"}:
             blocked = _implementation_recovery_block_violation(record)
             if blocked is not None:
@@ -455,7 +483,7 @@ class RunPipeline:
                 implementation_recovery_reopened = True
                 stages.append(_stage("implementation_recovery_reopen", "PASS", {"reopen": str(_implementation_recovery_reopen_count(record))}))
 
-        if record.get("status") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "VALIDATION_FAILED"}:
+        if implementer_result is None and record.get("status") in {"READY_FOR_IMPLEMENTATION", "IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT", "VALIDATION_FAILED"}:
             if implementation_recovery_reopened:
                 prior_failure = _review_convergence_prior_failure(record) if review_convergence_reopened else _implementer_outcome_from_record_failure(run_record_path, record)
                 recovery = self._recover_implementation_failure(config, run_record_path, record, stages, bootstrap, prior_failure, timeout_ms)
@@ -471,7 +499,7 @@ class RunPipeline:
                     if isinstance(recovery, PipelineOutcome):
                         return recovery
                     implementer_result, record = recovery
-        else:
+        elif implementer_result is None:
             implementer_result = None
             stages.append(_stage("implementer", "SKIPPED", {"status": str(record.get("status", ""))}))
 
@@ -818,6 +846,136 @@ class RunPipeline:
         next_record = _read_json(run_record_path) or retry.run_record or updated
         stages.append(_stage("implementer_failover_run", retry.status, {"implementer": new_assignment.implementer_id}))
         return retry, next_record
+
+    def _retry_pinned_implementer(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        timeout_ms: int,
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        """Consume one current-epoch slot and retry the unchanged pinned owner."""
+
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        continuation = _read_json(run_record_path.with_name("restored-review-changes-continuation.json"))
+        violations = pinned_implementer_retry_evidence(
+            self.git, config, run_record_path, record, candidate, validation, review, implementer, continuation
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "IMPLEMENTATION_FAILED")),
+                tuple([*stages, _stage("pinned_implementer_retry", "BLOCKED", {})]),
+                record,
+                bootstrap=bootstrap,
+                violations=violations,
+            )
+
+        source = _implementer_outcome_from_artifact(implementer, record)
+        assert source.result is not None
+        epoch = _implementation_recovery_epoch(record)
+        round_number = _implementation_recovery_attempt_count(record) + 1
+        max_rounds = config.execution_policy.implementation.max_recovery_rounds
+        failure_key = _pinned_retry_failure_key(record, implementer)
+        assignment = record["agentAssignment"]
+        prior_block = record["implementationRecoveryBlock"]
+        artifact_name = f"pinned-implementer-retry-{epoch}-{round_number}-{failure_key[:12]}.json"
+        primary_audit_path = (
+            Path(str(record["primaryRepository"]))
+            / ".agent-workflow"
+            / "runs"
+            / f"{record['specNumber']}-{record['featureSlug']}"
+            / artifact_name
+        )
+        authorization = {
+            "status": "CONSUMED",
+            "authorization": "EXPLICIT_OPERATOR_REQUEST",
+            "authorizedAt": _utc_now(),
+            "consumedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(record.get("featureWorktree", "")),
+            "requirementsSha": str(record.get("requirements", {}).get("sha256", "")),
+            "candidateSha": str(candidate.get("candidate_sha", "")),
+            "validatedSha": str(validation.get("head_after", "")),
+            "reviewedSha": str(review.get("reviewed_sha", "")),
+            "sourceRuntimeId": source.result.runtime_id,
+            "sourceFailureKey": failure_key,
+            "sourceAvailabilityEvent": _external_availability_events(record)[-1],
+            "implementationRecoveryEpoch": epoch,
+            "implementationRecoveryRound": round_number,
+            "implementationRecoveryAttemptLimit": max_rounds,
+            "implementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "reviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "pinnedImplementer": str(record.get("implementer", "")),
+            "pinnedReviewer": str(record.get("reviewer", "")),
+            "pinnedAgentAssignment": assignment,
+            "previousImplementationRecoveryBlock": prior_block,
+            "sourceRestoredReviewChangesContinuation": continuation,
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        authorizations = updated.get("pinnedImplementerRetryAuthorizations")
+        authorization_history = list(authorizations) if isinstance(authorizations, list) else []
+        authorization_history.append(authorization)
+        updated["pinnedImplementerRetryAuthorizations"] = authorization_history
+        updated["pinnedImplementerRetryAuthorization"] = authorization
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "implementation_handoff"
+        _write_json(run_record_path.with_name(artifact_name), authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        _append_implementation_recovery_attempt(run_record_path, updated, source, round_number, max_rounds)
+        stages.append(
+            _stage(
+                "pinned_implementer_retry",
+                "PASS",
+                {"implementer": str(assignment.get("implementerId", "")), "epoch": str(epoch), "round": str(round_number)},
+            )
+        )
+
+        retry = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+        _update_implementation_recovery_attempt(
+            run_record_path,
+            round_number,
+            {
+                "recoveryImplementerStatus": retry.status,
+                "recoveryImplementerViolationCodes": [item.code for item in retry.violations],
+                "headAfterRecovery": _implementer_result_head_after(retry),
+                "changedFilesAfterRecovery": list(_implementer_result_changed_files(retry)),
+            },
+            reopen_epoch=epoch,
+        )
+        next_record = _read_json(run_record_path) or retry.run_record or updated
+        stages.append(_stage("pinned_implementer_retry_run", retry.status, {"epoch": str(epoch), "round": str(round_number)}))
+        if retry.status == "READY_FOR_VALIDATION":
+            _update_implementation_recovery_attempt(
+                run_record_path, round_number, {"status": "READY_FOR_VALIDATION"}, reopen_epoch=epoch
+            )
+            return retry, _read_json(run_record_path) or next_record
+        if _is_external_availability_failure(retry):
+            return self._handle_external_implementer_failure(
+                config, run_record_path, next_record, retry, stages, bootstrap, timeout_ms
+            )
+
+        violation = _violation(
+            "PINNED_IMPLEMENTER_RETRY_FAILED",
+            "the explicitly authorized pinned implementer retry failed; another action requires separate authorization",
+            {"epoch": str(epoch), "round": str(round_number), "status": retry.status},
+        )
+        _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=retry,
+            violations=tuple([*(_from_implementer(item) for item in retry.violations), violation]),
+        )
 
     def _external_runtime_block(
         self,
@@ -4631,6 +4789,119 @@ def restored_review_changes_continuation_evidence(
     except OSError:
         reject("RESTORED_REVIEW_CHANGES_CONTINUATION_ARTIFACT_MISSING", "restored review continuation requires all durable evidence artifacts")
 
+    return tuple(violations)
+
+
+def _pinned_retry_failure_key(record: dict[str, Any], implementer: Any) -> str:
+    event = _external_availability_events(record)[-1] if _external_availability_events(record) else {}
+    payload = {"implementer": implementer, "availability": event}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _implementer_outcome_from_artifact(raw: Any, record: dict[str, Any]) -> ImplementerRuntimeOutcome:
+    result_raw = raw.get("result") if isinstance(raw, dict) else {}
+    result_raw = result_raw if isinstance(result_raw, dict) else {}
+    violations = tuple(
+        ImplementerViolation(
+            str(item.get("code", "")), str(item.get("message", "")),
+            {str(k): str(v) for k, v in item.get("evidence", {}).items()} if isinstance(item.get("evidence", {}), dict) else {},
+        )
+        for item in result_raw.get("violations", []) if isinstance(result_raw.get("violations", []), list) and isinstance(item, dict)
+    )
+    result = ImplementerRuntimeResult(
+        runtime_id=str(result_raw.get("runtimeId", "")), run_id=str(result_raw.get("runId", record.get("runId", ""))),
+        status=str(result_raw.get("status", "IMPLEMENTATION_FAILED")),
+        exit_code=_optional_int(result_raw.get("exitCode")), timed_out=bool(result_raw.get("timedOut", False)),
+        stdout=str(result_raw.get("stdout", "")), stderr=str(result_raw.get("stderr", "")),
+        head_before=str(result_raw.get("headBefore", "")), head_after=str(result_raw.get("headAfter", "")),
+        changed_files=tuple(str(v) for v in result_raw.get("changedFiles", []) if isinstance(result_raw.get("changedFiles", []), list)),
+        violations=violations, runtime_failure_category=str(result_raw.get("runtimeFailureCategory", "")),
+    )
+    return ImplementerRuntimeOutcome(result.status, None, result, record, violations)
+
+
+def pinned_implementer_retry_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+    continuation: Any,
+) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+
+    if not isinstance(record, dict):
+        return (_violation("PINNED_IMPLEMENTER_RETRY_RECORD_INVALID", "retry requires a durable run record", {}),)
+    if record.get("status") != "IMPLEMENTATION_FAILED" or record.get("nextStage") != "human_intervention":
+        reject("PINNED_IMPLEMENTER_RETRY_STATE_INVALID", "retry requires the exact blocked implementation failure state")
+    block = record.get("implementationRecoveryBlock")
+    if not isinstance(block, dict) or block.get("reasonCode") != "FAILOVER_CANDIDATE_ALREADY_PRODUCED":
+        reject("PINNED_IMPLEMENTER_RETRY_BLOCK_INVALID", "retry requires the pre-existing-candidate failover block")
+    elif not is_external_availability_failure(str((block.get("evidence") or {}).get("category", ""))):
+        reject("PINNED_IMPLEMENTER_RETRY_CATEGORY_INVALID", "retry requires an approved external availability category")
+    block_evidence = block.get("evidence") if isinstance(block, dict) else None
+    if isinstance(block_evidence, dict) and (str(block_evidence.get("head_before", "")) != (str((candidate or {}).get("candidate_sha", "")) if isinstance(candidate, dict) else "") or str(block_evidence.get("head_after", "")) != (str((candidate or {}).get("candidate_sha", "")) if isinstance(candidate, dict) else "") or str(block_evidence.get("changed_files", "")) != ""):
+        reject("PINNED_IMPLEMENTER_RETRY_BLOCK_EVIDENCE_INVALID", "failover evidence must prove the candidate was unchanged")
+
+    cand = _candidate_from_mapping(candidate)
+    try:
+        val = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        rev = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        val = rev = None
+    exact = cand.candidate_sha if cand else ""
+    if cand is None or cand.status != "COMMITTED": reject("PINNED_IMPLEMENTER_RETRY_CANDIDATE_INVALID", "candidate evidence is not committed")
+    if val is None or val.status != "PASS": reject("PINNED_IMPLEMENTER_RETRY_VALIDATION_INVALID", "validation evidence is not PASS")
+    if rev is None or rev.status != "PASS" or rev.decision != "Changes Requested" or rev.exit_code != 0: reject("PINNED_IMPLEMENTER_RETRY_REVIEW_INVALID", "review evidence is not successful Changes Requested")
+    if not exact or not val or val.head_before != exact or val.head_after != exact: reject("PINNED_IMPLEMENTER_RETRY_VALIDATION_SHA_MISMATCH", "validation SHA does not match candidate")
+    if not rev or rev.reviewed_sha != exact: reject("PINNED_IMPLEMENTER_RETRY_REVIEW_SHA_MISMATCH", "reviewed SHA does not match candidate")
+    try: current_head = git.current_head(Path(str(record.get("featureWorktree", ""))))
+    except RepositoryProviderError as exc: reject(exc.code, exc.message); current_head = ""
+    if current_head != exact: reject("PINNED_IMPLEMENTER_RETRY_HEAD_MISMATCH", "HEAD does not match candidate")
+    try:
+        status = git.status(Path(str(record.get("featureWorktree", ""))))
+        if status.staged or status.dirty_tracked or status.untracked: reject("PINNED_IMPLEMENTER_RETRY_WORKTREE_DIRTY", "worktree must be clean")
+        if git.current_branch(Path(str(record.get("featureWorktree", "")))) != str(record.get("featureBranch", "")): reject("PINNED_IMPLEMENTER_RETRY_BRANCH_MISMATCH", "branch identity changed")
+    except RepositoryProviderError as exc: reject(exc.code, exc.message)
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict) or str(assignment.get("implementerCommand", "")) != str(record.get("implementer", "")) or str(assignment.get("reviewerCommand", "")) != str(record.get("reviewer", "")) or str(assignment.get("candidateOwnerId", "")) != str(assignment.get("implementerId", "")):
+        reject("PINNED_IMPLEMENTER_RETRY_ASSIGNMENT_MISMATCH", "pinned assignment or ownership changed")
+    if isinstance(continuation, dict):
+        if continuation.get("status") != "AUTHORIZED" or continuation.get("runId") != record.get("runId") or continuation.get("candidateSha") != exact or continuation.get("requirementsSha") != str(record.get("requirements", {}).get("sha256", "")) or continuation.get("pinnedAgentAssignment") != assignment or record.get("restoredReviewChangesContinuation") != continuation:
+            reject("PINNED_IMPLEMENTER_RETRY_CONTINUATION_INVALID", "restored-review continuation provenance does not match")
+    else: reject("PINNED_IMPLEMENTER_RETRY_CONTINUATION_MISSING", "restored-review continuation audit is required")
+
+    result = implementer.get("result") if isinstance(implementer, dict) else None
+    runtime = implementer.get("runtime") if isinstance(implementer, dict) else None
+    if not isinstance(result, dict) or not isinstance(runtime, dict): reject("PINNED_IMPLEMENTER_RETRY_RUNTIME_MISSING", "failed implementer runtime evidence is required")
+    else:
+        if str(result.get("runId", "")) != str(record.get("runId", "")) or str(result.get("status", "")) not in {"IMPLEMENTATION_FAILED", "IMPLEMENTATION_TIMED_OUT"} or result.get("exitCode") in (None, 0) or result.get("timedOut") is not False or not is_external_availability_failure(str(result.get("runtimeFailureCategory", ""))): reject("PINNED_IMPLEMENTER_RETRY_RUNTIME_INVALID", "failed runtime is not a retryable pinned availability failure")
+        if str(result.get("headBefore", "")) != exact or str(result.get("headAfter", "")) != exact or result.get("changedFiles") != []: reject("PINNED_IMPLEMENTER_RETRY_RUNTIME_MUTATED", "failed runtime must prove no candidate or worktree mutation")
+        if str(runtime.get("command", {}).get("adapter", "")) != str(record.get("implementer", "")): reject("PINNED_IMPLEMENTER_RETRY_IMPLEMENTER_MISMATCH", "failed runtime was not the pinned implementer")
+        events = _external_availability_events(record)
+        if not events or str(events[-1].get("agentId", "")) != str(assignment.get("implementerId", "")) or str(events[-1].get("category", "")) != str(result.get("runtimeFailureCategory", "")):
+            reject("PINNED_IMPLEMENTER_RETRY_AVAILABILITY_MISMATCH", "latest availability evidence does not match the failed pinned implementer")
+
+    auths = record.get("pinnedImplementerRetryAuthorizations")
+    key = _pinned_retry_failure_key(record, implementer)
+    if isinstance(auths, list) and any(isinstance(item, dict) and item.get("sourceFailureKey") == key for item in auths): reject("PINNED_IMPLEMENTER_RETRY_ALREADY_USED", "this failed invocation already has a retry authorization")
+    try:
+        impl_time = run_record_path.with_name("implementer-runtime.json").stat().st_mtime_ns
+        if any(run_record_path.with_name(name).stat().st_mtime_ns > impl_time for name in ("candidate.json", "validation-runtime.json", "review-runtime.json")):
+            reject("PINNED_IMPLEMENTER_RETRY_NEWER_EVIDENCE", "newer candidate, validation, or review evidence supersedes this failure")
+    except OSError:
+        reject("PINNED_IMPLEMENTER_RETRY_RUNTIME_MISSING", "durable runtime evidence is required")
+    epoch = _implementation_recovery_epoch(record)
+    try: attempts = _implementation_recovery_attempt_count(record)
+    except (TypeError, ValueError): attempts = 0; reject("PINNED_IMPLEMENTER_RETRY_ATTEMPTS_INVALID", "recovery attempt history is malformed")
+    if epoch <= 0 or attempts >= config.execution_policy.implementation.max_recovery_rounds: reject("PINNED_IMPLEMENTER_RETRY_CAPACITY_EXHAUSTED", "active recovery epoch has no remaining capacity")
     return tuple(violations)
 
 

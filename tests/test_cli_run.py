@@ -31,6 +31,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--reopen-review-convergence", completed.stdout)
         self.assertIn("--restore-failed-review-routing-state", completed.stdout)
         self.assertIn("--continue-restored-review-changes", completed.stdout)
+        self.assertIn("--retry-pinned-implementer", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
