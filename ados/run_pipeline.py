@@ -58,6 +58,40 @@ TRANSIENT_REVIEW_FAILURE_CODES = {
     "REVIEWER_COMMAND_FAILED",
     "REVIEWER_TIMED_OUT",
 }
+
+DIRTY_TIMEOUT_SALVAGE_PROFILES: dict[str, dict[str, Any]] = {
+    "cc6ed14815c049ed1b97ce1c": {
+        "forensicReviewId": "spec-148-dirty-timeout-2026-09-13",
+        "projectId": "AIverse",
+        "specNumber": "148",
+        "featureBranch": "codex/148-autonomous-company-operations-end-to-end",
+        "featureWorktree": r"C:\Users\tmdru\Desktop\Ky-Project\AIverse-autonomous-company-operations-end-to-end",
+        "candidateSha": "e1188d47ff7b3c5cd4ce233e75190e1b32460471",
+        "requirementsSha": "b0de9423d7b882ae695a41103c7609a5484645cf2c6bf766a85c358f8ba3a47c",
+        "dirtyFiles": [
+            "specs/148-autonomous-company-operations-end-to-end/runtime-evidence.json",
+            "specs/148-autonomous-company-operations-end-to-end/runtime-verification.md",
+            "tools/agent-workflow/spec148DurableAlignment.js",
+            "tools/agent-workflow/spec148RoleAssignmentEvidence.test.ts",
+        ],
+        "dirtyDiffSha256": "f06172f01def39e7818cd1a6d664c87ca69f64ca4bff1a1a10eb95ee96341d4c",
+        "implementationRecoveryEpoch": 3,
+        "consumedAttemptRound": 2,
+        "pinnedImplementerId": "claude",
+        "pinnedImplementerCommand": "claude -p",
+        "pinnedReviewerId": "codex",
+        "pinnedReviewerCommand": "codex exec -",
+        "assignmentSequence": 1,
+        "forensicDisposition": "SALVAGEABLE_WITH_CONTINUATION",
+        "forensicValidation": [
+            "git diff --check",
+            "runtime-evidence.json parse",
+            "node --check spec148DurableAlignment.js",
+            "spec148RoleAssignmentEvidence.test.ts 21/21",
+            "focused Spec 148 suites 30/30",
+        ],
+    }
+}
 PR_REFRESH_ATTEMPTS = 3
 
 
@@ -310,6 +344,7 @@ class RunPipeline:
         restore_failed_review_routing_state: bool = False,
         continue_restored_review_changes: bool = False,
         retry_pinned_implementer: bool = False,
+        continue_dirty_timeout_salvage: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -357,6 +392,26 @@ class RunPipeline:
                 return PipelineOutcome(
                     str(record.get("status", "IMPLEMENTATION_FAILED")),
                     tuple([*stages, _stage("pinned_implementer_retry", "BLOCKED", {})]),
+                    record,
+                    violations=violations,
+                )
+
+        if continue_dirty_timeout_salvage:
+            violations = dirty_timeout_salvage_evidence(
+                self.git,
+                config,
+                run_record_path,
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+                _read_run_artifact(run_record_path, record, "implementer-runtime.json"),
+                _read_json(run_record_path.with_name("restored-review-changes-continuation.json")),
+            )
+            if violations:
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("dirty_timeout_salvage_continuation", "BLOCKED", {})]),
                     record,
                     violations=violations,
                 )
@@ -458,7 +513,12 @@ class RunPipeline:
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
         implementation_recovery_reopened = review_convergence_reopened
-        if retry_pinned_implementer:
+        if continue_dirty_timeout_salvage:
+            salvaged = self._continue_dirty_timeout_salvage(config, run_record_path, record, stages, bootstrap, timeout_ms)
+            if isinstance(salvaged, PipelineOutcome):
+                return salvaged
+            implementer_result, record = salvaged
+        elif retry_pinned_implementer:
             retried = self._retry_pinned_implementer(config, run_record_path, record, stages, bootstrap, timeout_ms)
             if isinstance(retried, PipelineOutcome):
                 return retried
@@ -975,6 +1035,151 @@ class RunPipeline:
             bootstrap=bootstrap,
             implementer_result=retry,
             violations=tuple([*(_from_implementer(item) for item in retry.violations), violation]),
+        )
+
+    def _continue_dirty_timeout_salvage(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        timeout_ms: int,
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        continuation = _read_json(run_record_path.with_name("restored-review-changes-continuation.json"))
+        violations = dirty_timeout_salvage_evidence(
+            self.git, config, run_record_path, record, candidate, validation, review, implementer, continuation
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "IMPLEMENTATION_FAILED")),
+                tuple([*stages, _stage("dirty_timeout_salvage_continuation", "BLOCKED", {})]),
+                record,
+                bootstrap=bootstrap,
+                violations=violations,
+            )
+
+        profile = DIRTY_TIMEOUT_SALVAGE_PROFILES[str(record["runId"])]
+        source = _implementer_outcome_from_artifact(implementer, record)
+        assert source.result is not None
+        epoch = _implementation_recovery_epoch(record)
+        round_number = _implementation_recovery_attempt_count(record) + 1
+        max_rounds = config.execution_policy.implementation.max_recovery_rounds
+        assignment = record["agentAssignment"]
+        prior_block = record["implementationRecoveryBlock"]
+        prior_retry = record["pinnedImplementerRetryAuthorization"]
+        diff_sha = _dirty_diff_sha256(Path(str(record["featureWorktree"])), tuple(profile["dirtyFiles"]))
+        source_runtime_path = run_record_path.with_name("implementer-runtime.json")
+        source_runtime_sha = hashlib.sha256(source_runtime_path.read_bytes()).hexdigest()
+        artifact_name = f"dirty-timeout-salvage-{epoch}-{round_number}-{diff_sha[:12]}.json"
+        primary_audit_path = (
+            Path(str(record["primaryRepository"]))
+            / ".agent-workflow"
+            / "runs"
+            / f"{record['specNumber']}-{record['featureSlug']}"
+            / artifact_name
+        )
+        remaining_findings = [
+            {
+                "finding": 2,
+                "title": "Complete the same Project A cycle through the ADOS gates",
+                "required": "Extend the exercised request -> implementation chain through validation, independent review, exact-HEAD convergence, and publication-ready/converged semantics. Do not manually mark completion before those gates pass.",
+            },
+            {
+                "finding": 3,
+                "title": "Bind Project A execution to durable ADOS evidence",
+                "required": f"Add machine-verifiable linkage from Project A's request/preparation/execution identity to run {record['runId']}, its Claude implementer, Codex reviewer, candidate SHA, validation SHA/result, review SHA/decision, exact HEAD, and publication state. Merely documenting that identities differ is insufficient.",
+            },
+        ]
+        authorization = {
+            "status": "CONSUMED",
+            "authorization": "EXPLICIT_OPERATOR_REQUEST",
+            "authorizedAt": _utc_now(),
+            "consumedAt": _utc_now(),
+            "runId": str(record.get("runId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(record.get("featureWorktree", "")),
+            "requirementsSha": str(record.get("requirements", {}).get("sha256", "")),
+            "candidateSha": str(candidate.get("candidate_sha", "")),
+            "validatedSha": str(validation.get("head_after", "")),
+            "reviewedSha": str(review.get("reviewed_sha", "")),
+            "approvedDirtyFiles": list(profile["dirtyFiles"]),
+            "approvedDirtyDiffSha256": diff_sha,
+            "forensicReviewId": str(profile["forensicReviewId"]),
+            "forensicDisposition": str(profile["forensicDisposition"]),
+            "forensicValidation": list(profile["forensicValidation"]),
+            "remainingReviewFindings": remaining_findings,
+            "implementationRecoveryEpoch": epoch,
+            "implementationRecoveryRound": round_number,
+            "implementationRecoveryAttemptLimit": max_rounds,
+            "implementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "reviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "pinnedImplementer": str(record.get("implementer", "")),
+            "pinnedReviewer": str(record.get("reviewer", "")),
+            "pinnedAgentAssignment": assignment,
+            "previousImplementationRecoveryBlock": prior_block,
+            "sourcePinnedImplementerRetryAuthorization": prior_retry,
+            "sourceImplementerRuntimeId": source.result.runtime_id,
+            "sourceImplementerRuntimeStatus": source.result.status,
+            "sourceImplementerRuntimeArtifact": str(source_runtime_path),
+            "sourceImplementerRuntimeSha256": source_runtime_sha,
+            "sourceRestoredReviewChangesContinuation": continuation,
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        updated["dirtyTimeoutSalvageContinuation"] = authorization
+        updated["dirtyTimeoutSalvageContinuations"] = [authorization]
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "implementation_handoff"
+        _write_json(run_record_path.with_name(artifact_name), authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        _append_implementation_recovery_attempt(run_record_path, updated, source, round_number, max_rounds)
+        stages.append(
+            _stage(
+                "dirty_timeout_salvage_continuation",
+                "PASS",
+                {"implementer": str(assignment.get("implementerId", "")), "epoch": str(epoch), "round": str(round_number), "dirty_diff_sha256": diff_sha},
+            )
+        )
+
+        result = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=timeout_ms)
+        _update_implementation_recovery_attempt(
+            run_record_path,
+            round_number,
+            {
+                "recoveryImplementerStatus": result.status,
+                "recoveryImplementerViolationCodes": [item.code for item in result.violations],
+                "headAfterRecovery": _implementer_result_head_after(result),
+                "changedFilesAfterRecovery": list(_implementer_result_changed_files(result)),
+            },
+            reopen_epoch=epoch,
+        )
+        next_record = _read_json(run_record_path) or result.run_record or updated
+        stages.append(_stage("dirty_timeout_salvage_implementer", result.status, {"epoch": str(epoch), "round": str(round_number)}))
+        if result.status == "READY_FOR_VALIDATION":
+            _update_implementation_recovery_attempt(
+                run_record_path, round_number, {"status": "READY_FOR_VALIDATION"}, reopen_epoch=epoch
+            )
+            return result, _read_json(run_record_path) or next_record
+
+        violation = _violation(
+            "DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED",
+            "the final explicitly authorized dirty-timeout salvage attempt failed; preserved work requires human intervention",
+            {"epoch": str(epoch), "round": str(round_number), "status": result.status, "dirty_diff_sha256": diff_sha},
+        )
+        _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=result,
+            violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
         )
 
     def _external_runtime_block(
@@ -4902,6 +5107,209 @@ def pinned_implementer_retry_evidence(
     try: attempts = _implementation_recovery_attempt_count(record)
     except (TypeError, ValueError): attempts = 0; reject("PINNED_IMPLEMENTER_RETRY_ATTEMPTS_INVALID", "recovery attempt history is malformed")
     if epoch <= 0 or attempts >= config.execution_policy.implementation.max_recovery_rounds: reject("PINNED_IMPLEMENTER_RETRY_CAPACITY_EXHAUSTED", "active recovery epoch has no remaining capacity")
+    return tuple(violations)
+
+
+def _dirty_diff_sha256(worktree: Path, paths: tuple[str, ...]) -> str:
+    completed = subprocess.run(
+        ("git", "diff", "--binary", "--no-ext-diff", "--no-color", "--", *paths),
+        cwd=worktree,
+        shell=False,
+        capture_output=True,
+    )
+    return hashlib.sha256(completed.stdout).hexdigest() if completed.returncode == 0 else ""
+
+
+def dirty_timeout_salvage_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+    continuation: Any,
+) -> tuple[PipelineViolation, ...]:
+    violations: list[PipelineViolation] = []
+
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+
+    if not isinstance(record, dict):
+        return (_violation("DIRTY_TIMEOUT_SALVAGE_RECORD_INVALID", "salvage requires a durable run record", {}),)
+    profile = DIRTY_TIMEOUT_SALVAGE_PROFILES.get(str(record.get("runId", "")))
+    if not isinstance(profile, dict) or profile.get("forensicDisposition") != "SALVAGEABLE_WITH_CONTINUATION":
+        return (_violation("DIRTY_TIMEOUT_SALVAGE_FORENSIC_PROVENANCE_MISSING", "this run has no reviewed dirty-timeout salvage profile", {}),)
+
+    if record.get("status") != "IMPLEMENTATION_FAILED" or record.get("nextStage") != "human_intervention":
+        reject("DIRTY_TIMEOUT_SALVAGE_STATE_INVALID", "salvage requires the exact blocked implementation failure state")
+    block = record.get("implementationRecoveryBlock")
+    block_evidence = block.get("evidence") if isinstance(block, dict) else None
+    if not isinstance(block, dict) or block.get("reasonCode") != "PINNED_IMPLEMENTER_RETRY_FAILED" or not isinstance(block_evidence, dict):
+        reject("DIRTY_TIMEOUT_SALVAGE_BLOCK_INVALID", "salvage requires the failed pinned-retry block")
+    elif (
+        str(block_evidence.get("epoch", "")) != str(profile.get("implementationRecoveryEpoch", ""))
+        or str(block_evidence.get("round", "")) != str(profile.get("consumedAttemptRound", ""))
+        or str(block_evidence.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+    ):
+        reject("DIRTY_TIMEOUT_SALVAGE_BLOCK_EVIDENCE_INVALID", "block does not identify the reviewed timeout attempt")
+
+    for key, expected in (
+        ("projectId", profile.get("projectId")),
+        ("specNumber", profile.get("specNumber")),
+        ("featureBranch", profile.get("featureBranch")),
+    ):
+        if str(record.get(key, "")) != str(expected):
+            reject("DIRTY_TIMEOUT_SALVAGE_IDENTITY_MISMATCH", "run identity differs from forensic provenance", {"field": key})
+    if Path(str(record.get("featureWorktree", ""))).resolve() != Path(str(profile.get("featureWorktree", ""))).resolve():
+        reject("DIRTY_TIMEOUT_SALVAGE_WORKTREE_IDENTITY_MISMATCH", "feature worktree differs from forensic provenance")
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if requirements_sha != str(profile.get("requirementsSha", "")):
+        reject("DIRTY_TIMEOUT_SALVAGE_REQUIREMENTS_MISMATCH", "requirements identity differs from forensic provenance")
+
+    cand = _candidate_from_mapping(candidate)
+    try:
+        val = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        rev = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        val = rev = None
+    exact = cand.candidate_sha if cand else ""
+    if cand is None or cand.status != "COMMITTED" or exact != str(profile.get("candidateSha", "")):
+        reject("DIRTY_TIMEOUT_SALVAGE_CANDIDATE_INVALID", "candidate does not match forensic provenance")
+    if val is None or val.status != "PASS":
+        reject("DIRTY_TIMEOUT_SALVAGE_VALIDATION_INVALID", "validation must remain PASS")
+    elif val.head_before != exact or val.head_after != exact:
+        reject("DIRTY_TIMEOUT_SALVAGE_VALIDATION_SHA_MISMATCH", "validation does not match the authoritative candidate")
+    if rev is None or rev.status != "PASS" or rev.decision != "Changes Requested" or rev.exit_code != 0:
+        reject("DIRTY_TIMEOUT_SALVAGE_REVIEW_INVALID", "review must remain successful Changes Requested")
+    elif rev.reviewed_sha != exact:
+        reject("DIRTY_TIMEOUT_SALVAGE_REVIEW_SHA_MISMATCH", "review does not match the authoritative candidate")
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict) or (
+        str(assignment.get("implementerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or str(assignment.get("implementerCommand", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(assignment.get("reviewerId", "")) != str(profile.get("pinnedReviewerId", ""))
+        or str(assignment.get("reviewerCommand", "")) != str(profile.get("pinnedReviewerCommand", ""))
+        or str(assignment.get("candidateOwnerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or _positive_int_from_mapping(assignment, "sequence") != int(profile.get("assignmentSequence", 0))
+        or str(record.get("implementer", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(record.get("reviewer", "")) != str(profile.get("pinnedReviewerCommand", ""))
+    ):
+        reject("DIRTY_TIMEOUT_SALVAGE_ASSIGNMENT_MISMATCH", "pinned roles, owner, or assignment sequence changed")
+
+    prior_retry = record.get("pinnedImplementerRetryAuthorization")
+    retry_history = record.get("pinnedImplementerRetryAuthorizations")
+    if not isinstance(prior_retry, dict) or prior_retry.get("status") != "CONSUMED":
+        reject("DIRTY_TIMEOUT_SALVAGE_RETRY_AUDIT_MISSING", "consumed pinned-retry authorization is required")
+    elif (
+        not isinstance(retry_history, list)
+        or not retry_history
+        or retry_history[-1] != prior_retry
+        or _positive_int_from_mapping(prior_retry, "implementationRecoveryEpoch") != int(profile.get("implementationRecoveryEpoch", 0))
+        or _positive_int_from_mapping(prior_retry, "implementationRecoveryRound") != int(profile.get("consumedAttemptRound", 0))
+        or prior_retry.get("pinnedAgentAssignment") != assignment
+        or str(prior_retry.get("candidateSha", "")) != exact
+        or str(prior_retry.get("requirementsSha", "")) != requirements_sha
+    ):
+        reject("DIRTY_TIMEOUT_SALVAGE_RETRY_AUDIT_INVALID", "pinned-retry audit does not match this exact run and assignment")
+    else:
+        artifact_name = Path(str(prior_retry.get("artifact", ""))).name
+        local_retry_artifact = _read_json(run_record_path.with_name(artifact_name)) if artifact_name else None
+        primary_retry_artifact = _read_json(Path(str(prior_retry.get("artifact", "")))) if prior_retry.get("artifact") else None
+        if local_retry_artifact != prior_retry or primary_retry_artifact != prior_retry:
+            reject("DIRTY_TIMEOUT_SALVAGE_RETRY_ARTIFACT_MISMATCH", "pinned-retry audit copies are missing or changed")
+
+    if not isinstance(continuation, dict) or continuation != record.get("restoredReviewChangesContinuation"):
+        reject("DIRTY_TIMEOUT_SALVAGE_CONTINUATION_INVALID", "restored-review continuation provenance is missing or changed")
+    elif continuation.get("runId") != record.get("runId") or continuation.get("pinnedAgentAssignment") != assignment:
+        reject("DIRTY_TIMEOUT_SALVAGE_CONTINUATION_MISMATCH", "restored-review continuation does not match this run")
+
+    result = implementer.get("result") if isinstance(implementer, dict) else None
+    runtime = implementer.get("runtime") if isinstance(implementer, dict) else None
+    if not isinstance(result, dict) or not isinstance(runtime, dict):
+        reject("DIRTY_TIMEOUT_SALVAGE_RUNTIME_MISSING", "timeout runtime evidence is required")
+    else:
+        if (
+            str(result.get("runId", "")) != str(record.get("runId", ""))
+            or str(result.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+            or result.get("timedOut") is not True
+            or result.get("exitCode") is not None
+            or str(result.get("headBefore", "")) != exact
+            or str(result.get("headAfter", "")) != exact
+        ):
+            reject("DIRTY_TIMEOUT_SALVAGE_RUNTIME_INVALID", "runtime does not prove the exact unchanged-HEAD timeout")
+        if str(runtime.get("command", {}).get("adapter", "")) != str(profile.get("pinnedImplementerCommand", "")):
+            reject("DIRTY_TIMEOUT_SALVAGE_RUNTIME_OWNER_MISMATCH", "timeout did not belong to the pinned implementer")
+        if set(str(item) for item in result.get("changedFiles", [])) != set(str(item) for item in profile.get("dirtyFiles", [])):
+            reject("DIRTY_TIMEOUT_SALVAGE_RUNTIME_DIRTY_SET_MISMATCH", "runtime changed-file evidence differs from forensic provenance")
+
+    epoch = _implementation_recovery_epoch(record)
+    max_attempts = config.execution_policy.implementation.max_recovery_rounds
+    try:
+        attempt_count = _implementation_recovery_attempt_count(record)
+    except (TypeError, ValueError):
+        attempt_count = 0
+        reject("DIRTY_TIMEOUT_SALVAGE_ATTEMPT_HISTORY_INVALID", "implementation recovery history is malformed")
+    if epoch != int(profile.get("implementationRecoveryEpoch", 0)) or attempt_count != max_attempts - 1 or max_attempts != 3:
+        reject("DIRTY_TIMEOUT_SALVAGE_CAPACITY_INVALID", "salvage requires exactly one remaining attempt in the existing epoch", {"epoch": str(epoch), "attempts": str(attempt_count), "max_attempts": str(max_attempts)})
+    attempts_raw = record.get("implementationRecoveryAttempts")
+    source_attempts = [
+        item for item in attempts_raw
+        if isinstance(attempts_raw, list) and isinstance(item, dict)
+        and _positive_int_from_mapping(item, "reopenEpoch") == int(profile.get("implementationRecoveryEpoch", 0))
+        and _positive_int_from_mapping(item, "round") == int(profile.get("consumedAttemptRound", 0))
+    ] if isinstance(attempts_raw, list) else []
+    if len(source_attempts) != 1 or str(source_attempts[0].get("recoveryImplementerStatus", "")) != "IMPLEMENTATION_TIMED_OUT" or str(source_attempts[0].get("headAfterRecovery", "")) != exact or set(str(item) for item in source_attempts[0].get("changedFilesAfterRecovery", [])) != set(str(item) for item in profile.get("dirtyFiles", [])):
+        reject("DIRTY_TIMEOUT_SALVAGE_SOURCE_ATTEMPT_INVALID", "epoch attempt history does not match the reviewed timeout")
+    implementation_reopens = record.get("implementationRecoveryReopens")
+    convergence_reopens = record.get("reviewConvergenceReopens")
+    if not isinstance(implementation_reopens, list) or not isinstance(convergence_reopens, list) or len(implementation_reopens) != config.execution_policy.implementation.max_recovery_reopens or len(convergence_reopens) != config.execution_policy.review.max_convergence_reopens:
+        reject("DIRTY_TIMEOUT_SALVAGE_REOPEN_STATE_INVALID", "reopen histories must remain exactly exhausted")
+
+    if "dirtyTimeoutSalvageContinuation" in record or "dirtyTimeoutSalvageContinuations" in record:
+        reject("DIRTY_TIMEOUT_SALVAGE_ALREADY_USED", "dirty-timeout salvage may be authorized only once")
+    worktree = Path(str(record.get("featureWorktree", "")))
+    expected_files = tuple(str(item) for item in profile.get("dirtyFiles", []))
+    try:
+        status = git.status(worktree)
+        current_head = git.current_head(worktree)
+        branch = git.current_branch(worktree)
+    except RepositoryProviderError as exc:
+        reject(exc.code, exc.message)
+    else:
+        if status.root != worktree.resolve() or branch != str(record.get("featureBranch", "")):
+            reject("DIRTY_TIMEOUT_SALVAGE_WORKTREE_IDENTITY_MISMATCH", "worktree root or branch changed")
+        if current_head != exact:
+            reject("DIRTY_TIMEOUT_SALVAGE_HEAD_MISMATCH", "HEAD no longer matches the authoritative candidate")
+        if status.staged or status.untracked or set(status.dirty_tracked) != set(expected_files):
+            reject("DIRTY_TIMEOUT_SALVAGE_DIRTY_SET_MISMATCH", "worktree must contain exactly the forensic-approved tracked modifications")
+
+    actual_diff_sha = _dirty_diff_sha256(worktree, expected_files)
+    if actual_diff_sha != str(profile.get("dirtyDiffSha256", "")):
+        reject("DIRTY_TIMEOUT_SALVAGE_DIFF_MISMATCH", "dirty diff differs from the forensic-reviewed bytes", {"expected": str(profile.get("dirtyDiffSha256", "")), "actual": actual_diff_sha})
+    salvage_name = f"dirty-timeout-salvage-{epoch}-{attempt_count + 1}-{actual_diff_sha[:12]}.json"
+    primary_salvage = Path(str(record.get("primaryRepository", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / salvage_name
+    if run_record_path.with_name(salvage_name).exists() or primary_salvage.exists():
+        reject("DIRTY_TIMEOUT_SALVAGE_ALREADY_USED", "dirty-timeout salvage audit already exists")
+    diff_check = subprocess.run(("git", "diff", "--check"), cwd=worktree, shell=False, capture_output=True)
+    if diff_check.returncode != 0:
+        reject("DIRTY_TIMEOUT_SALVAGE_DIFF_CHECK_FAILED", "dirty diff failed git diff --check", {"stdout": diff_check.stdout.decode("utf-8", errors="replace"), "stderr": diff_check.stderr.decode("utf-8", errors="replace")})
+    for relative_path in expected_files:
+        if not relative_path.endswith(".json"):
+            continue
+        try:
+            json.loads((worktree / relative_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            reject("DIRTY_TIMEOUT_SALVAGE_STRUCTURE_INVALID", "forensic-reviewed JSON is no longer structurally valid", {"path": relative_path})
+
+    try:
+        implementer_time = run_record_path.with_name("implementer-runtime.json").stat().st_mtime_ns
+        if any(run_record_path.with_name(name).stat().st_mtime_ns > implementer_time for name in ("candidate.json", "validation-runtime.json", "review-runtime.json")):
+            reject("DIRTY_TIMEOUT_SALVAGE_NEWER_EVIDENCE", "newer candidate, validation, or review evidence supersedes the timeout")
+    except OSError:
+        reject("DIRTY_TIMEOUT_SALVAGE_ARTIFACT_MISSING", "required durable artifacts are missing")
     return tuple(violations)
 
 

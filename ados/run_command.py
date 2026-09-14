@@ -18,7 +18,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, failed_review_routing_state_restoration_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, dirty_timeout_salvage_evidence, failed_review_routing_state_restoration_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
@@ -43,6 +43,7 @@ class RunRequest:
     restore_failed_review_routing_state: bool = False
     continue_restored_review_changes: bool = False
     retry_pinned_implementer: bool = False
+    continue_dirty_timeout_salvage: bool = False
     prefer_implementer: str | None = None
 
 
@@ -249,6 +250,7 @@ class RunService:
             reopen_review_convergence=request.reopen_review_convergence,
             restore_failed_review_routing_state=request.restore_failed_review_routing_state,
             retry_pinned_implementer=request.retry_pinned_implementer,
+            continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
         )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
@@ -270,6 +272,7 @@ class RunService:
                 restore_failed_review_routing_state=request.restore_failed_review_routing_state,
                 continue_restored_review_changes=request.continue_restored_review_changes,
                 retry_pinned_implementer=request.retry_pinned_implementer,
+                continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -287,6 +290,7 @@ class RunService:
                 restore_failed_review_routing_state=request.restore_failed_review_routing_state,
                 continue_restored_review_changes=request.continue_restored_review_changes,
                 retry_pinned_implementer=request.retry_pinned_implementer,
+                continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -329,6 +333,7 @@ class RunService:
             restore_failed_review_routing_state=request.restore_failed_review_routing_state,
             continue_restored_review_changes=request.continue_restored_review_changes,
             retry_pinned_implementer=request.retry_pinned_implementer,
+            continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -396,6 +401,7 @@ class RunService:
         reopen_review_convergence: bool = False,
         restore_failed_review_routing_state: bool = False,
         retry_pinned_implementer: bool = False,
+        continue_dirty_timeout_salvage: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -466,6 +472,23 @@ class RunService:
             and resume is not None
             and set(blocking_recovery) == {"FAILOVER_CANDIDATE_ALREADY_PRODUCED"}
             and not pinned_implementer_retry_evidence(
+                self.git,
+                config,
+                resume.record_path,
+                _read_mapping(resume.record_path),
+                _read_mapping(resume.record_path.with_name("candidate.json")),
+                _read_mapping(resume.record_path.with_name("validation-runtime.json")),
+                _read_mapping(resume.record_path.with_name("review-runtime.json")),
+                _read_mapping(resume.record_path.with_name("implementer-runtime.json")),
+                _read_mapping(resume.record_path.with_name("restored-review-changes-continuation.json")),
+            )
+        ):
+            blocking_recovery = ()
+        if (
+            continue_dirty_timeout_salvage
+            and resume is not None
+            and set(blocking_recovery) == {"PINNED_IMPLEMENTER_RETRY_FAILED"}
+            and not dirty_timeout_salvage_evidence(
                 self.git,
                 config,
                 resume.record_path,
