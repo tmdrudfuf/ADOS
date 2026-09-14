@@ -420,6 +420,31 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 "Do not discard partial legitimate work unless it is clearly wrong for this feature.",
             ]
         )
+    dirty_salvage = record.get("dirtyTimeoutSalvageContinuation")
+    if isinstance(dirty_salvage, dict) and dirty_salvage.get("status") == "CONSUMED":
+        lines.extend(
+            [
+                "",
+                "Explicit dirty-timeout salvage continuation:",
+                f"Approved dirty diff SHA-256: {dirty_salvage.get('approvedDirtyDiffSha256', '')}",
+                "Preserve the forensic-reviewed partial work already present in the worktree.",
+                "Finding 1 is already correctly addressed: validation alignment requires PASS and includes BLOCK + Approved regression coverage.",
+                "Complete every remaining independent-review finding below before returning:",
+            ]
+        )
+        findings = dirty_salvage.get("remainingReviewFindings", [])
+        if isinstance(findings, list):
+            for finding in findings:
+                if isinstance(finding, dict):
+                    lines.append(f"- Finding {finding.get('finding', '')}: {finding.get('title', '')}")
+                    lines.append(f"  Required: {finding.get('required', '')}")
+        lines.extend(
+            [
+                "Do not satisfy the durable-linkage finding merely by documenting that identities differ.",
+                "Add machine-verifiable linkage and assertions for the exercised Project A request and the durable ADOS evidence.",
+                "Do not manually mark Project A complete before implementation, validation, independent review, exact-HEAD, and publication-ready/converged gates are satisfied.",
+            ]
+        )
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(

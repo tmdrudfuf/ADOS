@@ -32,6 +32,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--restore-failed-review-routing-state", completed.stdout)
         self.assertIn("--continue-restored-review-changes", completed.stdout)
         self.assertIn("--retry-pinned-implementer", completed.stdout)
+        self.assertIn("--continue-dirty-timeout-salvage", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -4553,6 +4554,171 @@ class CliRunTests(unittest.TestCase):
             self.assertIn(expected_code, {item.code for item in outcome.violations})
             self.assertNotIn("implementer", [stage.id for stage in outcome.stages])
 
+    def test_dirty_timeout_salvage_consumes_final_existing_epoch_attempt_and_resumes_normal_flow(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_dirty_timeout_salvage_run(fixture, "Continue dirty timeout salvage")
+            original = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            original_reopens = (original["implementationRecoveryReopens"], original["reviewConvergenceReopens"])
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "prompt = sys.stdin.read()\n"
+                "assert 'Finding 2' in prompt and 'Finding 3' in prompt\n"
+                "assert 'forensic-reviewed partial work' in prompt\n"
+                "assert Path('implementation.txt').read_text(encoding='utf-8') == 'forensic partial work'\n"
+                "Path('implementation.txt').write_text('salvage completed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, {original["runId"]: state["profile"]}, clear=False):
+                result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                    RunRequest(
+                        fixture.repo,
+                        "Continue dirty timeout salvage",
+                        1,
+                        fixture.config,
+                        requirements_file=state["requirements"],
+                        continue_dirty_timeout_salvage=True,
+                    )
+                )
+            final = result.pipeline_result.run_record
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            epoch_attempts = [item for item in final["implementationRecoveryAttempts"] if item.get("reopenEpoch") == 3]
+            authorization = final["dirtyTimeoutSalvageContinuation"]
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(original["runId"], final["runId"])
+        self.assertEqual(original["agentAssignment"], final["agentAssignment"])
+        self.assertEqual("claude", final["agentAssignment"]["candidateOwnerId"])
+        self.assertEqual([1, 2, 3], [item["round"] for item in epoch_attempts])
+        self.assertEqual("READY_FOR_VALIDATION", epoch_attempts[-1]["status"])
+        self.assertEqual(3, authorization["implementationRecoveryEpoch"])
+        self.assertEqual(3, authorization["implementationRecoveryRound"])
+        self.assertEqual(state["profile"]["dirtyDiffSha256"], authorization["approvedDirtyDiffSha256"])
+        self.assertEqual("CONSUMED", authorization["status"])
+        self.assertEqual(original_reopens[0], final["implementationRecoveryReopens"])
+        self.assertEqual(original_reopens[1], final["reviewConvergenceReopens"])
+        self.assertLess(stages.index("dirty_timeout_salvage_implementer"), stages.index("validation"))
+        self.assertLess(stages.index("validation"), stages.index("review"))
+
+    def test_dirty_timeout_salvage_requires_exact_forensic_diff_and_final_failure_stays_consumed(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_dirty_timeout_salvage_run(fixture, "Reject changed dirty timeout salvage")
+            (state["worktree"] / "implementation.txt").write_text("one line changed", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                rejected = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=state["record_path"],
+                    timeout_ms=1000,
+                    continue_dirty_timeout_salvage=True,
+                )
+            rejected_record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            (state["worktree"] / "implementation.txt").write_text("forensic partial work", encoding="utf-8")
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "assert Path('implementation.txt').read_text(encoding='utf-8') == 'forensic partial work'\n"
+                "Path('implementation.txt').write_text('failed but preserved', encoding='utf-8')\n"
+                "sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                failed = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=state["record_path"],
+                    timeout_ms=1000,
+                    continue_dirty_timeout_salvage=True,
+                )
+                repeated = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=state["record_path"],
+                    timeout_ms=1000,
+                    continue_dirty_timeout_salvage=True,
+                )
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            epoch_attempts = [item for item in final["implementationRecoveryAttempts"] if item.get("reopenEpoch") == 3]
+            preserved_content = (state["worktree"] / "implementation.txt").read_text(encoding="utf-8")
+
+        self.assertIn("DIRTY_TIMEOUT_SALVAGE_DIFF_MISMATCH", {item.code for item in rejected.violations})
+        self.assertNotIn("dirtyTimeoutSalvageContinuation", rejected_record)
+        self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
+        self.assertEqual("DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual([1, 2, 3], [item["round"] for item in epoch_attempts])
+        self.assertEqual("CONSUMED", final["dirtyTimeoutSalvageContinuation"]["status"])
+        self.assertIn("DIRTY_TIMEOUT_SALVAGE_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertEqual("failed but preserved", preserved_content)
+
+    def test_dirty_timeout_salvage_admission_fails_closed_on_evidence_drift(self):
+        cases = {
+            "missing_profile": "DIRTY_TIMEOUT_SALVAGE_FORENSIC_PROVENANCE_MISSING",
+            "extra_tracked": "DIRTY_TIMEOUT_SALVAGE_DIRTY_SET_MISMATCH",
+            "missing_dirty": "DIRTY_TIMEOUT_SALVAGE_DIRTY_SET_MISMATCH",
+            "timeout_status": "DIRTY_TIMEOUT_SALVAGE_RUNTIME_INVALID",
+            "candidate_sha": "DIRTY_TIMEOUT_SALVAGE_CANDIDATE_INVALID",
+            "validation": "DIRTY_TIMEOUT_SALVAGE_VALIDATION_INVALID",
+            "review": "DIRTY_TIMEOUT_SALVAGE_REVIEW_INVALID",
+            "owner": "DIRTY_TIMEOUT_SALVAGE_ASSIGNMENT_MISMATCH",
+            "requirements": "DIRTY_TIMEOUT_SALVAGE_REQUIREMENTS_MISMATCH",
+            "prior_audit": "DIRTY_TIMEOUT_SALVAGE_RETRY_AUDIT_MISSING",
+            "unrelated_block": "DIRTY_TIMEOUT_SALVAGE_BLOCK_INVALID",
+            "no_capacity": "DIRTY_TIMEOUT_SALVAGE_CAPACITY_INVALID",
+        }
+        for mutation, expected in cases.items():
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_dirty_timeout_salvage_run(fixture, f"Dirty timeout evidence {mutation}")
+                record_path = state["record_path"]
+                candidate_path = record_path.with_name("candidate.json")
+                validation_path = record_path.with_name("validation-runtime.json")
+                review_path = record_path.with_name("review-runtime.json")
+                implementer_path = record_path.with_name("implementer-runtime.json")
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                validation = json.loads(validation_path.read_text(encoding="utf-8"))
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                implementer = json.loads(implementer_path.read_text(encoding="utf-8"))
+                if mutation == "extra_tracked":
+                    tracked_file = state["worktree"] / ".gitignore"
+                    tracked_file.write_text(tracked_file.read_text(encoding="utf-8") + "\nchanged tracked file\n", encoding="utf-8")
+                elif mutation == "missing_dirty":
+                    self.git(state["worktree"], "restore", "--", "implementation.txt")
+                elif mutation == "timeout_status":
+                    implementer["result"]["status"] = "IMPLEMENTATION_FAILED"
+                elif mutation == "candidate_sha":
+                    candidate["candidate_sha"] = "f" * 40
+                elif mutation == "validation":
+                    validation["status"] = "BLOCK"
+                elif mutation == "review":
+                    review["decision"] = "Approved"
+                elif mutation == "owner":
+                    record["agentAssignment"]["candidateOwnerId"] = "codex"
+                elif mutation == "requirements":
+                    record["requirements"]["sha256"] = "f" * 64
+                elif mutation == "prior_audit":
+                    record.pop("pinnedImplementerRetryAuthorization")
+                elif mutation == "unrelated_block":
+                    record["implementationRecoveryBlock"]["reasonCode"] = "OTHER_FAILURE"
+                elif mutation == "no_capacity":
+                    record["implementationRecoveryAttempts"].append({"round": 3, "reopenEpoch": 3, "status": "RECOVERY_IMPLEMENTER_PENDING"})
+                record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+                candidate_path.write_text(json.dumps(candidate, indent=2, sort_keys=True), encoding="utf-8")
+                validation_path.write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8")
+                review_path.write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8")
+                implementer_path.write_text(json.dumps(implementer, indent=2, sort_keys=True), encoding="utf-8")
+                profiles = {} if mutation == "missing_profile" else {state["run_id"]: state["profile"]}
+                with mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, profiles, clear=True):
+                    violations = run_pipeline.dirty_timeout_salvage_evidence(
+                        run_pipeline.GitRepositoryProvider(),
+                        load_project_config(fixture.config),
+                        record_path,
+                        record,
+                        candidate,
+                        validation,
+                        review,
+                        implementer,
+                        json.loads(record_path.with_name("restored-review-changes-continuation.json").read_text(encoding="utf-8")),
+                    )
+                self.assertIn(expected, {item.code for item in violations})
+
     def test_failed_reviewer_dirty_side_effect_reopen_rejects_unsafe_evidence(self):
         for mutation, expected_code in (
             ("validation", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED"),
@@ -5652,6 +5818,114 @@ class CliRunTests(unittest.TestCase):
         )
         self.assertEqual("REVIEW_BLOCKED", restored.status)
         return {**state, "restored": restored}
+
+    def create_dirty_timeout_salvage_run(self, fixture, feature):
+        state = self.create_restored_review_changes_continuation_run(fixture, feature)
+        config = load_project_config(fixture.config)
+        pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+        restored_record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+        continued = pipeline._continue_restored_review_changes(config, state["record_path"], restored_record, [])
+        self.assertIsInstance(continued, dict)
+        record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+        candidate = json.loads(state["record_path"].with_name("candidate.json").read_text(encoding="utf-8"))
+        validation = json.loads(state["record_path"].with_name("validation-runtime.json").read_text(encoding="utf-8"))
+        review = json.loads(state["record_path"].with_name("review-runtime.json").read_text(encoding="utf-8"))
+        exact = candidate["candidate_sha"]
+        assignment = record["agentAssignment"]
+        continuation = record["restoredReviewChangesContinuation"]
+        primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}"
+        retry_artifact = primary_run_dir / "pinned-implementer-retry-3-2-testtimeout.json"
+        retry_authorization = {
+            "status": "CONSUMED",
+            "authorization": "EXPLICIT_OPERATOR_REQUEST",
+            "authorizedAt": "2026-09-13T22:51:20+00:00",
+            "consumedAt": "2026-09-13T22:51:20+00:00",
+            "runId": record["runId"],
+            "candidateSha": exact,
+            "validatedSha": validation["head_after"],
+            "reviewedSha": review["reviewed_sha"],
+            "requirementsSha": record["requirements"]["sha256"],
+            "implementationRecoveryEpoch": 3,
+            "implementationRecoveryRound": 2,
+            "pinnedAgentAssignment": assignment,
+            "sourceRestoredReviewChangesContinuation": continuation,
+            "artifact": str(retry_artifact),
+        }
+        primary_run_dir.mkdir(parents=True, exist_ok=True)
+        retry_artifact.write_text(json.dumps(retry_authorization, indent=2, sort_keys=True), encoding="utf-8")
+        state["record_path"].with_name(retry_artifact.name).write_text(json.dumps(retry_authorization, indent=2, sort_keys=True), encoding="utf-8")
+        record["pinnedImplementerRetryAuthorization"] = retry_authorization
+        record["pinnedImplementerRetryAuthorizations"] = [retry_authorization]
+        record["implementationRecoveryAttempts"].append(
+            {
+                "round": 2,
+                "reopenEpoch": 3,
+                "maxRounds": 3,
+                "status": "RECOVERY_IMPLEMENTER_PENDING",
+                "priorStatus": "IMPLEMENTATION_FAILED",
+                "recoveryImplementerStatus": "IMPLEMENTATION_TIMED_OUT",
+                "headAfterRecovery": exact,
+                "changedFilesAfterRecovery": ["implementation.txt"],
+            }
+        )
+        record["status"] = "IMPLEMENTATION_FAILED"
+        record["nextStage"] = "human_intervention"
+        record["implementationRecoveryBlock"] = {
+            "status": "BLOCKED",
+            "reasonCode": "PINNED_IMPLEMENTER_RETRY_FAILED",
+            "message": "the explicitly authorized pinned implementer retry failed",
+            "evidence": {"epoch": "3", "round": "2", "status": "IMPLEMENTATION_TIMED_OUT"},
+        }
+        (state["worktree"] / "implementation.txt").write_text("forensic partial work", encoding="utf-8")
+        timeout_runtime = {
+            "status": "IMPLEMENTATION_TIMED_OUT",
+            "runtime": {
+                "runtimeId": "test-timeout",
+                "runId": record["runId"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "command": {"adapter": record["implementer"], "timeoutMs": 300000},
+            },
+            "result": {
+                "runtimeId": "test-timeout",
+                "runId": record["runId"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "exitCode": None,
+                "timedOut": True,
+                "stdout": "",
+                "stderr": "timeout",
+                "headBefore": exact,
+                "headAfter": exact,
+                "changedFiles": ["implementation.txt"],
+                "runtimeFailureCategory": "UNKNOWN_RUNTIME_FAILURE",
+                "violations": [{"code": "IMPLEMENTER_TIMED_OUT", "message": "timed out", "evidence": {"timeout_ms": "300000"}}],
+            },
+            "runRecord": record,
+            "violations": [],
+        }
+        state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        state["record_path"].with_name("implementer-runtime.json").write_text(json.dumps(timeout_runtime, indent=2, sort_keys=True), encoding="utf-8")
+        diff_sha = run_pipeline._dirty_diff_sha256(state["worktree"], ("implementation.txt",))
+        profile = {
+            "forensicReviewId": "test-dirty-timeout",
+            "projectId": record["projectId"],
+            "specNumber": record["specNumber"],
+            "featureBranch": record["featureBranch"],
+            "featureWorktree": record["featureWorktree"],
+            "candidateSha": exact,
+            "requirementsSha": record["requirements"]["sha256"],
+            "dirtyFiles": ["implementation.txt"],
+            "dirtyDiffSha256": diff_sha,
+            "implementationRecoveryEpoch": 3,
+            "consumedAttemptRound": 2,
+            "pinnedImplementerId": assignment["implementerId"],
+            "pinnedImplementerCommand": assignment["implementerCommand"],
+            "pinnedReviewerId": assignment["reviewerId"],
+            "pinnedReviewerCommand": assignment["reviewerCommand"],
+            "assignmentSequence": assignment["sequence"],
+            "forensicDisposition": "SALVAGEABLE_WITH_CONTINUATION",
+            "forensicValidation": ["git diff --check", "focused tests"],
+        }
+        return {**state, "profile": profile, "run_id": record["runId"]}
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
