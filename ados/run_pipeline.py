@@ -92,6 +92,53 @@ DIRTY_TIMEOUT_SALVAGE_PROFILES: dict[str, dict[str, Any]] = {
         ],
     }
 }
+SUBSTANTIAL_COMPLETION_TIMEOUT_MS = 1_800_000
+HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES: dict[str, dict[str, Any]] = {
+    "cc6ed14815c049ed1b97ce1c": {
+        "forensicReviewId": "spec-148-final-partial-review-2026-09-19",
+        "forensicDisposition": "NEEDS_SUBSTANTIAL_COMPLETION",
+        "projectId": "AIverse",
+        "specNumber": "148",
+        "featureBranch": "codex/148-autonomous-company-operations-end-to-end",
+        "featureWorktree": r"C:\Users\tmdru\Desktop\Ky-Project\AIverse-autonomous-company-operations-end-to-end",
+        "authoritativeBaseSha": "bbbb0318704f612be8ec54523e59b8d7e4fda204",
+        "candidateSha": "e1188d47ff7b3c5cd4ce233e75190e1b32460471",
+        "requirementsSha": "b0de9423d7b882ae695a41103c7609a5484645cf2c6bf766a85c358f8ba3a47c",
+        "dirtyFiles": [
+            "specs/148-autonomous-company-operations-end-to-end/runtime-evidence.json",
+            "specs/148-autonomous-company-operations-end-to-end/runtime-verification.md",
+            "src/features/city-view/scene/office/project-backlog/AutonomousCompanyOperationsE2E.test.ts",
+            "tools/agent-workflow/spec148DurableAlignment.js",
+            "tools/agent-workflow/spec148RoleAssignmentEvidence.test.ts",
+        ],
+        "dirtyDiffSha256": "6f393974caf75cb95b059a76a79b643747f8014437d93ba4763cc2a63f4645e0",
+        "sourceDirtyDiffSha256": "f06172f01def39e7818cd1a6d664c87ca69f64ca4bff1a1a10eb95ee96341d4c",
+        "sourceEpoch": 3,
+        "sourceAttemptUsage": 3,
+        "sourceImplementationReopens": 2,
+        "sourceReviewConvergenceReopens": 1,
+        "pinnedImplementerId": "claude",
+        "pinnedImplementerCommand": "claude -p",
+        "pinnedReviewerId": "codex",
+        "pinnedReviewerCommand": "codex exec -",
+        "assignmentSequence": 1,
+        "findingOneChecks": [
+            {
+                "path": "tools/agent-workflow/spec148DurableAlignment.js",
+                "contains": ["validation.status === \"PASS\"", "validatedMatchesHead ="],
+            },
+            {
+                "path": "tools/agent-workflow/spec148RoleAssignmentEvidence.test.ts",
+                "contains": [
+                    "status: \"BLOCK\"",
+                    "expect(alignment.validatedMatchesHead).toBe(false)",
+                    "expect(alignment.allAligned).toBe(false)",
+                    "expect(convergenceForAlignment(alignment)).not.toBe(CONVERGENCE_STATUSES.CONVERGED)",
+                ],
+            },
+        ],
+    }
+}
 PR_REFRESH_ATTEMPTS = 3
 
 
@@ -345,6 +392,7 @@ class RunPipeline:
         continue_restored_review_changes: bool = False,
         retry_pinned_implementer: bool = False,
         continue_dirty_timeout_salvage: bool = False,
+        authorize_substantial_completion: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -412,6 +460,25 @@ class RunPipeline:
                 return PipelineOutcome(
                     str(record.get("status", "IMPLEMENTATION_FAILED")),
                     tuple([*stages, _stage("dirty_timeout_salvage_continuation", "BLOCKED", {})]),
+                    record,
+                    violations=violations,
+                )
+
+        if authorize_substantial_completion:
+            violations = human_authorized_substantial_completion_evidence(
+                self.git,
+                config,
+                run_record_path,
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+                _read_run_artifact(run_record_path, record, "implementer-runtime.json"),
+            )
+            if violations:
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("human_authorized_substantial_completion", "BLOCKED", {})]),
                     record,
                     violations=violations,
                 )
@@ -513,7 +580,12 @@ class RunPipeline:
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
         implementation_recovery_reopened = review_convergence_reopened
-        if continue_dirty_timeout_salvage:
+        if authorize_substantial_completion:
+            completed = self._authorize_substantial_completion(config, run_record_path, record, stages, bootstrap)
+            if isinstance(completed, PipelineOutcome):
+                return completed
+            implementer_result, record = completed
+        elif continue_dirty_timeout_salvage:
             salvaged = self._continue_dirty_timeout_salvage(config, run_record_path, record, stages, bootstrap, timeout_ms)
             if isinstance(salvaged, PipelineOutcome):
                 return salvaged
@@ -1171,6 +1243,184 @@ class RunPipeline:
             "DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED",
             "the final explicitly authorized dirty-timeout salvage attempt failed; preserved work requires human intervention",
             {"epoch": str(epoch), "round": str(round_number), "status": result.status, "dirty_diff_sha256": diff_sha},
+        )
+        _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=result,
+            violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
+        )
+
+    def _authorize_substantial_completion(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        """Consume one exceptional authorization without changing recovery capacity."""
+
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        violations = human_authorized_substantial_completion_evidence(
+            self.git, config, run_record_path, record, candidate, validation, review, implementer
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "IMPLEMENTATION_FAILED")),
+                tuple([*stages, _stage("human_authorized_substantial_completion", "BLOCKED", {})]),
+                record,
+                bootstrap=bootstrap,
+                violations=violations,
+            )
+
+        profile = HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES[str(record["runId"])]
+        assignment = record["agentAssignment"]
+        source_block = record["implementationRecoveryBlock"]
+        source_salvage = record["dirtyTimeoutSalvageContinuation"]
+        source_epoch = _implementation_recovery_epoch(record)
+        source_usage = _implementation_recovery_attempt_count(record)
+        worktree = Path(str(record["featureWorktree"]))
+        dirty_files = tuple(str(item) for item in profile["dirtyFiles"])
+        diff_sha = _dirty_diff_sha256(worktree, dirty_files)
+        runtime_result = implementer["result"]
+        source_runtime_path = run_record_path.with_name("implementer-runtime.json")
+        source_runtime_sha = hashlib.sha256(source_runtime_path.read_bytes()).hexdigest()
+        authorization_id = f"human-substantial-completion-{record['runId']}-{diff_sha[:12]}"
+        artifact_name = f"human-authorized-substantial-completion-{diff_sha[:12]}.json"
+        primary_audit_path = (
+            Path(str(record["primaryRepository"]))
+            / ".agent-workflow"
+            / "runs"
+            / f"{record['specNumber']}-{record['featureSlug']}"
+            / artifact_name
+        )
+        findings = [
+            {
+                "finding": 1,
+                "status": "COMPLETE",
+                "required": "Preserve validation.status === PASS convergence enforcement and its BLOCK + Approved regression.",
+            },
+            {
+                "finding": 2,
+                "status": "UNTOUCHED",
+                "required": "Extend one Project A production execution through request, preparation, implementation, validation, independent review, exact-HEAD convergence, and publication readiness before task completion.",
+            },
+            {
+                "finding": 3,
+                "status": "UNTOUCHED",
+                "required": f"Create machine-verifiable request -> preparation -> execution -> durable run {record['runId']} linkage carrying roles, ownership, candidate, validation, review, HEAD, and convergence evidence for that same Project A cycle.",
+            },
+        ]
+        now = _utc_now()
+        authorization = {
+            "authorizationId": authorization_id,
+            "authorizationType": "HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION",
+            "authorizationProvenance": "EXPLICIT_OPERATOR_CLI_FLAG",
+            "status": "CONSUMED",
+            "authorizedAt": now,
+            "consumedAt": now,
+            "runId": str(record.get("runId", "")),
+            "projectId": str(record.get("projectId", "")),
+            "featureBranch": str(record.get("featureBranch", "")),
+            "featureWorktree": str(record.get("featureWorktree", "")),
+            "sourceTerminalBlock": source_block,
+            "sourceImplementationRecoveryEpoch": source_epoch,
+            "sourceImplementationRecoveryUsage": source_usage,
+            "sourceImplementationRecoveryLimit": config.execution_policy.implementation.max_recovery_rounds,
+            "sourceImplementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "sourceReviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "sourceTimeoutRuntimeId": str(runtime_result.get("runtimeId", "")),
+            "sourceTimeoutRuntimeStatus": str(runtime_result.get("status", "")),
+            "sourceTimeoutRuntimeArtifact": str(source_runtime_path),
+            "sourceTimeoutRuntimeSha256": source_runtime_sha,
+            "startingHead": self.git.current_head(worktree),
+            "startingCandidateSha": str(candidate.get("candidate_sha", "")),
+            "startingValidatedSha": str(validation.get("head_after", "")),
+            "startingReviewedSha": str(review.get("reviewed_sha", "")),
+            "startingDirtyDiffSha256": diff_sha,
+            "approvedDirtyFiles": list(dirty_files),
+            "requirementsSha": str(record.get("requirements", {}).get("sha256", "")),
+            "assignmentSequence": assignment["sequence"],
+            "implementerId": assignment["implementerId"],
+            "implementerCommand": assignment["implementerCommand"],
+            "reviewerId": assignment["reviewerId"],
+            "reviewerCommand": assignment["reviewerCommand"],
+            "candidateOwnerId": assignment["candidateOwnerId"],
+            "pinnedAgentAssignment": assignment,
+            "sourceDirtyTimeoutSalvageAuthorization": source_salvage,
+            "forensicReviewId": str(profile["forensicReviewId"]),
+            "forensicDisposition": "NEEDS_SUBSTANTIAL_COMPLETION",
+            "findings": findings,
+            "ordinaryRecoveryCapacityGranted": 0,
+            "invocationOrdinal": 1,
+            "invocationTimeoutMs": SUBSTANTIAL_COMPLETION_TIMEOUT_MS,
+            "invocationRuntimeId": "",
+            "invocationStatus": "PENDING",
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        updated["humanAuthorizedSubstantialCompletion"] = authorization
+        updated["humanAuthorizedSubstantialCompletions"] = [authorization]
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "human_authorized_substantial_completion_handoff"
+
+        # All durable copies are CONSUMED before the only implementer invocation starts.
+        local_audit_path = run_record_path.with_name(artifact_name)
+        _write_json(local_audit_path, authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        stages.append(
+            _stage(
+                "human_authorized_substantial_completion",
+                "PASS",
+                {
+                    "authorization_id": authorization_id,
+                    "implementer": str(assignment["implementerId"]),
+                    "dirty_diff_sha256": diff_sha,
+                    "timeout_ms": str(SUBSTANTIAL_COMPLETION_TIMEOUT_MS),
+                },
+            )
+        )
+
+        result = self.implementer.run(
+            config=config,
+            run_record_path=run_record_path,
+            timeout_ms=SUBSTANTIAL_COMPLETION_TIMEOUT_MS,
+        )
+        invocation_runtime_id = result.result.runtime_id if result.result is not None else ""
+        completed_authorization = {
+            **authorization,
+            "invocationRuntimeId": invocation_runtime_id,
+            "invocationStatus": result.status,
+        }
+        next_record = _read_json(run_record_path) or result.run_record or updated
+        next_record = dict(next_record)
+        next_record["humanAuthorizedSubstantialCompletion"] = completed_authorization
+        next_record["humanAuthorizedSubstantialCompletions"] = [completed_authorization]
+        _write_json(local_audit_path, completed_authorization)
+        _write_json(primary_audit_path, completed_authorization)
+        _write_json(run_record_path, next_record)
+        stages.append(
+            _stage(
+                "human_authorized_substantial_completion_implementer",
+                result.status,
+                {"authorization_id": authorization_id, "runtime_id": invocation_runtime_id},
+            )
+        )
+        if result.status == "READY_FOR_VALIDATION":
+            return result, next_record
+
+        violation = _violation(
+            "HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_FAILED",
+            "the one human-authorized substantial-completion invocation failed; preserved work requires a new human decision",
+            {"authorization_id": authorization_id, "status": result.status},
         )
         _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
         return PipelineOutcome(
@@ -5310,6 +5560,231 @@ def dirty_timeout_salvage_evidence(
             reject("DIRTY_TIMEOUT_SALVAGE_NEWER_EVIDENCE", "newer candidate, validation, or review evidence supersedes the timeout")
     except OSError:
         reject("DIRTY_TIMEOUT_SALVAGE_ARTIFACT_MISSING", "required durable artifacts are missing")
+    return tuple(violations)
+
+
+def human_authorized_substantial_completion_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+) -> tuple[PipelineViolation, ...]:
+    """Fail-closed admission for the single reviewed Spec 148 terminal state."""
+
+    violations: list[PipelineViolation] = []
+
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+
+    if not isinstance(record, dict):
+        return (_violation("SUBSTANTIAL_COMPLETION_RECORD_INVALID", "authorization requires a durable run record", {}),)
+    profile = HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES.get(str(record.get("runId", "")))
+    if not isinstance(profile, dict) or profile.get("forensicDisposition") != "NEEDS_SUBSTANTIAL_COMPLETION":
+        return (_violation("SUBSTANTIAL_COMPLETION_FORENSIC_PROVENANCE_MISSING", "this run has no human-reviewed substantial-completion profile", {}),)
+
+    if record.get("status") != "IMPLEMENTATION_FAILED":
+        reject("SUBSTANTIAL_COMPLETION_STATUS_INVALID", "authorization requires status IMPLEMENTATION_FAILED")
+    if record.get("nextStage") != "human_intervention":
+        reject("SUBSTANTIAL_COMPLETION_NEXT_STAGE_INVALID", "authorization requires nextStage human_intervention")
+    block = record.get("implementationRecoveryBlock")
+    block_evidence = block.get("evidence") if isinstance(block, dict) else None
+    if not isinstance(block, dict) or block.get("reasonCode") != "DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED" or not isinstance(block_evidence, dict):
+        reject("SUBSTANTIAL_COMPLETION_BLOCK_INVALID", "authorization requires the final dirty-timeout salvage block")
+    elif (
+        str(block_evidence.get("epoch", "")) != str(profile.get("sourceEpoch", ""))
+        or str(block_evidence.get("round", "")) != str(profile.get("sourceAttemptUsage", ""))
+        or str(block_evidence.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+        or str(block_evidence.get("dirty_diff_sha256", "")) != str(profile.get("sourceDirtyDiffSha256", ""))
+    ):
+        reject("SUBSTANTIAL_COMPLETION_BLOCK_EVIDENCE_INVALID", "terminal block does not identify the exact exhausted salvage timeout")
+
+    for key, expected in (
+        ("projectId", profile.get("projectId")),
+        ("specNumber", profile.get("specNumber")),
+        ("featureBranch", profile.get("featureBranch")),
+        ("authoritativeBaseSha", profile.get("authoritativeBaseSha")),
+    ):
+        if str(record.get(key, "")) != str(expected):
+            reject("SUBSTANTIAL_COMPLETION_IDENTITY_MISMATCH", "run identity differs from human-reviewed provenance", {"field": key})
+    recorded_worktree = Path(str(record.get("featureWorktree", "")))
+    if recorded_worktree.resolve() != Path(str(profile.get("featureWorktree", ""))).resolve():
+        reject("SUBSTANTIAL_COMPLETION_WORKTREE_IDENTITY_MISMATCH", "feature worktree differs from human-reviewed provenance")
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if requirements_sha != str(profile.get("requirementsSha", "")):
+        reject("SUBSTANTIAL_COMPLETION_REQUIREMENTS_MISMATCH", "requirements identity differs from human-reviewed provenance")
+
+    cand = _candidate_from_mapping(candidate)
+    try:
+        val = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        rev = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        val = rev = None
+    exact = cand.candidate_sha if cand else ""
+    if cand is None or cand.status != "COMMITTED" or exact != str(profile.get("candidateSha", "")):
+        reject("SUBSTANTIAL_COMPLETION_CANDIDATE_INVALID", "candidate does not match the reviewed terminal state")
+    if val is None or val.status != "PASS":
+        reject("SUBSTANTIAL_COMPLETION_VALIDATION_INVALID", "validation must remain PASS")
+    elif val.head_before != exact or val.head_after != exact:
+        reject("SUBSTANTIAL_COMPLETION_VALIDATION_SHA_MISMATCH", "validation does not match the exact candidate")
+    if rev is None or rev.status != "PASS" or rev.decision != "Changes Requested" or rev.exit_code != 0:
+        reject("SUBSTANTIAL_COMPLETION_REVIEW_INVALID", "review must remain successful Changes Requested")
+    elif rev.reviewed_sha != exact:
+        reject("SUBSTANTIAL_COMPLETION_REVIEW_SHA_MISMATCH", "review does not match the exact candidate")
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict) or (
+        str(assignment.get("implementerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or str(assignment.get("implementerCommand", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(assignment.get("reviewerId", "")) != str(profile.get("pinnedReviewerId", ""))
+        or str(assignment.get("reviewerCommand", "")) != str(profile.get("pinnedReviewerCommand", ""))
+        or str(assignment.get("candidateOwnerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or _positive_int_from_mapping(assignment, "sequence") != int(profile.get("assignmentSequence", 0))
+        or str(record.get("implementer", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(record.get("reviewer", "")) != str(profile.get("pinnedReviewerCommand", ""))
+    ):
+        reject("SUBSTANTIAL_COMPLETION_ASSIGNMENT_MISMATCH", "pinned roles, owner, or assignment sequence changed")
+
+    salvage = record.get("dirtyTimeoutSalvageContinuation")
+    salvage_history = record.get("dirtyTimeoutSalvageContinuations")
+    if not isinstance(salvage, dict) or salvage.get("status") != "CONSUMED":
+        reject("SUBSTANTIAL_COMPLETION_SALVAGE_AUDIT_MISSING", "consumed dirty-timeout salvage authorization is required")
+    elif (
+        not isinstance(salvage_history, list)
+        or len(salvage_history) != 1
+        or salvage_history[0] != salvage
+        or str(salvage.get("runId", "")) != str(record.get("runId", ""))
+        or _positive_int_from_mapping(salvage, "implementationRecoveryEpoch") != int(profile.get("sourceEpoch", 0))
+        or _positive_int_from_mapping(salvage, "implementationRecoveryRound") != int(profile.get("sourceAttemptUsage", 0))
+        or str(salvage.get("candidateSha", "")) != exact
+        or str(salvage.get("validatedSha", "")) != exact
+        or str(salvage.get("reviewedSha", "")) != exact
+        or salvage.get("pinnedAgentAssignment") != assignment
+    ):
+        reject("SUBSTANTIAL_COMPLETION_SALVAGE_AUDIT_INVALID", "salvage authorization does not match this exact run and assignment")
+    else:
+        artifact_name = Path(str(salvage.get("artifact", ""))).name
+        local_salvage = _read_json(run_record_path.with_name(artifact_name)) if artifact_name else None
+        primary_salvage = _read_json(Path(str(salvage.get("artifact", "")))) if salvage.get("artifact") else None
+        if local_salvage != salvage or primary_salvage != salvage:
+            reject("SUBSTANTIAL_COMPLETION_SALVAGE_ARTIFACT_MISMATCH", "salvage audit copies are missing or changed")
+
+    result = implementer.get("result") if isinstance(implementer, dict) else None
+    runtime = implementer.get("runtime") if isinstance(implementer, dict) else None
+    expected_files = tuple(str(item) for item in profile.get("dirtyFiles", []))
+    if not isinstance(result, dict) or not isinstance(runtime, dict):
+        reject("SUBSTANTIAL_COMPLETION_RUNTIME_MISSING", "final salvage runtime evidence is required")
+    else:
+        if (
+            str(result.get("runId", "")) != str(record.get("runId", ""))
+            or str(result.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+            or result.get("timedOut") is not True
+            or result.get("exitCode") is not None
+            or str(result.get("headBefore", "")) != exact
+            or str(result.get("headAfter", "")) != exact
+        ):
+            reject("SUBSTANTIAL_COMPLETION_RUNTIME_INVALID", "runtime does not prove the unchanged-HEAD final timeout")
+        command = runtime.get("command") if isinstance(runtime.get("command"), dict) else {}
+        if str(command.get("adapter", "")) != str(profile.get("pinnedImplementerCommand", "")):
+            reject("SUBSTANTIAL_COMPLETION_RUNTIME_OWNER_MISMATCH", "final timeout did not belong to the pinned implementer")
+        if set(str(item) for item in result.get("changedFiles", [])) != set(expected_files):
+            reject("SUBSTANTIAL_COMPLETION_RUNTIME_DIRTY_SET_MISMATCH", "runtime changed-file evidence differs from reviewed provenance")
+
+    epoch = _implementation_recovery_epoch(record)
+    max_attempts = config.execution_policy.implementation.max_recovery_rounds
+    try:
+        attempt_count = _implementation_recovery_attempt_count(record)
+    except (TypeError, ValueError):
+        attempt_count = 0
+        reject("SUBSTANTIAL_COMPLETION_ATTEMPT_HISTORY_INVALID", "implementation recovery history is malformed")
+    if epoch != int(profile.get("sourceEpoch", 0)) or attempt_count != int(profile.get("sourceAttemptUsage", 0)) or attempt_count != max_attempts:
+        reject("SUBSTANTIAL_COMPLETION_CAPACITY_INVALID", "ordinary recovery must remain exactly exhausted", {"epoch": str(epoch), "attempts": str(attempt_count), "max_attempts": str(max_attempts)})
+    attempts = record.get("implementationRecoveryAttempts")
+    source_attempts = [
+        item for item in attempts
+        if isinstance(attempts, list) and isinstance(item, dict)
+        and _positive_int_from_mapping(item, "reopenEpoch") == int(profile.get("sourceEpoch", 0))
+    ] if isinstance(attempts, list) else []
+    source_attempts.sort(key=lambda item: int(item.get("round", 0)))
+    if (
+        [item.get("round") for item in source_attempts] != list(range(1, int(profile.get("sourceAttemptUsage", 0)) + 1))
+        or not source_attempts
+        or str(source_attempts[-1].get("recoveryImplementerStatus", "")) != "IMPLEMENTATION_TIMED_OUT"
+        or str(source_attempts[-1].get("headAfterRecovery", "")) != exact
+        or set(str(item) for item in source_attempts[-1].get("changedFilesAfterRecovery", [])) != set(expected_files)
+    ):
+        reject("SUBSTANTIAL_COMPLETION_SOURCE_ATTEMPT_INVALID", "epoch history does not identify the final reviewed timeout")
+    implementation_reopens = record.get("implementationRecoveryReopens")
+    convergence_reopens = record.get("reviewConvergenceReopens")
+    if (
+        not isinstance(implementation_reopens, list)
+        or len(implementation_reopens) != int(profile.get("sourceImplementationReopens", -1))
+        or len(implementation_reopens) != config.execution_policy.implementation.max_recovery_reopens
+    ):
+        reject("SUBSTANTIAL_COMPLETION_IMPLEMENTATION_REOPENS_INVALID", "implementation-recovery reopens must remain exactly exhausted")
+    if (
+        not isinstance(convergence_reopens, list)
+        or len(convergence_reopens) != int(profile.get("sourceReviewConvergenceReopens", -1))
+        or len(convergence_reopens) != config.execution_policy.review.max_convergence_reopens
+    ):
+        reject("SUBSTANTIAL_COMPLETION_CONVERGENCE_REOPENS_INVALID", "review-convergence reopens must remain exactly exhausted")
+
+    if "humanAuthorizedSubstantialCompletion" in record or "humanAuthorizedSubstantialCompletions" in record:
+        reject("SUBSTANTIAL_COMPLETION_ALREADY_USED", "substantial completion may be authorized only once")
+    try:
+        status = git.status(recorded_worktree)
+        current_head = git.current_head(recorded_worktree)
+        branch = git.current_branch(recorded_worktree)
+    except RepositoryProviderError as exc:
+        reject(exc.code, exc.message)
+    else:
+        if status.root != recorded_worktree.resolve() or branch != str(profile.get("featureBranch", "")):
+            reject("SUBSTANTIAL_COMPLETION_WORKTREE_IDENTITY_MISMATCH", "worktree root or branch changed")
+        if current_head != exact:
+            reject("SUBSTANTIAL_COMPLETION_HEAD_MISMATCH", "HEAD no longer matches the authoritative candidate")
+        if status.staged:
+            reject("SUBSTANTIAL_COMPLETION_STAGED_FILES", "staged files are forbidden")
+        if status.untracked:
+            reject("SUBSTANTIAL_COMPLETION_UNTRACKED_FILES", "untracked files are forbidden")
+        if set(status.dirty_tracked) != set(expected_files):
+            reject("SUBSTANTIAL_COMPLETION_DIRTY_SET_MISMATCH", "worktree must contain exactly the five reviewed tracked modifications")
+
+    actual_diff_sha = _dirty_diff_sha256(recorded_worktree, expected_files)
+    if actual_diff_sha != str(profile.get("dirtyDiffSha256", "")):
+        reject("SUBSTANTIAL_COMPLETION_DIFF_MISMATCH", "dirty diff differs from the final human-reviewed bytes", {"expected": str(profile.get("dirtyDiffSha256", "")), "actual": actual_diff_sha})
+    diff_check = subprocess.run(("git", "diff", "--check"), cwd=recorded_worktree, shell=False, capture_output=True)
+    if diff_check.returncode != 0:
+        reject("SUBSTANTIAL_COMPLETION_DIFF_CHECK_FAILED", "dirty diff failed git diff --check")
+    checks = profile.get("findingOneChecks")
+    if not isinstance(checks, list) or not checks:
+        reject("SUBSTANTIAL_COMPLETION_FINDING_ONE_PROVENANCE_MISSING", "Finding 1 structural provenance is missing")
+    else:
+        for check in checks:
+            path = recorded_worktree / str(check.get("path", "")) if isinstance(check, dict) else recorded_worktree
+            fragments = check.get("contains", []) if isinstance(check, dict) else []
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            if not isinstance(fragments, list) or not fragments or any(str(fragment) not in content for fragment in fragments):
+                reject("SUBSTANTIAL_COMPLETION_FINDING_ONE_INVALID", "the completed Finding 1 fix or regression is missing", {"path": str(path)})
+
+    artifact_name = f"human-authorized-substantial-completion-{actual_diff_sha[:12]}.json"
+    primary_artifact = Path(str(record.get("primaryRepository", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / artifact_name
+    if run_record_path.with_name(artifact_name).exists() or primary_artifact.exists():
+        reject("SUBSTANTIAL_COMPLETION_ALREADY_USED", "substantial-completion audit already exists")
+    try:
+        implementer_time = run_record_path.with_name("implementer-runtime.json").stat().st_mtime_ns
+        salvage_name = Path(str(salvage.get("artifact", ""))).name if isinstance(salvage, dict) else ""
+        if not salvage_name or run_record_path.with_name(salvage_name).stat().st_mtime_ns >= implementer_time:
+            reject("SUBSTANTIAL_COMPLETION_RUNTIME_ORDER_INVALID", "final timeout must postdate its salvage authorization")
+        if any(run_record_path.with_name(name).stat().st_mtime_ns > implementer_time for name in ("candidate.json", "validation-runtime.json", "review-runtime.json")):
+            reject("SUBSTANTIAL_COMPLETION_NEWER_EVIDENCE", "newer candidate, validation, or review evidence supersedes the timeout")
+    except OSError:
+        reject("SUBSTANTIAL_COMPLETION_ARTIFACT_MISSING", "required durable artifacts are missing")
     return tuple(violations)
 
 

@@ -445,6 +445,25 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 "Do not manually mark Project A complete before implementation, validation, independent review, exact-HEAD, and publication-ready/converged gates are satisfied.",
             ]
         )
+    substantial_completion = record.get("humanAuthorizedSubstantialCompletion")
+    if isinstance(substantial_completion, dict) and substantial_completion.get("status") == "CONSUMED":
+        lines.extend(
+            [
+                "",
+                "Human-authorized substantial-completion continuation:",
+                f"Authorization ID: {substantial_completion.get('authorizationId', '')}",
+                f"Approved starting dirty diff SHA-256: {substantial_completion.get('startingDirtyDiffSha256', '')}",
+                "Preserve the five forensic-reviewed dirty files as the starting point. Do not reset, restore, clean, or discard them.",
+                "Finding 1 is COMPLETE. Preserve validation.status === PASS as a prerequisite for validatedMatchesHead and preserve its BLOCK + Approved non-convergence regression.",
+                "Findings 2 and 3 require substantial implementation, including production types/services where appropriate.",
+                "You may inspect and modify any necessary AIverse production files, tests, Spec 148 evidence, and supporting tooling; you are not limited to the five starting dirty files.",
+                "Finding 2: extend one Project A production execution through request -> preparation -> implementation -> validation -> independent review -> exact-HEAD convergence -> publication readiness. Do not treat synthetic booleans alone as successful completion, and do not complete the task before these gates pass.",
+                f"Finding 3: machine-verifiably bind Project A request ID -> preparation ID -> execution ID -> durable ADOS run ID {substantial_completion.get('runId', '')}. The same execution must carry/consume structured run identity, Claude implementer and candidate ownership, Codex reviewer, candidate SHA, PASS validation and validated SHA, review decision and reviewed SHA, exact HEAD, and publication/convergence state.",
+                "Do not solve the linkage by documenting that the identities are unrelated. Production execution must be capable of representing the relationship, and the E2E test must prove the complete same-cycle chain.",
+                "Update runtime-evidence.json and runtime-verification.md to describe the machine-verified relationship.",
+                "This authorization grants implementation only. It does not approve validation, review, exact HEAD, publication, or merge; ADOS applies those gates after you return.",
+            ]
+        )
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(

@@ -77,6 +77,11 @@ class CliApplication:
             action="store_true",
             help="continue an exact forensic-approved dirty timeout in the active recovery epoch",
         )
+        run.add_argument(
+            "--authorize-substantial-completion",
+            action="store_true",
+            help="authorize one exact human-reviewed substantial-completion invocation outside exhausted recovery",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -192,6 +197,7 @@ class CliApplication:
                     continue_restored_review_changes=args.continue_restored_review_changes,
                     retry_pinned_implementer=args.retry_pinned_implementer,
                     continue_dirty_timeout_salvage=args.continue_dirty_timeout_salvage,
+                    authorize_substantial_completion=args.authorize_substantial_completion,
                     prefer_implementer=args.prefer_implementer,
                 )
             )
