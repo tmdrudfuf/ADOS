@@ -404,6 +404,24 @@ class RunPipeline:
         if isinstance(record.get("requirements"), dict):
             stages.append(_stage("requirements", "PASS", {"sha256": str(record["requirements"].get("sha256", ""))}))
 
+        substantial_completion = record.get("humanAuthorizedSubstantialCompletion")
+        if (
+            isinstance(substantial_completion, dict)
+            and substantial_completion.get("status") == "CONSUMED"
+            and substantial_completion.get("invocationStatus") == "PENDING"
+        ):
+            violation = _violation(
+                "HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_INVOCATION_UNRESOLVED",
+                "the consumed substantial-completion invocation has no durable result; another invocation requires a new human decision",
+                {"authorization_id": str(substantial_completion.get("authorizationId", ""))},
+            )
+            return PipelineOutcome(
+                "IMPLEMENTATION_FAILED",
+                tuple([*stages, _stage("human_authorized_substantial_completion", "BLOCKED", {"reason": violation.code})]),
+                record,
+                violations=(violation,),
+            )
+
         if restore_failed_review_routing_state:
             return self._restore_failed_review_routing_state(config, run_record_path, record, stages)
 
@@ -5708,7 +5726,11 @@ def human_authorized_substantial_completion_evidence(
         if isinstance(attempts, list) and isinstance(item, dict)
         and _positive_int_from_mapping(item, "reopenEpoch") == int(profile.get("sourceEpoch", 0))
     ] if isinstance(attempts, list) else []
-    source_attempts.sort(key=lambda item: int(item.get("round", 0)))
+    try:
+        source_attempts.sort(key=lambda item: int(item.get("round", 0)))
+    except (TypeError, ValueError):
+        source_attempts = []
+        reject("SUBSTANTIAL_COMPLETION_ATTEMPT_HISTORY_INVALID", "implementation recovery round values must be integers")
     if (
         [item.get("round") for item in source_attempts] != list(range(1, int(profile.get("sourceAttemptUsage", 0)) + 1))
         or not source_attempts

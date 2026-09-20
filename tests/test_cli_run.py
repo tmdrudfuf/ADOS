@@ -4823,6 +4823,37 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("IMPLEMENTATION_FAILED", plain.status)
         self.assertNotIn("human_authorized_substantial_completion_implementer", [stage.id for stage in plain.stages])
 
+    def test_consumed_substantial_completion_pending_result_blocks_plain_resume_without_invocation(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_completion_run(fixture, "Interrupted human substantial completion")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            original_attempts = record["implementationRecoveryAttempts"]
+            record["humanAuthorizedSubstantialCompletion"] = {
+                "authorizationId": "interrupted-test-authorization",
+                "status": "CONSUMED",
+                "invocationStatus": "PENDING",
+            }
+            record["humanAuthorizedSubstantialCompletions"] = [record["humanAuthorizedSubstantialCompletion"]]
+            record["status"] = "READY_FOR_IMPLEMENTATION"
+            record["nextStage"] = "human_authorized_substantial_completion_handoff"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            before_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+            outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=state["record_path"],
+                timeout_ms=1234,
+            )
+            after = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            after_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual("IMPLEMENTATION_FAILED", outcome.status)
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_INVOCATION_UNRESOLVED", {item.code for item in outcome.violations})
+        self.assertEqual(before_count, after_count)
+        self.assertEqual("PENDING", after["humanAuthorizedSubstantialCompletion"]["invocationStatus"])
+        self.assertEqual(original_attempts, after["implementationRecoveryAttempts"])
+        self.assertNotIn("implementer", [stage.id for stage in outcome.stages])
+
     def test_human_authorized_substantial_completion_admission_fails_closed_on_exact_state_drift(self):
         cases = {
             "wrong_block": "SUBSTANTIAL_COMPLETION_BLOCK_INVALID",
@@ -4830,6 +4861,7 @@ class CliRunTests(unittest.TestCase):
             "wrong_next_stage": "SUBSTANTIAL_COMPLETION_NEXT_STAGE_INVALID",
             "wrong_epoch": "SUBSTANTIAL_COMPLETION_CAPACITY_INVALID",
             "usage_not_exhausted": "SUBSTANTIAL_COMPLETION_CAPACITY_INVALID",
+            "malformed_round": "SUBSTANTIAL_COMPLETION_ATTEMPT_HISTORY_INVALID",
             "wrong_run": "SUBSTANTIAL_COMPLETION_FORENSIC_PROVENANCE_MISSING",
             "wrong_branch": "SUBSTANTIAL_COMPLETION_IDENTITY_MISMATCH",
             "wrong_worktree": "SUBSTANTIAL_COMPLETION_WORKTREE_IDENTITY_MISMATCH",
@@ -4875,6 +4907,7 @@ class CliRunTests(unittest.TestCase):
                 elif mutation == "wrong_next_stage": record["nextStage"] = "implementation_handoff"
                 elif mutation == "wrong_epoch": record["implementationRecoveryReopens"].pop()
                 elif mutation == "usage_not_exhausted": record["implementationRecoveryAttempts"] = record["implementationRecoveryAttempts"][:-1]
+                elif mutation == "malformed_round": record["implementationRecoveryAttempts"][-1]["round"] = "invalid"
                 elif mutation == "wrong_run": record["runId"] = "unrelated"
                 elif mutation == "wrong_branch": record["featureBranch"] = "codex/other"
                 elif mutation == "wrong_worktree": record["featureWorktree"] = str(fixture.repo)
