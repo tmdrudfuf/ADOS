@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -33,6 +34,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--continue-restored-review-changes", completed.stdout)
         self.assertIn("--retry-pinned-implementer", completed.stdout)
         self.assertIn("--continue-dirty-timeout-salvage", completed.stdout)
+        self.assertIn("--authorize-substantial-completion", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -4719,6 +4721,228 @@ class CliRunTests(unittest.TestCase):
                     )
                 self.assertIn(expected, {item.code for item in violations})
 
+    def test_human_authorized_substantial_completion_is_consumed_before_claude_and_resumes_normal_gates(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_completion_run(fixture, "Human authorized substantial completion")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            attempts_before = before["implementationRecoveryAttempts"]
+            implementation_reopens_before = before["implementationRecoveryReopens"]
+            convergence_reopens_before = before["reviewConvergenceReopens"]
+            dirty_contents = {path: (state["worktree"] / path).read_text(encoding="utf-8") for path in state["profile"]["dirtyFiles"]}
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import json, sys\n"
+                "prompt = sys.stdin.read()\n"
+                "assert 'Finding 1 is COMPLETE' in prompt\n"
+                "assert 'Findings 2 and 3 require substantial implementation' in prompt\n"
+                "assert 'not limited to the five starting dirty files' in prompt\n"
+                "record = json.loads(Path('.agent-workflow/runs/001-human-authorized-substantial-completion/ados-run.json').read_text(encoding='utf-8'))\n"
+                "auth = record['humanAuthorizedSubstantialCompletion']\n"
+                "assert auth['status'] == 'CONSUMED'\n"
+                "assert auth['invocationStatus'] == 'PENDING'\n"
+                "assert auth['invocationTimeoutMs'] == 1800000\n"
+                "assert record['status'] == 'READY_FOR_IMPLEMENTATION'\n"
+                f"expected = {dirty_contents!r}\n"
+                "for name, content in expected.items():\n"
+                "    assert Path(name).read_text(encoding='utf-8') == content\n"
+                "Path('implementation.txt').write_text('substantial completion finished', encoding='utf-8')\n"
+                "Path('production-linkage.txt').write_text('request -> preparation -> execution -> durable run', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            with (
+                mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, {state["run_id"]: state["salvage_profile"]}, clear=False),
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+            ):
+                result = RunService(pipeline=RunPipeline(publisher=FakePublisher(fixture.repo))).run(
+                    RunRequest(
+                        fixture.repo,
+                        "Human authorized substantial completion",
+                        1,
+                        fixture.config,
+                        requirements_file=state["requirements"],
+                        implementer_timeout_ms=1234,
+                        authorize_substantial_completion=True,
+                    )
+                )
+            final = result.pipeline_result.run_record
+            stages = [stage.id for stage in result.pipeline_result.stages]
+            authorization = final["humanAuthorizedSubstantialCompletion"]
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual(before["runId"], final["runId"])
+        self.assertEqual(before["agentAssignment"], final["agentAssignment"])
+        self.assertEqual("claude", final["agentAssignment"]["candidateOwnerId"])
+        self.assertEqual(attempts_before, final["implementationRecoveryAttempts"])
+        self.assertEqual(implementation_reopens_before, final["implementationRecoveryReopens"])
+        self.assertEqual(convergence_reopens_before, final["reviewConvergenceReopens"])
+        self.assertEqual("CONSUMED", authorization["status"])
+        self.assertEqual(3, authorization["sourceImplementationRecoveryEpoch"])
+        self.assertEqual(3, authorization["sourceImplementationRecoveryUsage"])
+        self.assertEqual(0, authorization["ordinaryRecoveryCapacityGranted"])
+        self.assertEqual(1_800_000, authorization["invocationTimeoutMs"])
+        self.assertEqual("READY_FOR_VALIDATION", authorization["invocationStatus"])
+        self.assertLess(stages.index("human_authorized_substantial_completion_implementer"), stages.index("candidate"))
+        self.assertLess(stages.index("candidate"), stages.index("validation"))
+        self.assertLess(stages.index("validation"), stages.index("review"))
+        self.assertLess(stages.index("review"), stages.index("exact_head"))
+
+    def test_human_authorized_substantial_completion_failure_is_one_shot_and_preserves_exhausted_accounting(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_completion_run(fixture, "Failed human substantial completion")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import json, sys\n"
+                "record = json.loads(Path('.agent-workflow/runs/001-failed-human-substantial-completion/ados-run.json').read_text(encoding='utf-8'))\n"
+                "assert record['humanAuthorizedSubstantialCompletion']['status'] == 'CONSUMED'\n"
+                "Path('implementation.txt').write_text('failed substantial completion preserved', encoding='utf-8')\n"
+                "sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(run_pipeline.DIRTY_TIMEOUT_SALVAGE_PROFILES, {state["run_id"]: state["salvage_profile"]}, clear=False),
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+            ):
+                pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+                failed = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1000, authorize_substantial_completion=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1000, authorize_substantial_completion=True)
+                plain = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1000)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            preserved_content = (state["worktree"] / "implementation.txt").read_text(encoding="utf-8")
+
+        self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
+        self.assertEqual("human_intervention", final["nextStage"])
+        self.assertEqual("HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual("CONSUMED", final["humanAuthorizedSubstantialCompletion"]["status"])
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertIn("failed substantial completion preserved", preserved_content)
+        self.assertIn("SUBSTANTIAL_COMPLETION_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertEqual("IMPLEMENTATION_FAILED", plain.status)
+        self.assertNotIn("human_authorized_substantial_completion_implementer", [stage.id for stage in plain.stages])
+
+    def test_consumed_substantial_completion_pending_result_blocks_plain_resume_without_invocation(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_completion_run(fixture, "Interrupted human substantial completion")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            original_attempts = record["implementationRecoveryAttempts"]
+            record["humanAuthorizedSubstantialCompletion"] = {
+                "authorizationId": "interrupted-test-authorization",
+                "status": "CONSUMED",
+                "invocationStatus": "PENDING",
+            }
+            record["humanAuthorizedSubstantialCompletions"] = [record["humanAuthorizedSubstantialCompletion"]]
+            record["status"] = "READY_FOR_IMPLEMENTATION"
+            record["nextStage"] = "human_authorized_substantial_completion_handoff"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            before_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+            outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config),
+                run_record_path=state["record_path"],
+                timeout_ms=1234,
+            )
+            after = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            after_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual("IMPLEMENTATION_FAILED", outcome.status)
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_INVOCATION_UNRESOLVED", {item.code for item in outcome.violations})
+        self.assertEqual(before_count, after_count)
+        self.assertEqual("PENDING", after["humanAuthorizedSubstantialCompletion"]["invocationStatus"])
+        self.assertEqual(original_attempts, after["implementationRecoveryAttempts"])
+        self.assertNotIn("implementer", [stage.id for stage in outcome.stages])
+
+    def test_human_authorized_substantial_completion_admission_fails_closed_on_exact_state_drift(self):
+        cases = {
+            "wrong_block": "SUBSTANTIAL_COMPLETION_BLOCK_INVALID",
+            "wrong_status": "SUBSTANTIAL_COMPLETION_STATUS_INVALID",
+            "wrong_next_stage": "SUBSTANTIAL_COMPLETION_NEXT_STAGE_INVALID",
+            "wrong_epoch": "SUBSTANTIAL_COMPLETION_CAPACITY_INVALID",
+            "usage_not_exhausted": "SUBSTANTIAL_COMPLETION_CAPACITY_INVALID",
+            "malformed_round": "SUBSTANTIAL_COMPLETION_ATTEMPT_HISTORY_INVALID",
+            "wrong_run": "SUBSTANTIAL_COMPLETION_FORENSIC_PROVENANCE_MISSING",
+            "wrong_branch": "SUBSTANTIAL_COMPLETION_IDENTITY_MISMATCH",
+            "wrong_worktree": "SUBSTANTIAL_COMPLETION_WORKTREE_IDENTITY_MISMATCH",
+            "wrong_base": "SUBSTANTIAL_COMPLETION_IDENTITY_MISMATCH",
+            "wrong_requirements": "SUBSTANTIAL_COMPLETION_REQUIREMENTS_MISMATCH",
+            "wrong_sequence": "SUBSTANTIAL_COMPLETION_ASSIGNMENT_MISMATCH",
+            "wrong_implementer": "SUBSTANTIAL_COMPLETION_ASSIGNMENT_MISMATCH",
+            "wrong_reviewer": "SUBSTANTIAL_COMPLETION_ASSIGNMENT_MISMATCH",
+            "wrong_owner": "SUBSTANTIAL_COMPLETION_ASSIGNMENT_MISMATCH",
+            "head_mismatch": "SUBSTANTIAL_COMPLETION_HEAD_MISMATCH",
+            "candidate_sha": "SUBSTANTIAL_COMPLETION_CANDIDATE_INVALID",
+            "validation_sha": "SUBSTANTIAL_COMPLETION_VALIDATION_SHA_MISMATCH",
+            "reviewed_sha": "SUBSTANTIAL_COMPLETION_REVIEW_SHA_MISMATCH",
+            "validation_status": "SUBSTANTIAL_COMPLETION_VALIDATION_INVALID",
+            "review_decision": "SUBSTANTIAL_COMPLETION_REVIEW_INVALID",
+            "missing_salvage": "SUBSTANTIAL_COMPLETION_SALVAGE_AUDIT_MISSING",
+            "salvage_not_consumed": "SUBSTANTIAL_COMPLETION_SALVAGE_AUDIT_MISSING",
+            "wrong_timeout": "SUBSTANTIAL_COMPLETION_RUNTIME_INVALID",
+            "missing_dirty": "SUBSTANTIAL_COMPLETION_DIRTY_SET_MISMATCH",
+            "extra_untracked": "SUBSTANTIAL_COMPLETION_UNTRACKED_FILES",
+            "staged": "SUBSTANTIAL_COMPLETION_STAGED_FILES",
+            "diff_mutation": "SUBSTANTIAL_COMPLETION_DIFF_MISMATCH",
+            "missing_finding_one_fix": "SUBSTANTIAL_COMPLETION_FINDING_ONE_INVALID",
+            "missing_finding_one_regression": "SUBSTANTIAL_COMPLETION_FINDING_ONE_INVALID",
+            "implementation_reopens_remaining": "SUBSTANTIAL_COMPLETION_IMPLEMENTATION_REOPENS_INVALID",
+            "convergence_reopens_remaining": "SUBSTANTIAL_COMPLETION_CONVERGENCE_REOPENS_INVALID",
+            "newer_evidence": "SUBSTANTIAL_COMPLETION_NEWER_EVIDENCE",
+            "already_used": "SUBSTANTIAL_COMPLETION_ALREADY_USED",
+        }
+        for mutation, expected in cases.items():
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_substantial_completion_run(fixture, f"Substantial evidence {mutation}")
+                record_path = state["record_path"]
+                paths = {name: record_path.with_name(name) for name in ("candidate.json", "validation-runtime.json", "review-runtime.json", "implementer-runtime.json")}
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                candidate = json.loads(paths["candidate.json"].read_text(encoding="utf-8"))
+                validation = json.loads(paths["validation-runtime.json"].read_text(encoding="utf-8"))
+                review = json.loads(paths["review-runtime.json"].read_text(encoding="utf-8"))
+                implementer = json.loads(paths["implementer-runtime.json"].read_text(encoding="utf-8"))
+                profiles = {state["run_id"]: state["profile"]}
+                if mutation == "wrong_block": record["implementationRecoveryBlock"]["reasonCode"] = "OTHER"
+                elif mutation == "wrong_status": record["status"] = "READY_FOR_IMPLEMENTATION"
+                elif mutation == "wrong_next_stage": record["nextStage"] = "implementation_handoff"
+                elif mutation == "wrong_epoch": record["implementationRecoveryReopens"].pop()
+                elif mutation == "usage_not_exhausted": record["implementationRecoveryAttempts"] = record["implementationRecoveryAttempts"][:-1]
+                elif mutation == "malformed_round": record["implementationRecoveryAttempts"][-1]["round"] = "invalid"
+                elif mutation == "wrong_run": record["runId"] = "unrelated"
+                elif mutation == "wrong_branch": record["featureBranch"] = "codex/other"
+                elif mutation == "wrong_worktree": record["featureWorktree"] = str(fixture.repo)
+                elif mutation == "wrong_base": record["authoritativeBaseSha"] = "f" * 40
+                elif mutation == "wrong_requirements": record["requirements"]["sha256"] = "f" * 64
+                elif mutation == "wrong_sequence": record["agentAssignment"]["sequence"] = 2
+                elif mutation == "wrong_implementer": record["agentAssignment"]["implementerId"] = "codex"
+                elif mutation == "wrong_reviewer": record["agentAssignment"]["reviewerId"] = "claude"
+                elif mutation == "wrong_owner": record["agentAssignment"]["candidateOwnerId"] = "codex"
+                elif mutation == "head_mismatch": self.git(state["worktree"], "commit", "--allow-empty", "-m", "newer candidate")
+                elif mutation == "candidate_sha": candidate["candidate_sha"] = "f" * 40
+                elif mutation == "validation_sha": validation["head_after"] = "f" * 40
+                elif mutation == "reviewed_sha": review["reviewed_sha"] = "f" * 40
+                elif mutation == "validation_status": validation["status"] = "BLOCK"
+                elif mutation == "review_decision": review["decision"] = "Approved"
+                elif mutation == "missing_salvage": record.pop("dirtyTimeoutSalvageContinuation")
+                elif mutation == "salvage_not_consumed": record["dirtyTimeoutSalvageContinuation"]["status"] = "AUTHORIZED"
+                elif mutation == "wrong_timeout": implementer["result"]["status"] = "IMPLEMENTATION_FAILED"
+                elif mutation == "missing_dirty": self.git(state["worktree"], "restore", "--", state["profile"]["dirtyFiles"][0])
+                elif mutation == "extra_untracked": (state["worktree"] / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+                elif mutation == "staged": self.git(state["worktree"], "add", "--", state["profile"]["dirtyFiles"][0])
+                elif mutation == "diff_mutation": (state["worktree"] / state["profile"]["dirtyFiles"][0]).write_text("one changed line", encoding="utf-8")
+                elif mutation == "missing_finding_one_fix": (state["worktree"] / "finding-one.js").write_text("fix removed", encoding="utf-8")
+                elif mutation == "missing_finding_one_regression": (state["worktree"] / "finding-one.test.ts").write_text("regression removed", encoding="utf-8")
+                elif mutation == "implementation_reopens_remaining": record["implementationRecoveryReopens"].pop()
+                elif mutation == "convergence_reopens_remaining": record["reviewConvergenceReopens"].pop()
+                elif mutation == "newer_evidence": os.utime(paths["candidate.json"], ns=(paths["implementer-runtime.json"].stat().st_mtime_ns + 1_000_000, paths["implementer-runtime.json"].stat().st_mtime_ns + 1_000_000))
+                elif mutation == "already_used": record["humanAuthorizedSubstantialCompletion"] = {"status": "CONSUMED"}
+                with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES, profiles, clear=False):
+                    violations = run_pipeline.human_authorized_substantial_completion_evidence(
+                        run_pipeline.GitRepositoryProvider(), load_project_config(fixture.config), record_path,
+                        record, candidate, validation, review, implementer,
+                    )
+                self.assertIn(expected, {item.code for item in violations})
+
     def test_failed_reviewer_dirty_side_effect_reopen_rejects_unsafe_evidence(self):
         for mutation, expected_code in (
             ("validation", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED"),
@@ -5926,6 +6150,145 @@ class CliRunTests(unittest.TestCase):
             "forensicValidation": ["git diff --check", "focused tests"],
         }
         return {**state, "profile": profile, "run_id": record["runId"]}
+
+    def create_substantial_completion_run(self, fixture, feature):
+        base_files = {
+            "finding-one.js": "module.exports = {};\n",
+            "finding-one.test.ts": "// baseline regression\n",
+            "evidence.json": "{}\n",
+            "verification.md": "baseline\n",
+        }
+        for path, content in base_files.items():
+            (fixture.repo / path).write_text(content, encoding="utf-8")
+        self.git(fixture.repo, "add", "--", *base_files)
+        self.git(fixture.repo, "commit", "-m", "add substantial completion fixtures")
+        self.git(fixture.repo, "update-ref", "refs/remotes/origin/main", self.head(fixture.repo))
+
+        state = self.create_dirty_timeout_salvage_run(fixture, feature)
+        salvage_profile = state["profile"]
+        worktree = state["worktree"]
+        dirty_contents = {
+            "finding-one.js": 'const validatedMatchesHead = validation.status === "PASS" && targetsMatch(validation.head_after, head);\n',
+            "finding-one.test.ts": 'status: "BLOCK"; expect(alignment.validatedMatchesHead).toBe(false); expect(alignment.allAligned).toBe(false); expect(convergenceForAlignment(alignment)).not.toBe(CONVERGENCE_STATUSES.CONVERGED);\n',
+            "evidence.json": '{"forensic":"coherent"}\n',
+            "verification.md": "Findings 2 and 3 remain for substantial completion.\n",
+        }
+        for path, content in dirty_contents.items():
+            (worktree / path).write_text(content, encoding="utf-8", newline="\n")
+
+        record_path = state["record_path"]
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        candidate = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))
+        validation = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+        review = json.loads(record_path.with_name("review-runtime.json").read_text(encoding="utf-8"))
+        exact = candidate["candidate_sha"]
+        assignment = record["agentAssignment"]
+        approved_files = ["implementation.txt", *dirty_contents]
+        primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}"
+        salvage_artifact = primary_run_dir / f"dirty-timeout-salvage-3-3-{salvage_profile['dirtyDiffSha256'][:12]}.json"
+        salvage_authorization = {
+            "status": "CONSUMED",
+            "authorization": "EXPLICIT_OPERATOR_REQUEST",
+            "authorizedAt": "2026-09-14T09:39:11+00:00",
+            "consumedAt": "2026-09-14T09:39:11+00:00",
+            "runId": record["runId"],
+            "candidateSha": exact,
+            "validatedSha": validation["head_after"],
+            "reviewedSha": review["reviewed_sha"],
+            "approvedDirtyFiles": salvage_profile["dirtyFiles"],
+            "approvedDirtyDiffSha256": salvage_profile["dirtyDiffSha256"],
+            "implementationRecoveryEpoch": 3,
+            "implementationRecoveryRound": 3,
+            "implementationRecoveryAttemptLimit": 3,
+            "pinnedAgentAssignment": assignment,
+            "artifact": str(salvage_artifact),
+        }
+        salvage_artifact.write_text(json.dumps(salvage_authorization, indent=2, sort_keys=True), encoding="utf-8")
+        record_path.with_name(salvage_artifact.name).write_text(json.dumps(salvage_authorization, indent=2, sort_keys=True), encoding="utf-8")
+        record["dirtyTimeoutSalvageContinuation"] = salvage_authorization
+        record["dirtyTimeoutSalvageContinuations"] = [salvage_authorization]
+        record["implementationRecoveryAttempts"].append(
+            {
+                "round": 3,
+                "reopenEpoch": 3,
+                "maxRounds": 3,
+                "status": "RECOVERY_IMPLEMENTER_PENDING",
+                "priorStatus": "IMPLEMENTATION_FAILED",
+                "recoveryImplementerStatus": "IMPLEMENTATION_TIMED_OUT",
+                "headAfterRecovery": exact,
+                "changedFilesAfterRecovery": approved_files,
+                "recoveryImplementerViolationCodes": ["IMPLEMENTER_TIMED_OUT"],
+            }
+        )
+        record["status"] = "IMPLEMENTATION_FAILED"
+        record["nextStage"] = "human_intervention"
+        record["implementationRecoveryBlock"] = {
+            "status": "BLOCKED",
+            "reasonCode": "DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED",
+            "message": "the final explicitly authorized dirty-timeout salvage attempt failed",
+            "evidence": {
+                "epoch": "3",
+                "round": "3",
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "dirty_diff_sha256": salvage_profile["dirtyDiffSha256"],
+            },
+        }
+        timeout_runtime = {
+            "status": "IMPLEMENTATION_TIMED_OUT",
+            "runtime": {
+                "runtimeId": "test-final-salvage-timeout",
+                "runId": record["runId"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "command": {"adapter": record["implementer"], "timeoutMs": 300000},
+            },
+            "result": {
+                "runtimeId": "test-final-salvage-timeout",
+                "runId": record["runId"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "exitCode": None,
+                "timedOut": True,
+                "stdout": "",
+                "stderr": "timeout",
+                "headBefore": exact,
+                "headAfter": exact,
+                "changedFiles": approved_files,
+                "runtimeFailureCategory": "UNKNOWN_RUNTIME_FAILURE",
+                "violations": [{"code": "IMPLEMENTER_TIMED_OUT", "message": "timed out", "evidence": {"timeout_ms": "300000"}}],
+            },
+            "runRecord": record,
+            "violations": [],
+        }
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        record_path.with_name("implementer-runtime.json").write_text(json.dumps(timeout_runtime, indent=2, sort_keys=True), encoding="utf-8")
+        diff_sha = run_pipeline._dirty_diff_sha256(worktree, tuple(approved_files))
+        profile = {
+            "forensicReviewId": "test-final-substantial-review",
+            "forensicDisposition": "NEEDS_SUBSTANTIAL_COMPLETION",
+            "projectId": record["projectId"],
+            "specNumber": record["specNumber"],
+            "featureBranch": record["featureBranch"],
+            "featureWorktree": record["featureWorktree"],
+            "authoritativeBaseSha": record["authoritativeBaseSha"],
+            "candidateSha": exact,
+            "requirementsSha": record["requirements"]["sha256"],
+            "dirtyFiles": approved_files,
+            "dirtyDiffSha256": diff_sha,
+            "sourceDirtyDiffSha256": salvage_profile["dirtyDiffSha256"],
+            "sourceEpoch": 3,
+            "sourceAttemptUsage": 3,
+            "sourceImplementationReopens": 2,
+            "sourceReviewConvergenceReopens": 1,
+            "pinnedImplementerId": assignment["implementerId"],
+            "pinnedImplementerCommand": assignment["implementerCommand"],
+            "pinnedReviewerId": assignment["reviewerId"],
+            "pinnedReviewerCommand": assignment["reviewerCommand"],
+            "assignmentSequence": assignment["sequence"],
+            "findingOneChecks": [
+                {"path": "finding-one.js", "contains": ['validation.status === "PASS"', "validatedMatchesHead ="]},
+                {"path": "finding-one.test.ts", "contains": ['status: "BLOCK"', "expect(alignment.validatedMatchesHead).toBe(false)", "expect(alignment.allAligned).toBe(false)", "expect(convergenceForAlignment(alignment)).not.toBe(CONVERGENCE_STATUSES.CONVERGED)"]},
+            ],
+        }
+        return {**state, "profile": profile, "salvage_profile": salvage_profile}
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
