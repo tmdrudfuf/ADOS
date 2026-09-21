@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -35,6 +36,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--retry-pinned-implementer", completed.stdout)
         self.assertIn("--continue-dirty-timeout-salvage", completed.stdout)
         self.assertIn("--authorize-substantial-completion", completed.stdout)
+        self.assertIn("--authorize-post-review-fix", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -4741,6 +4743,8 @@ class CliRunTests(unittest.TestCase):
                 "assert auth['status'] == 'CONSUMED'\n"
                 "assert auth['invocationStatus'] == 'PENDING'\n"
                 "assert auth['invocationTimeoutMs'] == 1800000\n"
+                "assert Path(auth['artifact']).is_file()\n"
+                f"assert Path(r'{relative_record}').with_name(Path(auth['artifact']).name).is_file()\n"
                 "assert record['status'] == 'READY_FOR_IMPLEMENTATION'\n"
                 f"expected = {dirty_contents!r}\n"
                 "for name, content in expected.items():\n"
@@ -4938,6 +4942,248 @@ class CliRunTests(unittest.TestCase):
                 elif mutation == "already_used": record["humanAuthorizedSubstantialCompletion"] = {"status": "CONSUMED"}
                 with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES, profiles, clear=False):
                     violations = run_pipeline.human_authorized_substantial_completion_evidence(
+                        run_pipeline.GitRepositoryProvider(), load_project_config(fixture.config), record_path,
+                        record, candidate, validation, review, implementer,
+                    )
+                self.assertIn(expected, {item.code for item in violations})
+
+    def test_human_authorized_post_review_fix_exact_state_is_eligible_read_only(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_post_review_fix_run(fixture, "Authorized post review fix eligibility")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunService().run(
+                    RunRequest(
+                        fixture.repo,
+                        "Authorized post review fix eligibility",
+                        1,
+                        fixture.config,
+                        requirements_file=state["requirements"],
+                        dry_run=True,
+                        authorize_post_review_fix=True,
+                    )
+                )
+
+        self.assertEqual("PLANNED", result.status)
+        self.assertEqual("ELIGIBLE", result.eligibility.status)
+
+    def test_human_authorized_post_review_fix_is_consumed_before_one_claude_and_resumes_normal_gates(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_post_review_fix_run(fixture, "Authorized post review fix success")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "authorized-post-review-count.txt"
+            relative_record = state["record_path"].relative_to(state["worktree"]).as_posix()
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import json, sys\n"
+                "prompt = sys.stdin.read()\n"
+                "assert 'Human-authorized post-review fix continuation' in prompt\n"
+                "assert 'do not pre-seed the known durable run ID' in prompt\n"
+                "assert 'blocked publication state must leave the task non-completed' in prompt\n"
+                f"record = json.loads(Path(r'{relative_record}').read_text(encoding='utf-8'))\n"
+                "auth = record['humanAuthorizedPostReviewFix']\n"
+                "assert auth['status'] == 'CONSUMED'\n"
+                "assert auth['invocationStatus'] == 'PENDING'\n"
+                "assert auth['invocationTimeoutMs'] == 1800000\n"
+                "assert record['status'] == 'READY_FOR_IMPLEMENTATION'\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "Path('authorized-review-fix.txt').write_text('fixed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(pipeline.implementer, "run", wraps=pipeline.implementer.run) as implementer_run,
+            ):
+                result = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_post_review_fix=True)
+                dispatched_timeout = implementer_run.call_args.kwargs["timeout_ms"]
+            final = result.run_record
+            authorization = final["humanAuthorizedPostReviewFix"]
+            stages = [stage.id for stage in result.stages]
+            invocation_count = counter.read_text()
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("1", invocation_count)
+        self.assertEqual("CONSUMED", authorization["status"])
+        self.assertEqual("READY_FOR_VALIDATION", authorization["invocationStatus"])
+        self.assertEqual(1800000, authorization["invocationTimeoutMs"])
+        self.assertEqual(0, authorization["ordinaryRecoveryCapacityGranted"])
+        self.assertEqual(1800000, dispatched_timeout)
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertEqual("claude", final["agentAssignment"]["candidateOwnerId"])
+        self.assertLess(stages.index("human_authorized_post_review_fix_implementer"), stages.index("candidate"))
+        self.assertLess(stages.index("candidate"), stages.index("validation"))
+        self.assertLess(stages.index("validation"), stages.index("review"))
+        self.assertLess(stages.index("review"), stages.index("exact_head"))
+
+    def test_human_authorized_post_review_fix_changes_requested_stops_without_second_dispatch(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_post_review_fix_run(fixture, "Authorized post review fix rejected")
+            counter = fixture.root / "authorized-rejected-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "Path('authorized-review-fix.txt').write_text('attempted fix', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Changes Requested')\n", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_post_review_fix=True
+                )
+            invocation_count = counter.read_text()
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertEqual("1", invocation_count)
+        self.assertIn("HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED", {item.code for item in result.violations})
+        self.assertNotIn("implementation_recovery", [stage.id for stage in result.stages])
+
+    def test_human_authorized_post_review_fix_failure_is_terminal_and_one_shot(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_post_review_fix_run(fixture, "Authorized post review fix failure")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "authorized-failure-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+                failed = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_post_review_fix=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_post_review_fix=True)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            invocation_count = counter.read_text()
+
+        self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
+        self.assertEqual("human_intervention", final["nextStage"])
+        self.assertEqual("HUMAN_AUTHORIZED_POST_REVIEW_FIX_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual("CONSUMED", final["humanAuthorizedPostReviewFix"]["status"])
+        self.assertEqual("1", invocation_count)
+        self.assertIn("POST_REVIEW_FIX_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+
+    def test_consumed_post_review_fix_pending_blocks_plain_resume_without_dispatch(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_post_review_fix_run(fixture, "Interrupted authorized post review fix")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            record["humanAuthorizedPostReviewFix"] = {"authorizationId": "interrupted-post-review-fix", "status": "CONSUMED", "invocationStatus": "PENDING"}
+            record["humanAuthorizedPostReviewFixes"] = [record["humanAuthorizedPostReviewFix"]]
+            record["status"] = "READY_FOR_IMPLEMENTATION"
+            record["nextStage"] = "human_authorized_post_review_fix_handoff"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            before_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+            outcome = RunPipeline(publisher=FakePublisher(fixture.repo)).run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234)
+            after_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual("IMPLEMENTATION_FAILED", outcome.status)
+        self.assertIn("HUMAN_AUTHORIZED_POST_REVIEW_FIX_INVOCATION_UNRESOLVED", {item.code for item in outcome.violations})
+        self.assertEqual(before_count, after_count)
+        self.assertNotIn("implementer", [stage.id for stage in outcome.stages])
+
+    def test_human_authorized_post_review_fix_admission_fails_closed_on_state_drift(self):
+        cases = {
+            "wrong_run": "POST_REVIEW_FIX_FORENSIC_PROVENANCE_MISSING",
+            "wrong_branch": "POST_REVIEW_FIX_IDENTITY_MISMATCH",
+            "wrong_worktree": "POST_REVIEW_FIX_WORKTREE_IDENTITY_MISMATCH",
+            "wrong_requirements": "POST_REVIEW_FIX_REQUIREMENTS_MISMATCH",
+            "wrong_sequence": "POST_REVIEW_FIX_ASSIGNMENT_MISMATCH",
+            "wrong_implementer": "POST_REVIEW_FIX_ASSIGNMENT_MISMATCH",
+            "wrong_reviewer": "POST_REVIEW_FIX_ASSIGNMENT_MISMATCH",
+            "wrong_owner": "POST_REVIEW_FIX_ASSIGNMENT_MISMATCH",
+            "wrong_status": "POST_REVIEW_FIX_STATUS_INVALID",
+            "wrong_next_stage": "POST_REVIEW_FIX_NEXT_STAGE_INVALID",
+            "wrong_block": "POST_REVIEW_FIX_BLOCK_INVALID",
+            "wrong_epoch": "POST_REVIEW_FIX_CAPACITY_INVALID",
+            "wrong_usage": "POST_REVIEW_FIX_CAPACITY_INVALID",
+            "implementation_reopens": "POST_REVIEW_FIX_IMPLEMENTATION_REOPENS_INVALID",
+            "convergence_reopens": "POST_REVIEW_FIX_CONVERGENCE_REOPENS_INVALID",
+            "missing_substantial": "POST_REVIEW_FIX_SUBSTANTIAL_AUTHORIZATION_MISSING",
+            "substantial_not_consumed": "POST_REVIEW_FIX_SUBSTANTIAL_AUTHORIZATION_MISSING",
+            "candidate_sha": "POST_REVIEW_FIX_CANDIDATE_INVALID",
+            "validation_sha": "POST_REVIEW_FIX_VALIDATION_SHA_MISMATCH",
+            "reviewed_sha": "POST_REVIEW_FIX_REVIEW_SHA_MISMATCH",
+            "validation_status": "POST_REVIEW_FIX_VALIDATION_INVALID",
+            "review_status": "POST_REVIEW_FIX_REVIEW_INVALID",
+            "review_decision": "POST_REVIEW_FIX_REVIEW_INVALID",
+            "review_findings": "POST_REVIEW_FIX_REVIEW_FINDINGS_MISMATCH",
+            "timeout_status": "POST_REVIEW_FIX_RUNTIME_INVALID",
+            "timeout_duration": "POST_REVIEW_FIX_RUNTIME_INVALID",
+            "failed_fix_head": "POST_REVIEW_FIX_RUNTIME_INVALID",
+            "failed_fix_changed": "POST_REVIEW_FIX_RUNTIME_INVALID",
+            "head_mismatch": "POST_REVIEW_FIX_HEAD_MISMATCH",
+            "dirty": "POST_REVIEW_FIX_DIRTY_FILES",
+            "staged": "POST_REVIEW_FIX_STAGED_FILES",
+            "untracked": "POST_REVIEW_FIX_UNTRACKED_FILES",
+            "newer_evidence": "POST_REVIEW_FIX_EVIDENCE_ORDER_INVALID",
+            "already_used": "POST_REVIEW_FIX_ALREADY_USED",
+        }
+        for mutation, expected in cases.items():
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_post_review_fix_run(fixture, f"Post review drift {mutation}")
+                record_path = state["record_path"]
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                candidate_path = record_path.with_name("candidate.json")
+                validation_path = record_path.with_name("validation-runtime.json")
+                review_path = record_path.with_name("review-runtime.json")
+                implementer_path = record_path.with_name("implementer-runtime.json")
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                validation = json.loads(validation_path.read_text(encoding="utf-8"))
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                implementer = json.loads(implementer_path.read_text(encoding="utf-8"))
+                profiles = {state["run_id"]: state["profile"]}
+                if mutation == "wrong_run": record["runId"] = "other"
+                elif mutation == "wrong_branch": record["featureBranch"] = "codex/other"
+                elif mutation == "wrong_worktree": record["featureWorktree"] = str(fixture.repo)
+                elif mutation == "wrong_requirements": record["requirements"]["sha256"] = "f" * 64
+                elif mutation == "wrong_sequence": record["agentAssignment"]["sequence"] = 2
+                elif mutation == "wrong_implementer": record["agentAssignment"]["implementerId"] = "codex"
+                elif mutation == "wrong_reviewer": record["agentAssignment"]["reviewerId"] = "claude"
+                elif mutation == "wrong_owner": record["agentAssignment"]["candidateOwnerId"] = "codex"
+                elif mutation == "wrong_status": record["status"] = "IMPLEMENTATION_FAILED"
+                elif mutation == "wrong_next_stage": record["nextStage"] = "implementation_handoff"
+                elif mutation == "wrong_block": record["implementationRecoveryBlock"]["reasonCode"] = "OTHER"
+                elif mutation == "wrong_epoch": record["implementationRecoveryReopens"].pop()
+                elif mutation == "wrong_usage": record["implementationRecoveryAttempts"].pop()
+                elif mutation == "implementation_reopens": record["implementationRecoveryReopens"].pop()
+                elif mutation == "convergence_reopens": record["reviewConvergenceReopens"].pop()
+                elif mutation == "missing_substantial": record.pop("humanAuthorizedSubstantialCompletion")
+                elif mutation == "substantial_not_consumed": record["humanAuthorizedSubstantialCompletion"]["status"] = "AUTHORIZED"
+                elif mutation == "candidate_sha": candidate["candidate_sha"] = "f" * 40
+                elif mutation == "validation_sha": validation["head_after"] = "f" * 40
+                elif mutation == "reviewed_sha": review["reviewed_sha"] = "f" * 40
+                elif mutation == "validation_status": validation["status"] = "BLOCK"
+                elif mutation == "review_status": review["status"] = "BLOCK"
+                elif mutation == "review_decision": review["decision"] = "Approved"
+                elif mutation == "review_findings": review["stdout"] += "changed"
+                elif mutation == "timeout_status": implementer["result"]["status"] = "READY_FOR_VALIDATION"
+                elif mutation == "timeout_duration": implementer["runtime"]["command"]["timeoutMs"] = 1
+                elif mutation == "failed_fix_head": implementer["result"]["headAfter"] = "f" * 40
+                elif mutation == "failed_fix_changed": implementer["result"]["changedFiles"] = ["changed.txt"]
+                elif mutation == "head_mismatch": self.git(state["worktree"], "commit", "--allow-empty", "-m", "new head")
+                elif mutation == "dirty": (state["worktree"] / "implementation.txt").write_text("dirty", encoding="utf-8")
+                elif mutation == "staged":
+                    (state["worktree"] / "implementation.txt").write_text("staged", encoding="utf-8")
+                    self.git(state["worktree"], "add", "implementation.txt")
+                elif mutation == "untracked": (state["worktree"] / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+                elif mutation == "newer_evidence": os.utime(candidate_path, ns=(implementer_path.stat().st_mtime_ns + 1_000_000, implementer_path.stat().st_mtime_ns + 1_000_000))
+                elif mutation == "already_used": record["humanAuthorizedPostReviewFix"] = {"status": "CONSUMED"}
+                record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+                candidate_path.write_text(json.dumps(candidate, indent=2, sort_keys=True), encoding="utf-8") if mutation == "candidate_sha" else None
+                validation_path.write_text(json.dumps(validation, indent=2, sort_keys=True), encoding="utf-8") if mutation in {"validation_sha", "validation_status"} else None
+                review_path.write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8") if mutation in {"reviewed_sha", "review_status", "review_decision", "review_findings"} else None
+                implementer_path.write_text(json.dumps(implementer, indent=2, sort_keys=True), encoding="utf-8") if mutation in {"timeout_status", "timeout_duration", "failed_fix_head", "failed_fix_changed"} else None
+                with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES, profiles, clear=False):
+                    violations = run_pipeline.human_authorized_post_review_fix_evidence(
                         run_pipeline.GitRepositoryProvider(), load_project_config(fixture.config), record_path,
                         record, candidate, validation, review, implementer,
                     )
@@ -6289,6 +6535,139 @@ class CliRunTests(unittest.TestCase):
             ],
         }
         return {**state, "profile": profile, "salvage_profile": salvage_profile}
+
+    def create_post_review_fix_run(self, fixture, feature):
+        state = self.create_substantial_completion_run(fixture, feature)
+        worktree = state["worktree"]
+        record_path = state["record_path"]
+        self.git(worktree, "add", "--all")
+        self.git(worktree, "commit", "-m", "substantial completion candidate")
+        exact = self.head(worktree)
+        assignment = json.loads(record_path.read_text(encoding="utf-8"))["agentAssignment"]
+        primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / record_path.parent.name
+        substantial_name = "human-authorized-substantial-completion-test.json"
+        substantial_path = primary_run_dir / substantial_name
+        substantial = {
+            "authorizationId": f"human-substantial-completion-{state['run_id']}-test",
+            "authorizationType": "HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION",
+            "status": "CONSUMED",
+            "runId": state["run_id"],
+            "invocationStatus": "READY_FOR_VALIDATION",
+            "invocationTimeoutMs": 1800000,
+            "ordinaryRecoveryCapacityGranted": 0,
+            "pinnedAgentAssignment": assignment,
+            "artifact": str(substantial_path),
+        }
+        substantial_bytes = json.dumps(substantial, indent=2, sort_keys=True).encode("utf-8")
+        substantial_path.parent.mkdir(parents=True, exist_ok=True)
+        substantial_path.write_bytes(substantial_bytes)
+        record_path.with_name(substantial_name).write_bytes(substantial_bytes)
+
+        candidate = {"status": "COMMITTED", "candidate_sha": exact, "changed_files": []}
+        validation = {"status": "PASS", "head_before": exact, "head_after": exact, "commands": [], "violations": []}
+        review_stdout = (
+            "# Changes Requested\n\n"
+            "1. Blocking - causal provenance is circular because the durable run ID is pre-seeded.\n"
+            "2. Blocking - task completion occurs before publication readiness.\n"
+            "3. Blocking - plan.md and tasks.md are stale.\n"
+        )
+        review = {"status": "PASS", "decision": "Changes Requested", "reviewed_sha": exact, "exit_code": 0, "stdout": review_stdout, "stderr": "", "violations": []}
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["humanAuthorizedSubstantialCompletion"] = substantial
+        record["humanAuthorizedSubstantialCompletions"] = [substantial]
+        record["status"] = "IMPLEMENTATION_TIMED_OUT"
+        record["nextStage"] = "human_intervention"
+        record["implementationRecoveryBlock"] = {
+            "status": "BLOCKED",
+            "reasonCode": "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED",
+            "message": "implementation recovery reached the configured maximum recovery rounds",
+            "evidence": {"max_recovery_rounds": "3", "status": "IMPLEMENTATION_TIMED_OUT"},
+        }
+        record["implementationFailure"] = {
+            "status": "IMPLEMENTATION_TIMED_OUT",
+            "timedOut": "true",
+            "exitCode": "",
+            "headBefore": exact,
+            "headAfter": exact,
+            "changedFiles": [],
+            "stdout": "",
+            "stderr": "",
+            "runtimeFailureCategory": "UNKNOWN_RUNTIME_FAILURE",
+            "reasonCodes": ["IMPLEMENTER_TIMED_OUT"],
+            "recoveryStage": "implementation_recovery",
+        }
+        timeout_runtime = {
+            "status": "IMPLEMENTATION_TIMED_OUT",
+            "runtime": {
+                "runtimeId": "test-post-review-fix-timeout",
+                "runId": state["run_id"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "command": {"adapter": assignment["implementerCommand"], "timeoutMs": 300000},
+            },
+            "result": {
+                "runtimeId": "test-post-review-fix-timeout",
+                "runId": state["run_id"],
+                "status": "IMPLEMENTATION_TIMED_OUT",
+                "exitCode": None,
+                "timedOut": True,
+                "stdout": "",
+                "stderr": "",
+                "headBefore": exact,
+                "headAfter": exact,
+                "changedFiles": [],
+                "runtimeFailureCategory": "UNKNOWN_RUNTIME_FAILURE",
+                "violations": [{"code": "IMPLEMENTER_TIMED_OUT", "message": "timed out", "evidence": {"timeout_ms": "300000"}}],
+            },
+            "runRecord": record,
+            "violations": [],
+        }
+        artifacts = {
+            "candidate.json": candidate,
+            "validation-runtime.json": validation,
+            "review-runtime.json": review,
+            "implementer-runtime.json": timeout_runtime,
+        }
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        base_time = record_path.stat().st_mtime_ns + 10_000_000
+        for index, (name, payload) in enumerate(artifacts.items(), start=1):
+            path = record_path.with_name(name)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            stamp = base_time + index * 10_000_000
+            os.utime(path, ns=(stamp, stamp))
+        review_path = record_path.with_name("review-runtime.json")
+        runtime_path = record_path.with_name("implementer-runtime.json")
+        profile = {
+            "forensicReviewId": "test-post-review-fix-timeout",
+            "forensicDisposition": "NEEDS_AUTHORIZED_POST_REVIEW_FIX",
+            "projectId": record["projectId"],
+            "specNumber": record["specNumber"],
+            "featureBranch": record["featureBranch"],
+            "featureWorktree": record["featureWorktree"],
+            "authoritativeBaseSha": record["authoritativeBaseSha"],
+            "candidateSha": exact,
+            "requirementsSha": record["requirements"]["sha256"],
+            "sourceEpoch": 3,
+            "sourceAttemptUsage": 3,
+            "sourceImplementationReopens": 2,
+            "sourceReviewConvergenceReopens": 1,
+            "pinnedImplementerId": assignment["implementerId"],
+            "pinnedImplementerCommand": assignment["implementerCommand"],
+            "pinnedReviewerId": assignment["reviewerId"],
+            "pinnedReviewerCommand": assignment["reviewerCommand"],
+            "assignmentSequence": assignment["sequence"],
+            "substantialAuthorizationId": substantial["authorizationId"],
+            "substantialAuthorizationArtifactSha256": hashlib.sha256(substantial_bytes).hexdigest(),
+            "reviewArtifactSha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+            "reviewStdoutSha256": hashlib.sha256(review_stdout.encode("utf-8")).hexdigest(),
+            "failedFixRuntimeArtifactSha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+            "failedFixTimeoutMs": 300000,
+            "reviewFindings": [
+                {"finding": 1, "title": "Causal provenance", "required": "Prove causality without pre-seeding the run ID."},
+                {"finding": 2, "title": "Completion gating", "required": "Require publication readiness before completion."},
+                {"finding": 3, "title": "Spec Kit", "required": "Update plan.md and tasks.md."},
+            ],
+        }
+        return {**state, "profile": profile, "substantial": substantial, "candidate_sha": exact}
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")

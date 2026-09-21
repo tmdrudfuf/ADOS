@@ -18,7 +18,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, dirty_timeout_salvage_evidence, failed_review_routing_state_restoration_evidence, human_authorized_substantial_completion_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, dirty_timeout_salvage_evidence, failed_review_routing_state_restoration_evidence, human_authorized_post_review_fix_evidence, human_authorized_substantial_completion_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
@@ -45,6 +45,7 @@ class RunRequest:
     retry_pinned_implementer: bool = False
     continue_dirty_timeout_salvage: bool = False
     authorize_substantial_completion: bool = False
+    authorize_post_review_fix: bool = False
     prefer_implementer: str | None = None
 
 
@@ -253,6 +254,7 @@ class RunService:
             retry_pinned_implementer=request.retry_pinned_implementer,
             continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
             authorize_substantial_completion=request.authorize_substantial_completion,
+            authorize_post_review_fix=request.authorize_post_review_fix,
         )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
@@ -276,6 +278,7 @@ class RunService:
                 retry_pinned_implementer=request.retry_pinned_implementer,
                 continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
                 authorize_substantial_completion=request.authorize_substantial_completion,
+                authorize_post_review_fix=request.authorize_post_review_fix,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -295,6 +298,7 @@ class RunService:
                 retry_pinned_implementer=request.retry_pinned_implementer,
                 continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
                 authorize_substantial_completion=request.authorize_substantial_completion,
+                authorize_post_review_fix=request.authorize_post_review_fix,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -339,6 +343,7 @@ class RunService:
             retry_pinned_implementer=request.retry_pinned_implementer,
             continue_dirty_timeout_salvage=request.continue_dirty_timeout_salvage,
             authorize_substantial_completion=request.authorize_substantial_completion,
+            authorize_post_review_fix=request.authorize_post_review_fix,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -408,6 +413,7 @@ class RunService:
         retry_pinned_implementer: bool = False,
         continue_dirty_timeout_salvage: bool = False,
         authorize_substantial_completion: bool = False,
+        authorize_post_review_fix: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -515,6 +521,22 @@ class RunService:
                 {"DIRTY_TIMEOUT_SALVAGE_FINAL_ATTEMPT_FAILED", "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"}
             )
             and not human_authorized_substantial_completion_evidence(
+                self.git,
+                config,
+                resume.record_path,
+                _read_mapping(resume.record_path),
+                _read_mapping(resume.record_path.with_name("candidate.json")),
+                _read_mapping(resume.record_path.with_name("validation-runtime.json")),
+                _read_mapping(resume.record_path.with_name("review-runtime.json")),
+                _read_mapping(resume.record_path.with_name("implementer-runtime.json")),
+            )
+        ):
+            blocking_recovery = ()
+        if (
+            authorize_post_review_fix
+            and resume is not None
+            and set(blocking_recovery) == {"IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"}
+            and not human_authorized_post_review_fix_evidence(
                 self.git,
                 config,
                 resume.record_path,

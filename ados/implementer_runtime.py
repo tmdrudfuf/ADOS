@@ -446,7 +446,11 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
             ]
         )
     substantial_completion = record.get("humanAuthorizedSubstantialCompletion")
-    if isinstance(substantial_completion, dict) and substantial_completion.get("status") == "CONSUMED":
+    if (
+        isinstance(substantial_completion, dict)
+        and substantial_completion.get("status") == "CONSUMED"
+        and substantial_completion.get("invocationStatus") == "PENDING"
+    ):
         lines.extend(
             [
                 "",
@@ -464,6 +468,32 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 "This authorization grants implementation only. It does not approve validation, review, exact HEAD, publication, or merge; ADOS applies those gates after you return.",
             ]
         )
+    post_review_fix = record.get("humanAuthorizedPostReviewFix")
+    if (
+        isinstance(post_review_fix, dict)
+        and post_review_fix.get("status") == "CONSUMED"
+        and post_review_fix.get("invocationStatus") == "PENDING"
+    ):
+        lines.extend(
+            [
+                "",
+                "Human-authorized post-review fix continuation:",
+                f"Authorization ID: {post_review_fix.get('authorizationId', '')}",
+                f"Exact reviewed candidate: {post_review_fix.get('startingCandidateSha', '')}",
+                "Finding 1 from the older review is already fixed: validation.status === PASS remains required for validatedMatchesHead, with the BLOCK + Approved regression. Preserve that fix.",
+                "The three current Codex blockers below are authoritative. Fix them in production types/services and truthful Spec Kit artifacts; do not merely weaken or alter tests to accept the existing behavior.",
+                "For causal provenance, do not pre-seed the known durable run ID into Project A or move that circular injection to another fixture. The controlled execution must establish or receive its durable ADOS identity through the exercised execution boundary, and the evidence must prove that the resulting durable lifecycle belongs to that execution.",
+                "For completion gating, the production transition to completed must require validation PASS, independent review approval, exact candidate/validated/reviewed/HEAD alignment, and publication-ready/converged evidence. A blocked publication state must leave the task non-completed.",
+                "Preserve human authority over final GitHub publication. This authorization permits implementation only; it does not approve validation, review, convergence, publication, or merge.",
+                "Authoritative current findings:",
+            ]
+        )
+        findings = post_review_fix.get("authoritativeReviewFindings", [])
+        if isinstance(findings, list):
+            for finding in findings:
+                if isinstance(finding, dict):
+                    lines.append(f"- Finding {finding.get('finding', '')}: {finding.get('title', '')}")
+                    lines.append(f"  Required: {finding.get('required', '')}")
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(
