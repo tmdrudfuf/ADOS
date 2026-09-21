@@ -12,6 +12,7 @@ from typing import Any
 
 from .agent_roles import AgentAssignment, RoleSelectionError, select_assignment
 from .doctor import DoctorRequest, DoctorService, discover_project_config
+from .external_origin import ExternalOrigin, ExternalOriginViolation, origin_artifact, parse_external_origin
 from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, SAFE_TIMEOUT_MS
 from .primary_repository_guardian import PrimaryRepositoryGuardian
@@ -47,6 +48,8 @@ class RunRequest:
     authorize_substantial_completion: bool = False
     authorize_post_review_fix: bool = False
     prefer_implementer: str | None = None
+    prepare_only: bool = False
+    external_origin: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,8 @@ class WorkflowRunRecord:
     next_stage: str
     requirements: dict[str, Any] | None = None
     agent_assignment: dict[str, Any] | None = None
+    external_origin: dict[str, Any] | None = None
+    external_origin_digest: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -126,6 +131,10 @@ class WorkflowRunRecord:
             record["requirements"] = self.requirements
         if self.agent_assignment is not None:
             record["agentAssignment"] = self.agent_assignment
+        if self.external_origin is not None:
+            record["externalOrigin"] = self.external_origin
+        if self.external_origin_digest is not None:
+            record["externalOriginDigest"] = self.external_origin_digest
         return record
 
 
@@ -195,12 +204,35 @@ class RunService:
             if isinstance(loaded_requirements, RequirementsViolation):
                 return _invalid(loaded_requirements.code, loaded_requirements.message, loaded_requirements.evidence)
             requirements = loaded_requirements
+        parsed_origin: ExternalOrigin | None = None
+        if request.external_origin is not None:
+            parsed = parse_external_origin(request.external_origin)
+            if isinstance(parsed, ExternalOriginViolation):
+                return _invalid(parsed.code, parsed.message, parsed.evidence)
+            parsed_origin = parsed
+            if requirements is None:
+                return _invalid("EXTERNAL_ORIGIN_REQUIREMENTS_REQUIRED", "external prepare requires an authoritative requirements file", {})
+            if parsed_origin.requirements_sha256 != requirements.sha256:
+                return _invalid(
+                    "EXTERNAL_ORIGIN_REQUIREMENTS_MISMATCH",
+                    "external origin requirements digest does not match the authoritative requirements file",
+                    {"origin": parsed_origin.requirements_sha256, "requirements": requirements.sha256},
+                )
+            if parsed_origin.requested_feature != request.feature_description.strip():
+                return _invalid("EXTERNAL_ORIGIN_FEATURE_MISMATCH", "external origin requestedFeature must exactly match --feature", {})
+        elif request.prepare_only:
+            return _invalid("EXTERNAL_ORIGIN_REQUIRED", "external prepare requires an external origin", {})
 
         try:
             plan = self._plan(project_path, config, request)
         except _RunPlanError as exc:
             eligibility = RunEligibility("BLOCKED", (RunViolation(exc.code, exc.message, exc.evidence),))
             return RunResult("BLOCKED", eligibility)
+
+        if parsed_origin is not None:
+            origin_conflicts = self._external_origin_conflicts(project_path, parsed_origin)
+            if origin_conflicts:
+                return RunResult("BLOCKED", RunEligibility("BLOCKED", origin_conflicts), plan)
 
         resume = self._resumable_run(
             project_path,
@@ -215,6 +247,9 @@ class RunService:
             requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
             if requirements_violations:
                 return RunResult("BLOCKED", RunEligibility("BLOCKED", requirements_violations), plan, resume.record, resumed=True)
+            origin_violations = _external_origin_resume_violations(resume.record, parsed_origin)
+            if origin_violations:
+                return RunResult("BLOCKED", RunEligibility("BLOCKED", origin_violations), plan, resume.record, resumed=True)
         adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description, requirements)
         if request.prefer_implementer and (resume is not None or adoption is not None):
             return RunResult(
@@ -265,6 +300,9 @@ class RunService:
             return RunResult("PLANNED", eligibility, plan, planned_record, resumed=resume is not None, adopted=adoption is not None)
 
         if resume is not None:
+            if request.prepare_only:
+                _write_external_origin_artifact(resume.record_path, resume.record)
+                return RunResult("PREPARED", eligibility, plan, resume.record, resumed=True)
             pipeline_result = self.pipeline.run(
                 config=config,
                 run_record_path=resume.record_path,
@@ -330,6 +368,9 @@ class RunService:
         record_path.parent.mkdir(parents=True, exist_ok=True)
         record_path.write_text(json.dumps(record.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
         write_requirements_artifacts(record_path, record.to_dict(), requirements)
+        _write_external_origin_artifact(record_path, record)
+        if request.prepare_only:
+            return RunResult("PREPARED", eligibility, plan, record, created)
         pipeline_result = self.pipeline.run(
             config=config,
             run_record_path=record_path,
@@ -862,6 +903,34 @@ class RunService:
             return candidates[0]
         return None
 
+    def _external_origin_conflicts(self, project_path: Path, requested: ExternalOrigin) -> tuple[RunViolation, ...]:
+        roots = [project_path / ".agent-workflow" / "runs"]
+        roots.extend(item.path / ".agent-workflow" / "runs" for item in self.worktrees.list_worktrees(project_path))
+        seen: set[Path] = set()
+        for root in roots:
+            for path in root.glob("*/ados-run.json") if root.is_dir() else ():
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                raw = _read_mapping(path)
+                if not isinstance(raw, dict) or not isinstance(raw.get("externalOrigin"), dict):
+                    continue
+                existing = parse_external_origin(raw["externalOrigin"])
+                if isinstance(existing, ExternalOriginViolation):
+                    continue
+                scope_matches = existing.origin_system == requested.origin_system and existing.project_id == requested.project_id
+                identity_collides = existing.execution_id == requested.execution_id or existing.idempotency_key == requested.idempotency_key
+                if scope_matches and identity_collides and existing.digest != requested.digest:
+                    return (
+                        _violation(
+                            "EXTERNAL_ORIGIN_IDEMPOTENCY_CONFLICT",
+                            "external execution or idempotency identity is already bound to a different immutable origin",
+                            {"existingRunId": str(raw.get("runId", "")), "existingDigest": existing.digest, "requestedDigest": requested.digest},
+                        ),
+                    )
+        return ()
+
     def _resume_candidates_in_run_dir(
         self,
         config: ProjectConfig,
@@ -963,9 +1032,12 @@ class RunService:
         return select_assignment(policy=policy, prefer_implementer=request.prefer_implementer, sequence=1)
 
     def _record(self, config: ProjectConfig, request: RunRequest, plan: RunPlan, requirements: RequirementsSource | None = None, assignment: AgentAssignment | None = None) -> WorkflowRunRecord:
-        return self._record_from_plan(config, plan, request.feature_description, requirements, assignment)
+        origin = parse_external_origin(request.external_origin) if request.external_origin is not None else None
+        if isinstance(origin, ExternalOriginViolation):
+            origin = None
+        return self._record_from_plan(config, plan, request.feature_description, requirements, assignment, origin)
 
-    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str, requirements: RequirementsSource | None = None, assignment: AgentAssignment | None = None) -> WorkflowRunRecord:
+    def _record_from_plan(self, config: ProjectConfig, plan: RunPlan, feature_description: str, requirements: RequirementsSource | None = None, assignment: AgentAssignment | None = None, external_origin: ExternalOrigin | None = None) -> WorkflowRunRecord:
         run_id = _run_id(config.project_id, plan.spec_number, plan.feature_slug, plan.authoritative_base_sha)
         if assignment is not None:
             implementer = assignment.implementer_command
@@ -992,6 +1064,8 @@ class RunService:
             next_stage="implementation_handoff",
             requirements=requirements.to_record() if requirements is not None else None,
             agent_assignment=agent_assignment,
+            external_origin=external_origin.to_dict() if external_origin is not None else None,
+            external_origin_digest=external_origin.digest if external_origin is not None else None,
         )
 
     def _record_path(self, worktree: Path, spec: str, slug: str) -> Path:
@@ -1021,7 +1095,31 @@ def _record_from_mapping(raw: dict[str, Any]) -> WorkflowRunRecord:
         next_stage=str(raw["nextStage"]),
         requirements=dict(requirements) if isinstance(requirements, dict) else None,
         agent_assignment=dict(raw["agentAssignment"]) if isinstance(raw.get("agentAssignment"), dict) else None,
+        external_origin=dict(raw["externalOrigin"]) if isinstance(raw.get("externalOrigin"), dict) else None,
+        external_origin_digest=str(raw["externalOriginDigest"]) if raw.get("externalOriginDigest") is not None else None,
     )
+
+
+def _external_origin_resume_violations(record: WorkflowRunRecord, requested: ExternalOrigin | None) -> tuple[RunViolation, ...]:
+    if record.external_origin is None and requested is None:
+        return ()
+    if record.external_origin is None or requested is None:
+        return (_violation("EXTERNAL_ORIGIN_BINDING_MISMATCH", "an externally originated run may only be resolved by the same external origin", {}),)
+    parsed = parse_external_origin(record.external_origin)
+    if isinstance(parsed, ExternalOriginViolation):
+        return (_violation(parsed.code, parsed.message, parsed.evidence),)
+    if parsed.digest != requested.digest or record.external_origin_digest != requested.digest:
+        return (_violation("EXTERNAL_ORIGIN_BINDING_MISMATCH", "external origin does not match the durable run binding", {"expected": str(record.external_origin_digest), "actual": requested.digest}),)
+    return ()
+
+
+def _write_external_origin_artifact(record_path: Path, record: WorkflowRunRecord) -> None:
+    if record.external_origin is None:
+        return
+    parsed = parse_external_origin(record.external_origin)
+    if isinstance(parsed, ExternalOriginViolation):
+        raise RuntimeError(f"invalid durable external origin: {parsed.code}")
+    _write_mapping(record_path.with_name("external-origin.json"), origin_artifact(parsed))
 
 
 def _requirements_resume_violations(record_path: Path, record: dict[str, Any], requirements: RequirementsSource | None) -> tuple[RunViolation, ...]:

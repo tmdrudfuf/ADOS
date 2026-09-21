@@ -4731,6 +4731,7 @@ class CliRunTests(unittest.TestCase):
             implementation_reopens_before = before["implementationRecoveryReopens"]
             convergence_reopens_before = before["reviewConvergenceReopens"]
             dirty_contents = {path: (state["worktree"] / path).read_text(encoding="utf-8") for path in state["profile"]["dirtyFiles"]}
+            relative_record = state["record_path"].relative_to(state["worktree"]).as_posix()
             (fixture.root / "implementer.py").write_text(
                 "from pathlib import Path\n"
                 "import json, sys\n"
