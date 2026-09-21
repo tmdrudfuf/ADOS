@@ -139,6 +139,52 @@ HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_PROFILES: dict[str, dict[str, Any]] = {
         ],
     }
 }
+POST_REVIEW_FIX_TIMEOUT_MS = 1_800_000
+HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES: dict[str, dict[str, Any]] = {
+    "cc6ed14815c049ed1b97ce1c": {
+        "forensicReviewId": "spec-148-post-review-fix-timeout-2026-09-20",
+        "forensicDisposition": "NEEDS_AUTHORIZED_POST_REVIEW_FIX",
+        "projectId": "AIverse",
+        "specNumber": "148",
+        "featureBranch": "codex/148-autonomous-company-operations-end-to-end",
+        "featureWorktree": r"C:\Users\tmdru\Desktop\Ky-Project\AIverse-autonomous-company-operations-end-to-end",
+        "authoritativeBaseSha": "bbbb0318704f612be8ec54523e59b8d7e4fda204",
+        "candidateSha": "c07d80bf33b9cab5244704325f891e6409c83b95",
+        "requirementsSha": "b0de9423d7b882ae695a41103c7609a5484645cf2c6bf766a85c358f8ba3a47c",
+        "sourceEpoch": 3,
+        "sourceAttemptUsage": 3,
+        "sourceImplementationReopens": 2,
+        "sourceReviewConvergenceReopens": 1,
+        "pinnedImplementerId": "claude",
+        "pinnedImplementerCommand": "claude -p",
+        "pinnedReviewerId": "codex",
+        "pinnedReviewerCommand": "codex exec -",
+        "assignmentSequence": 1,
+        "substantialAuthorizationId": "human-substantial-completion-cc6ed14815c049ed1b97ce1c-6f393974caf7",
+        "substantialAuthorizationArtifactSha256": "4a635d2aa782b31209c70c8a2d62721a7aaca668a9bbc8935ddbacd99edb96c9",
+        "reviewArtifactSha256": "76abf2328bdeb8db1f5be9e12001f38c7c1a198a45cf2a0e68e54b513d14a1f3",
+        "reviewStdoutSha256": "062daf637620e340a9c241c2a7902a09579fb02c3af4d5be943f2e93261de885",
+        "failedFixRuntimeArtifactSha256": "f09a4cf92b728933822e4ab490f8993fe98df6f587d9c95fcb9a1b49ea699aed",
+        "failedFixTimeoutMs": 300_000,
+        "reviewFindings": [
+            {
+                "finding": 1,
+                "title": "Causal provenance",
+                "required": "Do not pre-seed the known durable run ID into Project A. The controlled Project A execution must establish or receive its durable ADOS execution identity through the execution boundary being exercised, and the evidence must demonstrate that the resulting durable candidate, validation, and review lifecycle belongs to that execution. Avoid circular identifier-equality proof.",
+            },
+            {
+                "finding": 2,
+                "title": "Task completion must follow publication readiness",
+                "required": "The production completed transition must require implementation, validation PASS, independent review approval, exact candidate/validated/reviewed/HEAD alignment, and publication-ready/converged evidence. A blocked publication state must leave the task non-completed while preserving human authority over final GitHub mutation.",
+            },
+            {
+                "finding": 3,
+                "title": "Spec Kit artifacts are stale",
+                "required": "Update plan.md and tasks.md to truthfully describe the nine production modules changed and reconcile T035 with the alignment helper imports so Plan-before-Code and Tasks governance match the candidate.",
+            },
+        ],
+    }
+}
 PR_REFRESH_ATTEMPTS = 3
 
 
@@ -393,6 +439,7 @@ class RunPipeline:
         retry_pinned_implementer: bool = False,
         continue_dirty_timeout_salvage: bool = False,
         authorize_substantial_completion: bool = False,
+        authorize_post_review_fix: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -418,6 +465,24 @@ class RunPipeline:
             return PipelineOutcome(
                 "IMPLEMENTATION_FAILED",
                 tuple([*stages, _stage("human_authorized_substantial_completion", "BLOCKED", {"reason": violation.code})]),
+                record,
+                violations=(violation,),
+            )
+
+        post_review_fix = record.get("humanAuthorizedPostReviewFix")
+        if (
+            isinstance(post_review_fix, dict)
+            and post_review_fix.get("status") == "CONSUMED"
+            and post_review_fix.get("invocationStatus") == "PENDING"
+        ):
+            violation = _violation(
+                "HUMAN_AUTHORIZED_POST_REVIEW_FIX_INVOCATION_UNRESOLVED",
+                "the consumed post-review-fix invocation has no durable result; another invocation requires a new human decision",
+                {"authorization_id": str(post_review_fix.get("authorizationId", ""))},
+            )
+            return PipelineOutcome(
+                "IMPLEMENTATION_FAILED",
+                tuple([*stages, _stage("human_authorized_post_review_fix", "BLOCKED", {"reason": violation.code})]),
                 record,
                 violations=(violation,),
             )
@@ -497,6 +562,25 @@ class RunPipeline:
                 return PipelineOutcome(
                     str(record.get("status", "IMPLEMENTATION_FAILED")),
                     tuple([*stages, _stage("human_authorized_substantial_completion", "BLOCKED", {})]),
+                    record,
+                    violations=violations,
+                )
+
+        if authorize_post_review_fix:
+            violations = human_authorized_post_review_fix_evidence(
+                self.git,
+                config,
+                run_record_path,
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+                _read_run_artifact(run_record_path, record, "implementer-runtime.json"),
+            )
+            if violations:
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("human_authorized_post_review_fix", "BLOCKED", {})]),
                     record,
                     violations=violations,
                 )
@@ -598,7 +682,12 @@ class RunPipeline:
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
         implementation_recovery_reopened = review_convergence_reopened
-        if authorize_substantial_completion:
+        if authorize_post_review_fix:
+            completed = self._authorize_post_review_fix(config, run_record_path, record, stages, bootstrap)
+            if isinstance(completed, PipelineOutcome):
+                return completed
+            implementer_result, record = completed
+        elif authorize_substantial_completion:
             completed = self._authorize_substantial_completion(config, run_record_path, record, stages, bootstrap)
             if isinstance(completed, PipelineOutcome):
                 return completed
@@ -736,6 +825,32 @@ class RunPipeline:
             if review_result.decision != "Changes Requested":
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result, block_violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),), block_cause="review_decision_unavailable")
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_DECISION_UNAVAILABLE", "review decision was not Approved or Changes Requested", {}),))
+            if authorize_post_review_fix:
+                violation = _violation(
+                    "HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED",
+                    "the authorized fix produced a new candidate that still has Changes Requested; no further exceptional invocation is authorized",
+                    {"candidate_sha": candidate_result.candidate_sha},
+                )
+                _write_review_block_status(
+                    run_record_path,
+                    record,
+                    review_result,
+                    candidate_result,
+                    validation_result,
+                    block_violations=(violation,),
+                    block_cause="human_authorized_post_review_fix_changes_requested",
+                )
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple(stages),
+                    _read_json(run_record_path),
+                    bootstrap=bootstrap,
+                    implementer_result=implementer_result,
+                    candidate=candidate_result,
+                    validation=validation_result,
+                    review=review_result,
+                    violations=(violation,),
+                )
             if round_number == max_rounds:
                 _write_review_block_status(run_record_path, record, review_result, candidate_result, validation_result)
                 return PipelineOutcome("REVIEW_BLOCKED", tuple(stages), _read_json(run_record_path), bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, validation=validation_result, review=review_result, violations=(_violation("REVIEW_MAX_ROUNDS_EXCEEDED", "review changes requested after max rounds", {"max_rounds": str(max_rounds)}),))
@@ -1438,6 +1553,166 @@ class RunPipeline:
         violation = _violation(
             "HUMAN_AUTHORIZED_SUBSTANTIAL_COMPLETION_FAILED",
             "the one human-authorized substantial-completion invocation failed; preserved work requires a new human decision",
+            {"authorization_id": authorization_id, "status": result.status},
+        )
+        _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=result,
+            violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
+        )
+
+    def _authorize_post_review_fix(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        """Consume one exact post-review-fix authorization without reopening recovery."""
+
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        violations = human_authorized_post_review_fix_evidence(
+            self.git, config, run_record_path, record, candidate, validation, review, implementer
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "IMPLEMENTATION_FAILED")),
+                tuple([*stages, _stage("human_authorized_post_review_fix", "BLOCKED", {})]),
+                record,
+                bootstrap=bootstrap,
+                violations=violations,
+            )
+
+        profile = HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES[str(record["runId"])]
+        assignment = record["agentAssignment"]
+        worktree = Path(str(record["featureWorktree"]))
+        source_block = record["implementationRecoveryBlock"]
+        substantial = record["humanAuthorizedSubstantialCompletion"]
+        runtime_result = implementer["result"]
+        source_runtime_path = run_record_path.with_name("implementer-runtime.json")
+        source_review_path = run_record_path.with_name("review-runtime.json")
+        candidate_sha = str(candidate["candidate_sha"])
+        authorization_id = f"human-post-review-fix-{record['runId']}-{candidate_sha[:12]}"
+        artifact_name = f"human-authorized-post-review-fix-{candidate_sha[:12]}.json"
+        primary_audit_path = (
+            Path(str(record["primaryRepository"]))
+            / ".agent-workflow"
+            / "runs"
+            / f"{record['specNumber']}-{record['featureSlug']}"
+            / artifact_name
+        )
+        now = _utc_now()
+        authorization = {
+            "authorizationId": authorization_id,
+            "authorizationType": "HUMAN_AUTHORIZED_POST_REVIEW_FIX",
+            "authorizationProvenance": "EXPLICIT_OPERATOR_CLI_FLAG",
+            "status": "CONSUMED",
+            "authorizedAt": now,
+            "consumedAt": now,
+            "runId": str(record["runId"]),
+            "projectId": str(record["projectId"]),
+            "featureBranch": str(record["featureBranch"]),
+            "featureWorktree": str(record["featureWorktree"]),
+            "sourceTerminalBlock": source_block,
+            "sourceImplementationRecoveryEpoch": _implementation_recovery_epoch(record),
+            "sourceImplementationRecoveryUsage": _implementation_recovery_attempt_count(record),
+            "sourceImplementationRecoveryLimit": config.execution_policy.implementation.max_recovery_rounds,
+            "sourceImplementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "sourceReviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "sourceSubstantialCompletionAuthorizationId": str(substantial["authorizationId"]),
+            "sourceFailedFixRuntimeId": str(runtime_result.get("runtimeId", "")),
+            "sourceFailedFixRuntimeStatus": str(runtime_result.get("status", "")),
+            "sourceFailedFixRuntimeArtifact": str(source_runtime_path),
+            "sourceFailedFixRuntimeSha256": hashlib.sha256(source_runtime_path.read_bytes()).hexdigest(),
+            "sourceReviewArtifact": str(source_review_path),
+            "sourceReviewArtifactSha256": hashlib.sha256(source_review_path.read_bytes()).hexdigest(),
+            "startingHead": self.git.current_head(worktree),
+            "startingCandidateSha": candidate_sha,
+            "startingValidatedSha": str(validation["head_after"]),
+            "startingReviewedSha": str(review["reviewed_sha"]),
+            "startingWorktreeState": "CLEAN",
+            "requirementsSha": str(record["requirements"]["sha256"]),
+            "assignmentSequence": assignment["sequence"],
+            "implementerId": assignment["implementerId"],
+            "implementerCommand": assignment["implementerCommand"],
+            "reviewerId": assignment["reviewerId"],
+            "reviewerCommand": assignment["reviewerCommand"],
+            "candidateOwnerId": assignment["candidateOwnerId"],
+            "pinnedAgentAssignment": assignment,
+            "forensicReviewId": str(profile["forensicReviewId"]),
+            "forensicDisposition": "NEEDS_AUTHORIZED_POST_REVIEW_FIX",
+            "authoritativeReviewDecision": "Changes Requested",
+            "authoritativeReviewFindings": profile["reviewFindings"],
+            "ordinaryRecoveryCapacityGranted": 0,
+            "invocationOrdinal": 1,
+            "invocationTimeoutMs": POST_REVIEW_FIX_TIMEOUT_MS,
+            "invocationRuntimeId": "",
+            "invocationStatus": "PENDING",
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        updated["humanAuthorizedPostReviewFix"] = authorization
+        updated["humanAuthorizedPostReviewFixes"] = [authorization]
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "human_authorized_post_review_fix_handoff"
+
+        # Every durable copy is CONSUMED before the single dispatch starts.
+        local_audit_path = run_record_path.with_name(artifact_name)
+        _write_json(local_audit_path, authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        stages.append(
+            _stage(
+                "human_authorized_post_review_fix",
+                "PASS",
+                {
+                    "authorization_id": authorization_id,
+                    "candidate_sha": candidate_sha,
+                    "implementer": str(assignment["implementerId"]),
+                    "timeout_ms": str(POST_REVIEW_FIX_TIMEOUT_MS),
+                },
+            )
+        )
+
+        result = self.implementer.run(
+            config=config,
+            run_record_path=run_record_path,
+            timeout_ms=POST_REVIEW_FIX_TIMEOUT_MS,
+        )
+        invocation_runtime_id = result.result.runtime_id if result.result is not None else ""
+        completed_authorization = {
+            **authorization,
+            "invocationRuntimeId": invocation_runtime_id,
+            "invocationStatus": result.status,
+        }
+        next_record = _read_json(run_record_path) or result.run_record or updated
+        next_record = dict(next_record)
+        next_record["humanAuthorizedPostReviewFix"] = completed_authorization
+        next_record["humanAuthorizedPostReviewFixes"] = [completed_authorization]
+        _write_json(local_audit_path, completed_authorization)
+        _write_json(primary_audit_path, completed_authorization)
+        _write_json(run_record_path, next_record)
+        stages.append(
+            _stage(
+                "human_authorized_post_review_fix_implementer",
+                result.status,
+                {"authorization_id": authorization_id, "runtime_id": invocation_runtime_id},
+            )
+        )
+        if result.status == "READY_FOR_VALIDATION":
+            return result, next_record
+
+        violation = _violation(
+            "HUMAN_AUTHORIZED_POST_REVIEW_FIX_FAILED",
+            "the one human-authorized post-review fix invocation failed; another invocation requires a new human decision",
             {"authorization_id": authorization_id, "status": result.status},
         )
         _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
@@ -5807,6 +6082,228 @@ def human_authorized_substantial_completion_evidence(
             reject("SUBSTANTIAL_COMPLETION_NEWER_EVIDENCE", "newer candidate, validation, or review evidence supersedes the timeout")
     except OSError:
         reject("SUBSTANTIAL_COMPLETION_ARTIFACT_MISSING", "required durable artifacts are missing")
+    return tuple(violations)
+
+
+def human_authorized_post_review_fix_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+) -> tuple[PipelineViolation, ...]:
+    """Fail-closed admission for the exact Spec 148 post-review-fix timeout."""
+
+    violations: list[PipelineViolation] = []
+
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+
+    if not isinstance(record, dict):
+        return (_violation("POST_REVIEW_FIX_RECORD_INVALID", "authorization requires a durable run record", {}),)
+    profile = HUMAN_AUTHORIZED_POST_REVIEW_FIX_PROFILES.get(str(record.get("runId", "")))
+    if not isinstance(profile, dict) or profile.get("forensicDisposition") != "NEEDS_AUTHORIZED_POST_REVIEW_FIX":
+        return (_violation("POST_REVIEW_FIX_FORENSIC_PROVENANCE_MISSING", "this run has no human-reviewed post-review-fix profile", {}),)
+
+    if record.get("status") != "IMPLEMENTATION_TIMED_OUT":
+        reject("POST_REVIEW_FIX_STATUS_INVALID", "authorization requires status IMPLEMENTATION_TIMED_OUT")
+    if record.get("nextStage") != "human_intervention":
+        reject("POST_REVIEW_FIX_NEXT_STAGE_INVALID", "authorization requires nextStage human_intervention")
+    block = record.get("implementationRecoveryBlock")
+    block_evidence = block.get("evidence") if isinstance(block, dict) else None
+    if (
+        not isinstance(block, dict)
+        or block.get("reasonCode") != "IMPLEMENTATION_RECOVERY_MAX_ROUNDS_EXCEEDED"
+        or block.get("status") != "BLOCKED"
+        or not isinstance(block_evidence, dict)
+        or str(block_evidence.get("max_recovery_rounds", "")) != str(profile.get("sourceAttemptUsage", ""))
+        or str(block_evidence.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+    ):
+        reject("POST_REVIEW_FIX_BLOCK_INVALID", "authorization requires the exact exhausted implementation-recovery block")
+
+    for key, expected in (
+        ("projectId", profile.get("projectId")),
+        ("specNumber", profile.get("specNumber")),
+        ("featureBranch", profile.get("featureBranch")),
+        ("authoritativeBaseSha", profile.get("authoritativeBaseSha")),
+    ):
+        if str(record.get(key, "")) != str(expected):
+            reject("POST_REVIEW_FIX_IDENTITY_MISMATCH", "run identity differs from human-reviewed provenance", {"field": key})
+    recorded_worktree = Path(str(record.get("featureWorktree", "")))
+    if recorded_worktree.resolve() != Path(str(profile.get("featureWorktree", ""))).resolve():
+        reject("POST_REVIEW_FIX_WORKTREE_IDENTITY_MISMATCH", "feature worktree differs from human-reviewed provenance")
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if requirements_sha != str(profile.get("requirementsSha", "")):
+        reject("POST_REVIEW_FIX_REQUIREMENTS_MISMATCH", "requirements identity differs from human-reviewed provenance")
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict) or (
+        str(assignment.get("implementerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or str(assignment.get("implementerCommand", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(assignment.get("reviewerId", "")) != str(profile.get("pinnedReviewerId", ""))
+        or str(assignment.get("reviewerCommand", "")) != str(profile.get("pinnedReviewerCommand", ""))
+        or str(assignment.get("candidateOwnerId", "")) != str(profile.get("pinnedImplementerId", ""))
+        or _positive_int_from_mapping(assignment, "sequence") != int(profile.get("assignmentSequence", 0))
+        or str(record.get("implementer", "")) != str(profile.get("pinnedImplementerCommand", ""))
+        or str(record.get("reviewer", "")) != str(profile.get("pinnedReviewerCommand", ""))
+    ):
+        reject("POST_REVIEW_FIX_ASSIGNMENT_MISMATCH", "pinned roles, owner, or assignment sequence changed")
+
+    cand = _candidate_from_mapping(candidate)
+    try:
+        val = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        rev = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        val = rev = None
+    exact = cand.candidate_sha if cand else ""
+    if cand is None or cand.status != "COMMITTED" or exact != str(profile.get("candidateSha", "")):
+        reject("POST_REVIEW_FIX_CANDIDATE_INVALID", "candidate does not match the reviewed post-review timeout state")
+    if val is None or val.status != "PASS":
+        reject("POST_REVIEW_FIX_VALIDATION_INVALID", "validation must remain PASS")
+    elif val.head_before != exact or val.head_after != exact:
+        reject("POST_REVIEW_FIX_VALIDATION_SHA_MISMATCH", "validation does not match the exact candidate")
+    if rev is None or rev.status != "PASS" or rev.decision != "Changes Requested" or rev.exit_code != 0:
+        reject("POST_REVIEW_FIX_REVIEW_INVALID", "review must remain a successful Changes Requested result")
+    elif rev.reviewed_sha != exact:
+        reject("POST_REVIEW_FIX_REVIEW_SHA_MISMATCH", "review does not match the exact candidate")
+
+    review_path = run_record_path.with_name("review-runtime.json")
+    runtime_path = run_record_path.with_name("implementer-runtime.json")
+    try:
+        review_artifact_sha = hashlib.sha256(review_path.read_bytes()).hexdigest()
+        runtime_artifact_sha = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+    except OSError:
+        review_artifact_sha = runtime_artifact_sha = ""
+        reject("POST_REVIEW_FIX_ARTIFACT_MISSING", "review or failed-fix runtime artifact is missing")
+    if review_artifact_sha != str(profile.get("reviewArtifactSha256", "")):
+        reject("POST_REVIEW_FIX_REVIEW_ARTIFACT_MISMATCH", "the exact authoritative Codex review artifact changed")
+    review_stdout = str(review.get("stdout", "")) if isinstance(review, dict) else ""
+    if hashlib.sha256(review_stdout.encode("utf-8")).hexdigest() != str(profile.get("reviewStdoutSha256", "")):
+        reject("POST_REVIEW_FIX_REVIEW_FINDINGS_MISMATCH", "the authoritative Codex blocking findings changed")
+    if runtime_artifact_sha != str(profile.get("failedFixRuntimeArtifactSha256", "")):
+        reject("POST_REVIEW_FIX_RUNTIME_ARTIFACT_MISMATCH", "the failed ordinary review-fix runtime artifact changed")
+
+    runtime_result = implementer.get("result") if isinstance(implementer, dict) else None
+    runtime = implementer.get("runtime") if isinstance(implementer, dict) else None
+    command = runtime.get("command") if isinstance(runtime, dict) and isinstance(runtime.get("command"), dict) else None
+    if not isinstance(runtime_result, dict) or not isinstance(runtime, dict) or not isinstance(command, dict):
+        reject("POST_REVIEW_FIX_RUNTIME_MISSING", "failed ordinary review-fix runtime evidence is required")
+    else:
+        if (
+            str(runtime_result.get("runId", "")) != str(record.get("runId", ""))
+            or str(runtime_result.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+            or runtime_result.get("timedOut") is not True
+            or runtime_result.get("exitCode") is not None
+            or str(runtime_result.get("headBefore", "")) != exact
+            or str(runtime_result.get("headAfter", "")) != exact
+            or runtime_result.get("changedFiles") != []
+            or str(runtime_result.get("stdout", "")) != ""
+            or str(runtime_result.get("stderr", "")) != ""
+            or str(runtime_result.get("runtimeFailureCategory", "")) != "UNKNOWN_RUNTIME_FAILURE"
+            or str(command.get("adapter", "")) != str(profile.get("pinnedImplementerCommand", ""))
+            or _positive_int_from_mapping(command, "timeoutMs") != int(profile.get("failedFixTimeoutMs", 0))
+        ):
+            reject("POST_REVIEW_FIX_RUNTIME_INVALID", "runtime does not prove the exact unchanged clean ordinary review-fix timeout")
+    implementation_failure = record.get("implementationFailure")
+    if not isinstance(implementation_failure, dict) or (
+        str(implementation_failure.get("status", "")) != "IMPLEMENTATION_TIMED_OUT"
+        or str(implementation_failure.get("headBefore", "")) != exact
+        or str(implementation_failure.get("headAfter", "")) != exact
+        or implementation_failure.get("changedFiles") != []
+    ):
+        reject("POST_REVIEW_FIX_FAILURE_RECORD_INVALID", "durable implementation failure does not match the no-change review-fix timeout")
+
+    try:
+        attempt_count = _implementation_recovery_attempt_count(record)
+    except (TypeError, ValueError):
+        attempt_count = -1
+        reject("POST_REVIEW_FIX_ATTEMPT_HISTORY_INVALID", "implementation recovery history is malformed")
+    epoch = _implementation_recovery_epoch(record)
+    max_attempts = config.execution_policy.implementation.max_recovery_rounds
+    if epoch != int(profile.get("sourceEpoch", 0)) or attempt_count != int(profile.get("sourceAttemptUsage", 0)) or attempt_count != max_attempts:
+        reject("POST_REVIEW_FIX_CAPACITY_INVALID", "ordinary recovery must remain exactly exhausted", {"epoch": str(epoch), "attempts": str(attempt_count), "max_attempts": str(max_attempts)})
+    implementation_reopens = record.get("implementationRecoveryReopens")
+    convergence_reopens = record.get("reviewConvergenceReopens")
+    if (
+        not isinstance(implementation_reopens, list)
+        or len(implementation_reopens) != int(profile.get("sourceImplementationReopens", -1))
+        or len(implementation_reopens) != config.execution_policy.implementation.max_recovery_reopens
+    ):
+        reject("POST_REVIEW_FIX_IMPLEMENTATION_REOPENS_INVALID", "implementation-recovery reopens must remain exactly exhausted")
+    if (
+        not isinstance(convergence_reopens, list)
+        or len(convergence_reopens) != int(profile.get("sourceReviewConvergenceReopens", -1))
+        or len(convergence_reopens) != config.execution_policy.review.max_convergence_reopens
+    ):
+        reject("POST_REVIEW_FIX_CONVERGENCE_REOPENS_INVALID", "review-convergence reopens must remain exactly exhausted")
+
+    substantial = record.get("humanAuthorizedSubstantialCompletion")
+    substantial_history = record.get("humanAuthorizedSubstantialCompletions")
+    if not isinstance(substantial, dict) or substantial.get("status") != "CONSUMED":
+        reject("POST_REVIEW_FIX_SUBSTANTIAL_AUTHORIZATION_MISSING", "the consumed substantial-completion authorization is required")
+    elif (
+        str(substantial.get("authorizationId", "")) != str(profile.get("substantialAuthorizationId", ""))
+        or substantial.get("invocationStatus") != "READY_FOR_VALIDATION"
+        or substantial.get("ordinaryRecoveryCapacityGranted") != 0
+        or not isinstance(substantial_history, list)
+        or len(substantial_history) != 1
+        or substantial_history[0] != substantial
+    ):
+        reject("POST_REVIEW_FIX_SUBSTANTIAL_AUTHORIZATION_INVALID", "substantial-completion authorization does not match the exact source invocation")
+    else:
+        substantial_name = Path(str(substantial.get("artifact", ""))).name
+        local_substantial_path = run_record_path.with_name(substantial_name)
+        primary_substantial_path = Path(str(substantial.get("artifact", "")))
+        try:
+            local_substantial_sha = hashlib.sha256(local_substantial_path.read_bytes()).hexdigest()
+            primary_substantial_sha = hashlib.sha256(primary_substantial_path.read_bytes()).hexdigest()
+        except OSError:
+            local_substantial_sha = primary_substantial_sha = ""
+        expected_substantial_sha = str(profile.get("substantialAuthorizationArtifactSha256", ""))
+        if local_substantial_sha != expected_substantial_sha or primary_substantial_sha != expected_substantial_sha:
+            reject("POST_REVIEW_FIX_SUBSTANTIAL_ARTIFACT_MISMATCH", "substantial-completion audit copies are missing or changed")
+
+    if "humanAuthorizedPostReviewFix" in record or "humanAuthorizedPostReviewFixes" in record:
+        reject("POST_REVIEW_FIX_ALREADY_USED", "post-review fix may be authorized only once")
+    artifact_name = f"human-authorized-post-review-fix-{exact[:12]}.json"
+    primary_artifact = Path(str(record.get("primaryRepository", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / artifact_name
+    if run_record_path.with_name(artifact_name).exists() or primary_artifact.exists():
+        reject("POST_REVIEW_FIX_ALREADY_USED", "post-review-fix audit already exists")
+
+    try:
+        status = git.status(recorded_worktree)
+        current_head = git.current_head(recorded_worktree)
+        branch = git.current_branch(recorded_worktree)
+    except RepositoryProviderError as exc:
+        reject(exc.code, exc.message)
+    else:
+        if status.root != recorded_worktree.resolve() or branch != str(profile.get("featureBranch", "")):
+            reject("POST_REVIEW_FIX_WORKTREE_IDENTITY_MISMATCH", "worktree root or branch changed")
+        if current_head != exact:
+            reject("POST_REVIEW_FIX_HEAD_MISMATCH", "HEAD no longer matches the authoritative candidate")
+        if status.dirty_tracked:
+            reject("POST_REVIEW_FIX_DIRTY_FILES", "the authorized post-review fix requires a clean worktree")
+        if status.staged:
+            reject("POST_REVIEW_FIX_STAGED_FILES", "staged files are forbidden")
+        if status.untracked:
+            reject("POST_REVIEW_FIX_UNTRACKED_FILES", "untracked files are forbidden")
+    for args, code in ((('diff', '--check'), "POST_REVIEW_FIX_DIFF_CHECK_FAILED"), (('diff', '--cached', '--check'), "POST_REVIEW_FIX_CACHED_DIFF_CHECK_FAILED")):
+        checked = subprocess.run(("git", *args), cwd=recorded_worktree, shell=False, capture_output=True)
+        if checked.returncode != 0:
+            reject(code, "worktree failed git diff --check")
+
+    try:
+        candidate_time = run_record_path.with_name("candidate.json").stat().st_mtime_ns
+        validation_time = run_record_path.with_name("validation-runtime.json").stat().st_mtime_ns
+        review_time = review_path.stat().st_mtime_ns
+        implementer_time = runtime_path.stat().st_mtime_ns
+        if not candidate_time < validation_time < review_time < implementer_time:
+            reject("POST_REVIEW_FIX_EVIDENCE_ORDER_INVALID", "candidate, validation, review, and failed-fix evidence are not in the required order")
+    except OSError:
+        reject("POST_REVIEW_FIX_ARTIFACT_MISSING", "required durable artifacts are missing")
     return tuple(violations)
 
 
