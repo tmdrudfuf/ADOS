@@ -168,6 +168,41 @@ class ExternalRunProtocolTests(unittest.TestCase):
             self.assertEqual("BLOCKED", inspected.run["technicalPublicationReadiness"])
             self.assertEqual("MISMATCH", inspected.run["convergenceArtifactIntegrity"])
 
+    def test_blocked_convergence_resumes_at_publication_without_agent_redispatch(self):
+        with Fixture() as fixture:
+            service = ExternalRunProtocolService()
+            prepared = service.prepare(**fixture.prepare_args())
+            record_path = fixture.record_path(prepared.run)
+            origin_path = record_path.with_name("external-origin.json")
+            valid_origin = origin_path.read_bytes()
+            fixture.reviewer.write_text(
+                "from pathlib import Path\n"
+                f"p=Path(r'{fixture.review_marker}')\n"
+                "p.write_text(str(int(p.read_text())+1) if p.exists() else '1', encoding='utf-8')\n"
+                "next(Path('.agent-workflow/runs').glob('*/external-origin.json')).write_text('{}', encoding='utf-8')\n"
+                "print('Approved')\n",
+                encoding="utf-8",
+            )
+
+            blocked = service.continue_exact(
+                project_path=fixture.repo, run_id=prepared.run["runId"],
+                origin_digest=prepared.run["originDigest"], config_path=fixture.config,
+            )
+            durable = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual("PUBLICATION_BLOCKED", blocked.status)
+            self.assertEqual("READY_FOR_PUBLICATION", durable["status"])
+            self.assertEqual("1", fixture.dispatch_marker.read_text(encoding="utf-8"))
+            self.assertEqual("1", fixture.review_marker.read_text(encoding="utf-8"))
+
+            origin_path.write_bytes(valid_origin)
+            resumed = service.continue_exact(
+                project_path=fixture.repo, run_id=prepared.run["runId"],
+                origin_digest=prepared.run["originDigest"], config_path=fixture.config,
+            )
+            self.assertEqual("READY_FOR_PUBLICATION", resumed.status)
+            self.assertEqual("1", fixture.dispatch_marker.read_text(encoding="utf-8"))
+            self.assertEqual("1", fixture.review_marker.read_text(encoding="utf-8"))
+
     def test_convergence_failure_matrix(self):
         with Fixture() as fixture:
             service = ExternalRunProtocolService()
@@ -225,6 +260,7 @@ class Fixture:
         self.config = self.root / "project-config.json"
         self.requirements = self.root / "requirements.md"
         self.dispatch_marker = self.root / "dispatch-count.txt"
+        self.review_marker = self.root / "review-count.txt"
 
     def __enter__(self):
         self.git(self.root, "init", "--bare", str(self.bare))
@@ -247,7 +283,14 @@ class Fixture:
             encoding="utf-8",
         )
         reviewer = self.root / "reviewer.py"
-        reviewer.write_text("print('Approved')\n", encoding="utf-8")
+        self.reviewer = reviewer
+        reviewer.write_text(
+            "from pathlib import Path\n"
+            f"p=Path(r'{self.review_marker}')\n"
+            "p.write_text(str(int(p.read_text())+1) if p.exists() else '1', encoding='utf-8')\n"
+            "print('Approved')\n",
+            encoding="utf-8",
+        )
         command_i = f'"{sys.executable}" "{implementer}"'
         command_r = f'"{sys.executable}" "{reviewer}"'
         config = {

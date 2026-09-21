@@ -1966,9 +1966,6 @@ class RunPipeline:
             durable = _read_json(run_record_path)
             convergence = evaluate_convergence(run_record_path=run_record_path, record=durable, git=self.git)
             if convergence["technicalPublicationReadiness"] != "READY":
-                _write_status(run_record_path, durable, "PUBLICATION_BLOCKED")
-                durable = _read_json(run_record_path)
-                convergence = evaluate_convergence(run_record_path=run_record_path, record=durable, git=self.git)
                 write_convergence_artifact(run_record_path, convergence)
                 reasons = tuple(
                     PipelineViolation(
