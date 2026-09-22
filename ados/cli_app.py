@@ -10,6 +10,7 @@ from . import __version__
 from .doctor import DoctorRequest, DoctorResult, DoctorService
 from .execution_policy import PolicyValidationError, load_execution_policy
 from .exact_head_gate import ExactHeadGate
+from .external_run import ExternalRunProtocolService, ExternalRunResult, ExternalRunViolation
 from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfigError, load_project_config
 from .review_engine import ReviewEngine, ReviewRequest
@@ -89,6 +90,26 @@ class CliApplication:
         )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
+
+        external = subparsers.add_parser("external-run", help="prepare, continue, or inspect an externally originated exact run")
+        external_subparsers = external.add_subparsers(dest="action", required=True)
+        external_prepare = external_subparsers.add_parser("prepare", help="durably prepare a child run without invoking agents")
+        external_prepare.add_argument("--project", required=True)
+        external_prepare.add_argument("--feature", required=True)
+        external_prepare.add_argument("--origin-file", required=True)
+        external_prepare.add_argument("--requirements-file", required=True)
+        external_prepare.add_argument("--spec", type=int)
+        external_prepare.add_argument("--config")
+        external_prepare.add_argument("--json", action="store_true")
+        for action in ("continue", "inspect"):
+            command = external_subparsers.add_parser(action, help=f"{action} an exact externally originated run")
+            command.add_argument("--project", required=True)
+            command.add_argument("--run-id", required=True)
+            command.add_argument("--origin-digest", required=True)
+            command.add_argument("--config")
+            if action == "continue":
+                command.add_argument("--implementer-timeout-ms", type=int, default=300000)
+            command.add_argument("--json", action="store_true")
 
         policy_parser = subparsers.add_parser("policy")
         policy_subparsers = policy_parser.add_subparsers(dest="action", required=True)
@@ -212,6 +233,35 @@ class CliApplication:
             else:
                 print(_format_run_human(result))
             return _run_exit_code(result)
+
+        if args.area == "external-run":
+            service = ExternalRunProtocolService()
+            if args.action == "prepare":
+                try:
+                    origin = json.loads(Path(args.origin_file).read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    result = ExternalRunResult("INVALID", "prepare", violations=(ExternalRunViolation("EXTERNAL_ORIGIN_FILE_INVALID", str(exc), {"path": str(Path(args.origin_file).resolve())}),))
+                else:
+                    if not isinstance(origin, dict):
+                        result = ExternalRunResult("INVALID", "prepare", violations=(ExternalRunViolation("EXTERNAL_ORIGIN_FILE_INVALID", "external origin file must contain a JSON object", {}),))
+                    else:
+                        result = service.prepare(
+                            project_path=Path(args.project), feature=args.feature, origin=origin,
+                            requirements_file=Path(args.requirements_file), spec_number=args.spec,
+                            config_path=Path(args.config) if args.config else None,
+                        )
+            elif args.action == "continue":
+                result = service.continue_exact(
+                    project_path=Path(args.project), run_id=args.run_id, origin_digest=args.origin_digest,
+                    config_path=Path(args.config) if args.config else None, timeout_ms=args.implementer_timeout_ms,
+                )
+            else:
+                result = service.inspect(
+                    project_path=Path(args.project), run_id=args.run_id, origin_digest=args.origin_digest,
+                    config_path=Path(args.config) if args.config else None,
+                )
+            _print_json(result.to_dict())
+            return 0 if result.status in {"PASS", "PREPARED", "READY_FOR_PUBLICATION", "COMPLETE", "NO_CHANGES"} else 1
 
         if args.area == "config" and args.action == "validate":
             try:

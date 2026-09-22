@@ -22,6 +22,7 @@ from .agent_roles import (
     failover_implementer,
     is_external_availability_failure,
 )
+from .convergence_evidence import evaluate_convergence, write_convergence_artifact
 from .exact_head_gate import ExactHeadGate
 from .git_provider import GitRepositoryProvider
 from .implementer_runtime import ImplementerRuntime, ImplementerRuntimeOutcome, ImplementerRuntimeResult, ImplementerViolation
@@ -1960,6 +1961,25 @@ class RunPipeline:
         exact: dict[str, object],
     ) -> PipelineOutcome:
         worktree = Path(record["featureWorktree"])
+        if isinstance(record.get("externalOrigin"), dict):
+            _write_status(run_record_path, record, "READY_FOR_PUBLICATION")
+            durable = _read_json(run_record_path)
+            convergence = evaluate_convergence(run_record_path=run_record_path, record=durable, git=self.git)
+            if convergence["technicalPublicationReadiness"] != "READY":
+                write_convergence_artifact(run_record_path, convergence)
+                reasons = tuple(
+                    PipelineViolation(
+                        str(item.get("code", "TECHNICAL_CONVERGENCE_BLOCKED")),
+                        "external child run is not technically converged",
+                        {str(key): str(value) for key, value in item.get("evidence", {}).items()},
+                    )
+                    for item in convergence["blockingReasons"]
+                )
+                stages.append(_stage("technical_convergence", "BLOCKED", {"origin_digest": str(record.get("externalOriginDigest", ""))}))
+                return PipelineOutcome("PUBLICATION_BLOCKED", tuple(stages), durable, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact, violations=reasons)
+            write_convergence_artifact(run_record_path, convergence)
+            stages.append(_stage("technical_convergence", "READY", {"origin_digest": str(record.get("externalOriginDigest", "")), "remote_publication": "NOT_REQUESTED"}))
+            return PipelineOutcome("READY_FOR_PUBLICATION", tuple(stages), durable, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate, validation=validation, review=review, exact_head_gate=exact)
         if isinstance(self.publisher, GitHubCliPublicationProvider) and not _is_github_origin(self.git, worktree):
             _write_status(run_record_path, record, "READY_FOR_PUBLICATION")
             stages.append(_stage("publication", "READY_FOR_PUBLICATION", {"reason": "non_github_origin"}))
