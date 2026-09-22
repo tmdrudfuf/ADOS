@@ -251,6 +251,21 @@ class RunService:
             if origin_violations:
                 return RunResult("BLOCKED", RunEligibility("BLOCKED", origin_violations), plan, resume.record, resumed=True)
         adoption = None if resume is not None else self._orphaned_candidate_adoption(project_path, config, plan, request.feature_description, requirements)
+        if parsed_origin is not None and adoption is not None:
+            return RunResult(
+                "BLOCKED",
+                RunEligibility(
+                    "BLOCKED",
+                    (
+                        RunViolation(
+                            "EXTERNAL_ORIGIN_ORPHAN_ADOPTION_FORBIDDEN",
+                            "external prepare cannot attach a new origin identity to pre-existing unbound candidate work",
+                            {"worktree": plan.feature_worktree, "branch": plan.feature_branch},
+                        ),
+                    ),
+                ),
+                plan,
+            )
         if request.prefer_implementer and (resume is not None or adoption is not None):
             return RunResult(
                 "BLOCKED",

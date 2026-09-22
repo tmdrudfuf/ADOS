@@ -92,6 +92,25 @@ class ExternalRunProtocolTests(unittest.TestCase):
             self.assertTrue(origin_artifact.is_file())
             self.assertFalse(fixture.dispatch_marker.exists())
 
+    def test_prepare_rejects_unbound_orphan_candidate_without_dispatch(self):
+        with Fixture() as fixture:
+            worktree = fixture.root / "primary-child-protocol-exercise"
+            fixture.git(
+                fixture.repo, "worktree", "add", "-b", "codex/001-child-protocol-exercise",
+                str(worktree), fixture.git(fixture.repo, "rev-parse", "HEAD").stdout.strip(),
+            )
+            (worktree / "orphan.txt").write_text("pre-existing unbound candidate\n", encoding="utf-8")
+            fixture.git(worktree, "add", "orphan.txt")
+            fixture.git(worktree, "commit", "-m", "orphan candidate")
+
+            result = ExternalRunProtocolService().prepare(**fixture.prepare_args())
+
+            self.assertEqual("BLOCKED", result.status)
+            self.assertEqual("EXTERNAL_ORIGIN_ORPHAN_ADOPTION_FORBIDDEN", result.violations[0].code)
+            self.assertFalse(fixture.dispatch_marker.exists())
+            self.assertFalse(fixture.review_marker.exists())
+            self.assertEqual([], fixture.run_records())
+
     def test_controlled_two_phase_pipeline_and_read_only_inspection(self):
         with Fixture() as fixture:
             service = ExternalRunProtocolService()
