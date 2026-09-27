@@ -12,6 +12,7 @@ from unittest import mock
 
 import ados.run_pipeline as run_pipeline
 from ados.cli import main
+from ados.cli_app import CliApplication
 from ados.requirements_source import hash_requirements_content, read_durable_requirements_content, read_requirements_file, write_requirements_artifacts
 from ados.run_command import RunRequest, RunService
 from ados.run_pipeline import PipelineViolation, PullRequestInfo, RunPipeline
@@ -37,6 +38,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("--continue-dirty-timeout-salvage", completed.stdout)
         self.assertIn("--authorize-substantial-completion", completed.stdout)
         self.assertIn("--authorize-post-review-fix", completed.stdout)
+        self.assertIn("--authorize-substantial-rework", completed.stdout)
 
     def test_valid_run_start(self):
         with self.project(specs=[1, 2]) as fixture:
@@ -5190,6 +5192,290 @@ class CliRunTests(unittest.TestCase):
                     )
                 self.assertIn(expected, {item.code for item in violations})
 
+    def test_human_authorized_substantial_rework_consumes_before_one_claude_and_returns_to_normal_gates(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Authorized substantial rework success")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "substantial-rework-count.txt"
+            relative_record = state["record_path"].relative_to(state["worktree"]).as_posix()
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                "import json, sys\n"
+                "prompt = sys.stdin.read()\n"
+                "assert 'Human-authorized substantial architectural rework' in prompt\n"
+                "assert 'external-run prepare' in prompt and 'external-run continue' in prompt and 'external-run inspect' in prompt\n"
+                "assert 'NEW child run' in prompt and 'Never inject the parent verification run ID' in prompt\n"
+                f"record = json.loads(Path(r'{relative_record}').read_text(encoding='utf-8'))\n"
+                "auth = record['humanAuthorizedSubstantialRework']\n"
+                "assert auth['status'] == 'CONSUMED' and auth['invocationStatus'] == 'PENDING'\n"
+                "assert auth['invocationTimeoutMs'] == 3600000\n"
+                "assert auth['ordinaryRecoveryCapacityGranted'] == 0\n"
+                "assert auth['invocationOrdinal'] == 1\n"
+                "assert Path(auth['artifact']).is_file()\n"
+                f"assert Path(r'{relative_record}').with_name(Path(auth['artifact']).name).is_file()\n"
+                "assert record['agentAssignment']['implementerId'] == 'claude'\n"
+                "assert record['agentAssignment']['reviewerId'] == 'codex'\n"
+                "assert record['agentAssignment']['candidateOwnerId'] == 'claude'\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "Path('substantial-rework.txt').write_text('child protocol integrated', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(pipeline.implementer, "run", wraps=pipeline.implementer.run) as implementer_run,
+            ):
+                result = pipeline.run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=state["record_path"],
+                    timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+                dispatched_timeout = implementer_run.call_args.kwargs["timeout_ms"]
+            final = result.run_record
+            authorization = final["humanAuthorizedSubstantialRework"]
+            stages = [stage.id for stage in result.stages]
+            invocation_count = counter.read_text()
+
+        self.assertEqual("COMPLETE", result.status)
+        self.assertEqual("1", invocation_count)
+        self.assertEqual("CONSUMED", authorization["status"])
+        self.assertEqual("READY_FOR_VALIDATION", authorization["invocationStatus"])
+        self.assertEqual(3_600_000, authorization["invocationTimeoutMs"])
+        self.assertEqual(3_600_000, dispatched_timeout)
+        self.assertTrue(authorization["resultingRuntimeId"])
+        self.assertEqual(before["reviewBlock"]["candidateSha"], authorization["headBeforeImplementation"])
+        self.assertTrue(authorization["headAfterImplementation"])
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertEqual(before["agentAssignment"], final["agentAssignment"])
+        self.assertLess(stages.index("human_authorized_substantial_rework_implementer"), stages.index("candidate"))
+        self.assertLess(stages.index("candidate"), stages.index("validation"))
+        self.assertLess(stages.index("validation"), stages.index("review"))
+        self.assertLess(stages.index("review"), stages.index("exact_head"))
+
+    def test_human_authorized_substantial_rework_exact_state_is_eligible_read_only_and_cli_flag_is_stable(self):
+        parsed = CliApplication().build_parser().parse_args(
+            ["run", "--project", "project", "--feature", "feature", "--authorize-substantial-rework"]
+        )
+        self.assertTrue(parsed.authorize_substantial_rework)
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Eligible substantial rework")
+            before = state["record_path"].read_bytes()
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunService().run(
+                    RunRequest(
+                        fixture.repo,
+                        "Eligible substantial rework",
+                        1,
+                        fixture.config,
+                        requirements_file=state["requirements"],
+                        dry_run=True,
+                        authorize_substantial_rework=True,
+                    )
+                )
+            after = state["record_path"].read_bytes()
+
+        self.assertEqual("PLANNED", result.status, result.to_dict())
+        self.assertEqual("ELIGIBLE", result.eligibility.status, result.to_dict())
+        self.assertEqual(before, after)
+
+    def test_human_authorized_substantial_rework_changes_requested_stops_without_second_dispatch(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Substantial rework still blocked")
+            counter = fixture.root / "substantial-rework-rejected-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "Path('substantial-rework.txt').write_text('attempted', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Changes Requested')\n", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+                result = pipeline.run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+                plain_resume = pipeline.run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                )
+            invocation_count = counter.read_text()
+
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertEqual("1", invocation_count)
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED", {item.code for item in result.violations})
+        self.assertEqual("REVIEW_BLOCKED", plain_resume.status)
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED", {item.code for item in plain_resume.violations})
+        self.assertNotIn("implementation_recovery", [stage.id for stage in result.stages])
+
+    def test_human_authorized_substantial_rework_failure_is_terminal_one_shot_and_accounting_neutral(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Failed substantial rework")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "substantial-rework-failure-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nimport sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "sys.exit(7)\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+                failed = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_substantial_rework=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_substantial_rework=True)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            invocation_count = counter.read_text()
+
+        self.assertEqual("IMPLEMENTATION_FAILED", failed.status)
+        self.assertEqual("human_intervention", final["nextStage"])
+        self.assertEqual("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual("CONSUMED", final["humanAuthorizedSubstantialRework"]["status"])
+        self.assertEqual("1", invocation_count)
+        self.assertIn("SUBSTANTIAL_REWORK_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+
+    def test_human_authorized_substantial_rework_timeout_stops_safely_without_retry(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Timed out substantial rework")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            (fixture.root / "implementer.py").write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(run_pipeline, "SUBSTANTIAL_REWORK_TIMEOUT_MS", 100),
+            ):
+                result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("IMPLEMENTATION_TIMED_OUT", final["humanAuthorizedSubstantialRework"]["invocationStatus"])
+        self.assertEqual(100, final["humanAuthorizedSubstantialRework"]["invocationTimeoutMs"])
+        self.assertEqual("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+
+    def test_consumed_substantial_rework_pending_blocks_plain_resume_without_dispatch(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Interrupted substantial rework")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            record["humanAuthorizedSubstantialRework"] = {"authorizationId": "interrupted-rework", "status": "CONSUMED", "invocationStatus": "PENDING"}
+            record["humanAuthorizedSubstantialReworks"] = [record["humanAuthorizedSubstantialRework"]]
+            record["status"] = "READY_FOR_IMPLEMENTATION"
+            record["nextStage"] = "human_authorized_substantial_rework_handoff"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            before_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234
+            )
+            after_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_INVOCATION_UNRESOLVED", {item.code for item in result.violations})
+        self.assertEqual(before_count, after_count)
+
+    def test_human_authorized_substantial_rework_rejects_composed_recovery_flags_without_mutation(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Conflicting substantial rework flags")
+            before = state["record_path"].read_bytes()
+            before_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config),
+                    run_record_path=state["record_path"],
+                    timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                    reopen_review_convergence=True,
+                )
+            after = state["record_path"].read_bytes()
+            after_count = (fixture.root / "implementer-count.txt").read_text(encoding="utf-8")
+
+        self.assertIn("SUBSTANTIAL_REWORK_FLAG_CONFLICT", {item.code for item in result.violations})
+        self.assertEqual(before, after)
+        self.assertEqual(before_count, after_count)
+
+    def test_human_authorized_substantial_rework_admission_fails_closed_on_state_drift(self):
+        cases = {
+            "wrong_run": "SUBSTANTIAL_REWORK_FORENSIC_PROVENANCE_MISSING",
+            "wrong_branch": "SUBSTANTIAL_REWORK_IDENTITY_MISMATCH",
+            "wrong_worktree": "SUBSTANTIAL_REWORK_WORKTREE_IDENTITY_MISMATCH",
+            "wrong_requirements": "SUBSTANTIAL_REWORK_REQUIREMENTS_MISMATCH",
+            "wrong_status": "SUBSTANTIAL_REWORK_STATUS_INVALID",
+            "wrong_next_stage": "SUBSTANTIAL_REWORK_NEXT_STAGE_INVALID",
+            "wrong_block": "SUBSTANTIAL_REWORK_BLOCK_INVALID",
+            "wrong_candidate": "SUBSTANTIAL_REWORK_CANDIDATE_INVALID",
+            "wrong_review_sha": "SUBSTANTIAL_REWORK_REVIEW_SHA_MISMATCH",
+            "wrong_validation": "SUBSTANTIAL_REWORK_VALIDATION_INVALID",
+            "wrong_validation_sha": "SUBSTANTIAL_REWORK_VALIDATION_SHA_MISMATCH",
+            "wrong_review_decision": "SUBSTANTIAL_REWORK_REVIEW_INVALID",
+            "wrong_implementer": "SUBSTANTIAL_REWORK_ASSIGNMENT_MISMATCH",
+            "wrong_reviewer": "SUBSTANTIAL_REWORK_ASSIGNMENT_MISMATCH",
+            "wrong_owner": "SUBSTANTIAL_REWORK_ASSIGNMENT_MISMATCH",
+            "capacity": "SUBSTANTIAL_REWORK_CAPACITY_INVALID",
+            "implementation_reopens": "SUBSTANTIAL_REWORK_IMPLEMENTATION_REOPENS_INVALID",
+            "convergence_reopens": "SUBSTANTIAL_REWORK_CONVERGENCE_REOPENS_INVALID",
+            "prior_auth": "SUBSTANTIAL_REWORK_POST_REVIEW_AUTHORIZATION_INVALID",
+            "active": "SUBSTANTIAL_REWORK_ACTIVE_INVOCATION",
+            "dirty": "SUBSTANTIAL_REWORK_DIRTY_FILES",
+            "staged": "SUBSTANTIAL_REWORK_STAGED_FILES",
+            "untracked": "SUBSTANTIAL_REWORK_UNTRACKED_FILES",
+            "fingerprint": "SUBSTANTIAL_REWORK_STATE_FINGERPRINT_MISMATCH",
+            "already_used": "SUBSTANTIAL_REWORK_ALREADY_USED",
+        }
+        for mutation, expected in cases.items():
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_substantial_rework_run(fixture, f"Substantial rework drift {mutation}")
+                record_path = state["record_path"]
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                candidate = json.loads(record_path.with_name("candidate.json").read_text(encoding="utf-8"))
+                validation = json.loads(record_path.with_name("validation-runtime.json").read_text(encoding="utf-8"))
+                review = json.loads(record_path.with_name("review-runtime.json").read_text(encoding="utf-8"))
+                implementer = json.loads(record_path.with_name("implementer-runtime.json").read_text(encoding="utf-8"))
+                profile = dict(state["profile"])
+                if mutation == "wrong_run": record["runId"] = "unrelated"
+                elif mutation == "wrong_branch": record["featureBranch"] = "codex/other"
+                elif mutation == "wrong_worktree": record["featureWorktree"] = str(fixture.repo)
+                elif mutation == "wrong_requirements": record["requirements"]["sha256"] = "f" * 64
+                elif mutation == "wrong_status": record["status"] = "READY_FOR_IMPLEMENTATION"
+                elif mutation == "wrong_next_stage": record["nextStage"] = "implementation"
+                elif mutation == "wrong_block": record["reviewBlock"]["reasonCode"] = "REVIEW_CHANGES_REQUESTED"
+                elif mutation == "wrong_candidate": candidate["candidate_sha"] = "f" * 40
+                elif mutation == "wrong_review_sha": review["reviewed_sha"] = "f" * 40
+                elif mutation == "wrong_validation": validation["status"] = "BLOCK"
+                elif mutation == "wrong_validation_sha": validation["head_after"] = "f" * 40
+                elif mutation == "wrong_review_decision": review["decision"] = "Approved"
+                elif mutation == "wrong_implementer": record["agentAssignment"]["implementerId"] = "codex"
+                elif mutation == "wrong_reviewer": record["agentAssignment"]["reviewerId"] = "claude"
+                elif mutation == "wrong_owner": record["agentAssignment"]["candidateOwnerId"] = "codex"
+                elif mutation == "capacity": record["implementationRecoveryAttempts"].pop()
+                elif mutation == "implementation_reopens": record["implementationRecoveryReopens"].pop()
+                elif mutation == "convergence_reopens": record["reviewConvergenceReopens"].pop()
+                elif mutation == "prior_auth": record["humanAuthorizedPostReviewFix"]["status"] = "AUTHORIZED"
+                elif mutation == "active": record["humanAuthorizedPostReviewFix"]["invocationStatus"] = "PENDING"
+                elif mutation == "dirty": (state["worktree"] / "post-review-fix.txt").write_text("dirty", encoding="utf-8")
+                elif mutation == "staged":
+                    (state["worktree"] / "post-review-fix.txt").write_text("staged", encoding="utf-8")
+                    self.git(state["worktree"], "add", "post-review-fix.txt")
+                elif mutation == "untracked": (state["worktree"] / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+                elif mutation == "fingerprint": profile["stateFingerprint"] = "f" * 64
+                elif mutation == "already_used": record["humanAuthorizedSubstantialRework"] = {"status": "CONSUMED"}
+                with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: profile}, clear=False):
+                    violations = run_pipeline.human_authorized_substantial_rework_evidence(
+                        run_pipeline.GitRepositoryProvider(), load_project_config(fixture.config), record_path,
+                        record, candidate, validation, review, implementer,
+                    )
+                self.assertIn(expected, {item.code for item in violations})
+
     def test_failed_reviewer_dirty_side_effect_reopen_rejects_unsafe_evidence(self):
         for mutation, expected_code in (
             ("validation", "REVIEW_SIDE_EFFECT_FAILED_RUNTIME_REOPEN_VALIDATION_NOT_PASSED"),
@@ -6669,6 +6955,147 @@ class CliRunTests(unittest.TestCase):
             ],
         }
         return {**state, "profile": profile, "substantial": substantial, "candidate_sha": exact}
+
+    def create_substantial_rework_run(self, fixture, feature):
+        state = self.create_post_review_fix_run(fixture, feature)
+        worktree = state["worktree"]
+        record_path = state["record_path"]
+        (worktree / "post-review-fix.txt").write_text("reviewed architectural attempt\n", encoding="utf-8")
+        self.git(worktree, "add", "post-review-fix.txt")
+        self.git(worktree, "commit", "-m", "post-review fix candidate")
+        exact = self.head(worktree)
+
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assignment = record["agentAssignment"]
+        primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / record_path.parent.name
+        post_name = "human-authorized-post-review-fix-test.json"
+        post_path = primary_run_dir / post_name
+        post_review = {
+            "authorizationId": f"human-post-review-fix-{state['run_id']}-test",
+            "authorizationType": "HUMAN_AUTHORIZED_POST_REVIEW_FIX",
+            "status": "CONSUMED",
+            "runId": state["run_id"],
+            "invocationStatus": "READY_FOR_VALIDATION",
+            "invocationTimeoutMs": 1_800_000,
+            "ordinaryRecoveryCapacityGranted": 0,
+            "pinnedAgentAssignment": assignment,
+            "artifact": str(post_path),
+        }
+        post_bytes = json.dumps(post_review, indent=2, sort_keys=True).encode("utf-8")
+        post_path.write_bytes(post_bytes)
+        record_path.with_name(post_name).write_bytes(post_bytes)
+
+        candidate = {"status": "COMMITTED", "candidate_sha": exact, "changed_files": ["post-review-fix.txt"]}
+        validation = {"status": "PASS", "head_before": exact, "head_after": exact, "commands": [], "violations": []}
+        review_stdout = (
+            "# Changes Requested\n\n"
+            "1. Blocking - create a distinct ADOS-generated child run through the trusted external-run boundary.\n"
+            "2. Blocking - subprocess exit is not durable lifecycle completion.\n"
+            "3. Blocking - completion must consume exact execution-bound readiness evidence.\n"
+            "4. Blocking - prove one genuinely complete Project A cycle.\n"
+        )
+        review = {"status": "PASS", "decision": "Changes Requested", "reviewed_sha": exact, "exit_code": 0, "stdout": review_stdout, "stderr": "", "violations": []}
+        record["humanAuthorizedPostReviewFix"] = post_review
+        record["humanAuthorizedPostReviewFixes"] = [post_review]
+        record["status"] = "REVIEW_BLOCKED"
+        record["nextStage"] = "recovery"
+        record["reviewBlock"] = {
+            "baseSha": record["authoritativeBaseSha"],
+            "blockCause": "human_authorized_post_review_fix_changes_requested",
+            "candidateSha": exact,
+            "decision": "Changes Requested",
+            "exitCode": 0,
+            "reasonCode": "HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED",
+            "reasonCodes": ["HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED"],
+            "resumeStage": "",
+            "reviewedSha": exact,
+            "reviewer": assignment["reviewerCommand"],
+            "runtimeCategory": "",
+            "status": "PASS",
+            "timedOut": False,
+            "transient": False,
+            "validatedSha": exact,
+        }
+        runtime_id = "test-successful-post-review-fix"
+        implementer = {
+            "status": "READY_FOR_VALIDATION",
+            "runtime": {
+                "runtimeId": runtime_id,
+                "runId": state["run_id"],
+                "status": "READY_FOR_VALIDATION",
+                "command": {"adapter": assignment["implementerCommand"], "timeoutMs": 1_800_000},
+            },
+            "result": {
+                "runtimeId": runtime_id,
+                "runId": state["run_id"],
+                "status": "READY_FOR_VALIDATION",
+                "exitCode": 0,
+                "timedOut": False,
+                "stdout": "",
+                "stderr": "",
+                "headBefore": state["candidate_sha"],
+                "headAfter": exact,
+                "changedFiles": ["post-review-fix.txt"],
+                "runtimeFailureCategory": "NONE",
+                "violations": [],
+            },
+            "runRecord": record,
+            "violations": [],
+        }
+        artifacts = {
+            "candidate.json": candidate,
+            "validation-runtime.json": validation,
+            "review-runtime.json": review,
+            "implementer-runtime.json": implementer,
+        }
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        for name, payload in artifacts.items():
+            record_path.with_name(name).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+        substantial_path = Path(record["humanAuthorizedSubstantialCompletion"]["artifact"])
+        artifact_hashes = {
+            "ados-run.json": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+            **{name: hashlib.sha256(record_path.with_name(name).read_bytes()).hexdigest() for name in artifacts},
+            "substantialAuthorization": hashlib.sha256(substantial_path.read_bytes()).hexdigest(),
+            "postReviewFixAuthorization": hashlib.sha256(post_path.read_bytes()).hexdigest(),
+        }
+        fingerprint, _ = run_pipeline._substantial_rework_state_fingerprint(record_path, record)
+        profile = {
+            "forensicReviewId": "test-substantial-rework-review",
+            "forensicDisposition": "NEEDS_SUBSTANTIAL_REWORK",
+            "projectId": record["projectId"],
+            "specNumber": record["specNumber"],
+            "featureSlug": record["featureSlug"],
+            "featureBranch": record["featureBranch"],
+            "featureWorktree": record["featureWorktree"],
+            "authoritativeBaseSha": record["authoritativeBaseSha"],
+            "candidateSha": exact,
+            "requirementsSha": record["requirements"]["sha256"],
+            "sourceStatus": "REVIEW_BLOCKED",
+            "sourceNextStage": "recovery",
+            "sourceBlockReason": "HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED",
+            "sourceBlockCause": "human_authorized_post_review_fix_changes_requested",
+            "sourceEpoch": 3,
+            "sourceAttemptUsage": 3,
+            "sourceImplementationReopens": 2,
+            "sourceReviewConvergenceReopens": 1,
+            "pinnedImplementerId": assignment["implementerId"],
+            "pinnedImplementerCommand": assignment["implementerCommand"],
+            "pinnedReviewerId": assignment["reviewerId"],
+            "pinnedReviewerCommand": assignment["reviewerCommand"],
+            "assignmentSequence": assignment["sequence"],
+            "substantialAuthorizationId": record["humanAuthorizedSubstantialCompletion"]["authorizationId"],
+            "postReviewFixAuthorizationId": post_review["authorizationId"],
+            "artifactSha256": artifact_hashes,
+            "stateFingerprint": fingerprint,
+            "reviewFindings": [
+                {"finding": 1, "title": "Child run causality", "required": "Use the trusted external-run boundary."},
+                {"finding": 2, "title": "Lifecycle semantics", "required": "Observe durable lifecycle completion."},
+                {"finding": 3, "title": "Completion gate", "required": "Consume execution-bound readiness evidence."},
+                {"finding": 4, "title": "Complete cycle", "required": "Prove a genuinely completed Project A task."},
+            ],
+        }
+        return {**state, "profile": profile, "post_review": post_review, "candidate_sha": exact}
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")

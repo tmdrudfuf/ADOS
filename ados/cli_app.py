@@ -88,6 +88,11 @@ class CliApplication:
             action="store_true",
             help="authorize one exact human-reviewed post-review fix invocation outside exhausted recovery",
         )
+        run.add_argument(
+            "--authorize-substantial-rework",
+            action="store_true",
+            help="authorize one exact human-reviewed substantial architectural rework invocation outside exhausted recovery",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -225,6 +230,7 @@ class CliApplication:
                     continue_dirty_timeout_salvage=args.continue_dirty_timeout_salvage,
                     authorize_substantial_completion=args.authorize_substantial_completion,
                     authorize_post_review_fix=args.authorize_post_review_fix,
+                    authorize_substantial_rework=args.authorize_substantial_rework,
                     prefer_implementer=args.prefer_implementer,
                 )
             )
