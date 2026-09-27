@@ -594,6 +594,31 @@ class RunPipeline:
                 record,
                 violations=(violation,),
             )
+        if (
+            isinstance(substantial_rework, dict)
+            and substantial_rework.get("status") == "CONSUMED"
+            and substantial_rework.get("invocationStatus") in {"NO_MATERIAL_CANDIDATE", "MATERIAL_CANDIDATE_BLOCKED"}
+        ):
+            material_gate = substantial_rework.get("materialCandidateGate")
+            reason_code = (
+                str(material_gate.get("reasonCode", ""))
+                if isinstance(material_gate, dict)
+                else ""
+            ) or "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE"
+            violation = _violation(
+                reason_code,
+                "the consumed substantial-rework invocation did not establish a safe material candidate; another invocation requires a new human decision",
+                {
+                    "authorization_id": str(substantial_rework.get("authorizationId", "")),
+                    "admitted_candidate_sha": str(substantial_rework.get("admittedCandidateSha", "")),
+                },
+            )
+            return PipelineOutcome(
+                "IMPLEMENTATION_FAILED",
+                tuple([*stages, _stage("human_authorized_substantial_rework", "BLOCKED", {"reason": violation.code})]),
+                record,
+                violations=(violation,),
+            )
         rework_review_block = record.get("reviewBlock")
         if (
             isinstance(substantial_rework, dict)
@@ -904,6 +929,24 @@ class RunPipeline:
             stages.append(_stage("candidate", candidate_result.status, {"candidate_sha": candidate_result.candidate_sha, "round": str(round_number)}))
             if candidate_result.status == "BLOCKED":
                 return PipelineOutcome("CANDIDATE_BLOCKED", tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, violations=candidate_result.violations)
+            if authorize_substantial_rework:
+                authorization = record.get("humanAuthorizedSubstantialRework")
+                admitted_candidate_sha = str(authorization.get("admittedCandidateSha", "")) if isinstance(authorization, dict) else ""
+                material_violation = self._substantial_rework_pre_validation_violation(
+                    Path(str(record["featureWorktree"])),
+                    admitted_candidate_sha,
+                    candidate_result.candidate_sha,
+                )
+                if material_violation is not None:
+                    return self._block_substantial_rework_material_candidate(
+                        run_record_path,
+                        record,
+                        stages,
+                        bootstrap,
+                        implementer_result,
+                        material_violation,
+                        candidate_result,
+                    )
             if candidate_result.status == "NO_CHANGES":
                 adjudication = self._adjudicate_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate_result, timeout_ms)
                 if isinstance(adjudication, PipelineOutcome):
@@ -1006,7 +1049,7 @@ class RunPipeline:
             if authorize_substantial_rework:
                 violation = _violation(
                     "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED",
-                    "the authorized substantial rework produced a new candidate that still has Changes Requested; no further exceptional invocation is authorized",
+                    "the authorized substantial rework produced a proven new candidate that still has Changes Requested; no further exceptional invocation is authorized",
                     {"candidate_sha": candidate_result.candidate_sha},
                 )
                 _write_review_block_status(
@@ -2045,6 +2088,20 @@ class RunPipeline:
             )
         )
         if result.status == "READY_FOR_VALIDATION":
+            material_violation = self._substantial_rework_material_candidate_violation(
+                worktree,
+                candidate_sha,
+                runtime,
+            )
+            if material_violation is not None:
+                return self._block_substantial_rework_material_candidate(
+                    run_record_path,
+                    next_record,
+                    stages,
+                    bootstrap,
+                    result,
+                    material_violation,
+                )
             return result, next_record
 
         violation = _violation(
@@ -2060,6 +2117,140 @@ class RunPipeline:
             bootstrap=bootstrap,
             implementer_result=result,
             violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
+        )
+
+    def _substantial_rework_material_candidate_violation(
+        self,
+        worktree: Path,
+        admitted_candidate_sha: str,
+        runtime: ImplementerRuntimeResult | None,
+    ) -> PipelineViolation | None:
+        """Require material work relative to the candidate admitted by the authorization."""
+
+        if runtime is None:
+            return _violation(
+                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_RUNTIME_EVIDENCE_MISSING",
+                "substantial-rework success requires durable implementer runtime evidence",
+                {"admitted_candidate_sha": admitted_candidate_sha},
+            )
+        try:
+            actual_head = self.git.current_head(worktree)
+            status = self.git.status(worktree)
+        except RepositoryProviderError as exc:
+            return _violation(exc.code, exc.message, {"worktree": str(worktree)})
+        changed_files = tuple(status.staged + status.dirty_tracked + status.untracked)
+        evidence = {
+            "admitted_candidate_sha": admitted_candidate_sha,
+            "runtime_head_after": runtime.head_after,
+            "actual_head_after": actual_head,
+            "changed_files": ",".join(changed_files),
+        }
+        if runtime.head_after != actual_head:
+            return _violation(
+                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_HEAD_EVIDENCE_MISMATCH",
+                "substantial-rework runtime HEAD evidence does not match the actual worktree HEAD",
+                evidence,
+            )
+        if actual_head == admitted_candidate_sha and not changed_files:
+            return _violation(
+                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+                "the authorized substantial-rework implementer exited successfully but produced no material work relative to the admitted candidate",
+                evidence,
+            )
+        if actual_head != admitted_candidate_sha:
+            try:
+                if not self.git.is_ancestor(worktree, admitted_candidate_sha, actual_head):
+                    return _violation(
+                        "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_NOT_DESCENDANT",
+                        "the substantial-rework HEAD must descend from the admitted candidate",
+                        evidence,
+                    )
+            except RepositoryProviderError as exc:
+                return _violation(exc.code, exc.message, {"worktree": str(worktree)})
+        return None
+
+    def _substantial_rework_pre_validation_violation(
+        self,
+        worktree: Path,
+        admitted_candidate_sha: str,
+        candidate_sha: str,
+    ) -> PipelineViolation | None:
+        evidence = {
+            "admitted_candidate_sha": admitted_candidate_sha,
+            "candidate_sha": candidate_sha,
+        }
+        if not admitted_candidate_sha or candidate_sha == admitted_candidate_sha:
+            return _violation(
+                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+                "substantial-rework candidate preparation did not produce a candidate distinct from the admitted candidate",
+                evidence,
+            )
+        try:
+            actual_head = self.git.current_head(worktree)
+            evidence["actual_head"] = actual_head
+            if actual_head != candidate_sha:
+                return _violation(
+                    "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_HEAD_MISMATCH",
+                    "the prepared substantial-rework candidate must match the actual worktree HEAD",
+                    evidence,
+                )
+            if not self.git.is_ancestor(worktree, admitted_candidate_sha, candidate_sha):
+                return _violation(
+                    "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_NOT_DESCENDANT",
+                    "the prepared substantial-rework candidate must descend from the admitted candidate",
+                    evidence,
+                )
+        except RepositoryProviderError as exc:
+            return _violation(exc.code, exc.message, {"worktree": str(worktree)})
+        return None
+
+    def _block_substantial_rework_material_candidate(
+        self,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+        implementer_result: ImplementerRuntimeOutcome | None,
+        violation: PipelineViolation,
+        candidate: CandidatePreparationResult | None = None,
+    ) -> PipelineOutcome:
+        authorization = record.get("humanAuthorizedSubstantialRework")
+        authorization = authorization if isinstance(authorization, dict) else {}
+        invocation_status = (
+            "NO_MATERIAL_CANDIDATE"
+            if violation.code == "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE"
+            else "MATERIAL_CANDIDATE_BLOCKED"
+        )
+        blocked_authorization = {
+            **authorization,
+            "status": "CONSUMED",
+            "result": invocation_status,
+            "invocationStatus": invocation_status,
+            "materialCandidateGate": {
+                "status": "BLOCKED",
+                "reasonCode": violation.code,
+                "message": violation.message,
+                "evidence": violation.evidence,
+            },
+        }
+        updated = dict(record)
+        updated["humanAuthorizedSubstantialRework"] = blocked_authorization
+        updated["humanAuthorizedSubstantialReworks"] = [blocked_authorization]
+        artifact_path = Path(str(blocked_authorization.get("artifact", "")))
+        if artifact_path.name:
+            _write_json(run_record_path.with_name(artifact_path.name), blocked_authorization)
+            _write_json(artifact_path, blocked_authorization)
+        _write_json(run_record_path, updated)
+        _write_implementation_recovery_block_status(run_record_path, updated, violation, status="IMPLEMENTATION_FAILED")
+        stages.append(_stage("human_authorized_substantial_rework_material_candidate", "BLOCKED", {"reason": violation.code}))
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=implementer_result,
+            candidate=candidate,
+            violations=(violation,),
         )
 
     def _external_runtime_block(

@@ -5238,6 +5238,7 @@ class CliRunTests(unittest.TestCase):
             authorization = final["humanAuthorizedSubstantialRework"]
             stages = [stage.id for stage in result.stages]
             invocation_count = counter.read_text()
+            candidate_sha = result.candidate.candidate_sha
 
         self.assertEqual("COMPLETE", result.status)
         self.assertEqual("1", invocation_count)
@@ -5248,6 +5249,7 @@ class CliRunTests(unittest.TestCase):
         self.assertTrue(authorization["resultingRuntimeId"])
         self.assertEqual(before["reviewBlock"]["candidateSha"], authorization["headBeforeImplementation"])
         self.assertTrue(authorization["headAfterImplementation"])
+        self.assertNotEqual(authorization["admittedCandidateSha"], candidate_sha)
         self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
         self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
         self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
@@ -5256,6 +5258,110 @@ class CliRunTests(unittest.TestCase):
         self.assertLess(stages.index("candidate"), stages.index("validation"))
         self.assertLess(stages.index("validation"), stages.index("review"))
         self.assertLess(stages.index("review"), stages.index("exact_head"))
+
+    def test_human_authorized_substantial_rework_exit_zero_without_material_work_blocks_before_candidate(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Substantial rework no material candidate")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "substantial-rework-no-material-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nimport sys\n"
+                f"counter = Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+                "sys.stdin.read()\n"
+                "print('clarification required')\n",
+                encoding="utf-8",
+            )
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(pipeline, "_prepare_candidate", wraps=pipeline._prepare_candidate) as prepare_candidate,
+                mock.patch.object(pipeline.validation, "run", wraps=pipeline.validation.run) as validation_run,
+                mock.patch.object(pipeline.review, "run", wraps=pipeline.review.run) as review_run,
+            ):
+                result = pipeline.run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+                repeated = pipeline.run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            invocation_count = counter.read_text()
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("1", invocation_count)
+        self.assertEqual("CONSUMED", final["humanAuthorizedSubstantialRework"]["status"])
+        self.assertEqual("NO_MATERIAL_CANDIDATE", final["humanAuthorizedSubstantialRework"]["invocationStatus"])
+        self.assertEqual("human_intervention", final["nextStage"])
+        self.assertEqual(
+            "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+            final["implementationRecoveryBlock"]["reasonCode"],
+        )
+        self.assertNotIn("produced a new candidate", final["implementationRecoveryBlock"]["message"])
+        prepare_candidate.assert_not_called()
+        validation_run.assert_not_called()
+        review_run.assert_not_called()
+        self.assertIn("HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE", {item.code for item in repeated.violations})
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertEqual(before["agentAssignment"], final["agentAssignment"])
+
+    def test_human_authorized_substantial_rework_accepts_new_implementer_commit(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Substantial rework committed candidate")
+            admitted = state["candidate_sha"]
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nimport subprocess\n"
+                "Path('substantial-rework-commit.txt').write_text('implemented', encoding='utf-8')\n"
+                "subprocess.run(['git', 'add', 'substantial-rework-commit.txt'], check=True)\n"
+                "subprocess.run(['git', 'commit', '-m', 'substantial rework implementation'], check=True)\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+
+        self.assertEqual("COMPLETE", result.status, result.to_dict())
+        self.assertNotEqual(admitted, result.candidate.candidate_sha)
+        self.assertEqual(result.candidate.candidate_sha, result.validation.head_after)
+        self.assertEqual(result.candidate.candidate_sha, result.review.reviewed_sha)
+
+    def test_human_authorized_substantial_rework_blocks_if_candidate_preparation_reuses_admitted_sha(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_substantial_rework_run(fixture, "Substantial rework stale prepared candidate")
+            admitted = state["candidate_sha"]
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nPath('substantial-rework-dirty.txt').write_text('implemented', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            stale_candidate = run_pipeline.CandidatePreparationResult("COMMITTED", admitted, ())
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(pipeline, "_prepare_candidate", return_value=stale_candidate),
+                mock.patch.object(pipeline.validation, "run", wraps=pipeline.validation.run) as validation_run,
+                mock.patch.object(pipeline.review, "run", wraps=pipeline.review.run) as review_run,
+            ):
+                result = pipeline.run(
+                    config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234,
+                    authorize_substantial_rework=True,
+                )
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("NO_MATERIAL_CANDIDATE", final["humanAuthorizedSubstantialRework"]["invocationStatus"])
+        self.assertEqual(
+            "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+            final["implementationRecoveryBlock"]["reasonCode"],
+        )
+        validation_run.assert_not_called()
+        review_run.assert_not_called()
 
     def test_human_authorized_substantial_rework_exact_state_is_eligible_read_only_and_cli_flag_is_stable(self):
         parsed = CliApplication().build_parser().parse_args(
