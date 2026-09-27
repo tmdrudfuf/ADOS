@@ -494,6 +494,36 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 if isinstance(finding, dict):
                     lines.append(f"- Finding {finding.get('finding', '')}: {finding.get('title', '')}")
                     lines.append(f"  Required: {finding.get('required', '')}")
+    substantial_rework = record.get("humanAuthorizedSubstantialRework")
+    if (
+        isinstance(substantial_rework, dict)
+        and substantial_rework.get("status") == "CONSUMED"
+        and substantial_rework.get("invocationStatus") == "PENDING"
+    ):
+        lines.extend(
+            [
+                "",
+                "Human-authorized substantial architectural rework:",
+                f"Authorization ID: {substantial_rework.get('authorizationId', '')}",
+                f"Exact admitted candidate: {substantial_rework.get('admittedCandidateSha', '')}",
+                "This is one implementation dispatch only. It does not grant recovery capacity or approve validation, review, convergence, publication, or merge.",
+                "Implement the complete non-circular architecture in this existing AIverse feature worktree. Production code, tests, Spec Kit artifacts, and controlled verification support may all be changed as required; do not constrain the work to a narrow diff.",
+                "Current ADOS provides machine-oriented boundaries: python -m ados external-run prepare, python -m ados external-run continue, and python -m ados external-run inspect.",
+                "Integrate those commands through a trusted Node/local-server gateway. Do not continue the old direct-Claude execution architecture.",
+                "Project A must cause prepare of a NEW child run and receive the ADOS-generated child run ID. Never inject the parent verification run ID as child identity.",
+                "Use a separate controlled verification project/repository for the child. Prevent parent/self recursion and duplicate child creation.",
+                "Observe exact child lifecycle evidence through candidate, validation PASS, independent Approved review, candidate=validated=reviewed=HEAD, and technicalPublicationReadiness READY.",
+                "Complete the Project A task only through an execution-bound production coordinator that verifies this exact evidence. A caller boolean or subprocess exit is insufficient.",
+                "Preserve human authority over remote push, PR, merge, and deployment. Technical readiness is not remote publication authority.",
+                "The current independent-review blockers below are authoritative; do not weaken tests or acceptance criteria:",
+            ]
+        )
+        findings = substantial_rework.get("authoritativeReviewFindings", [])
+        if isinstance(findings, list):
+            for finding in findings:
+                if isinstance(finding, dict):
+                    lines.append(f"- Finding {finding.get('finding', '')}: {finding.get('title', '')}")
+                    lines.append(f"  Required: {finding.get('required', '')}")
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(
