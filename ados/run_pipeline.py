@@ -651,6 +651,8 @@ class RunPipeline:
         final_implementation = record.get("humanAuthorizedSpec148FinalImplementation")
         if isinstance(final_implementation, dict) and final_implementation.get("status") == "CONSUMED":
             invocation_status = str(final_implementation.get("invocationStatus", ""))
+            code = ""
+            message = ""
             if invocation_status == "PENDING":
                 code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_INVOCATION_UNRESOLVED"
                 message = "the consumed final implementation invocation has no durable result; it may not be dispatched again"
@@ -664,16 +666,20 @@ class RunPipeline:
                 code = str(block.get("reasonCode", "")) if isinstance(block, dict) else ""
                 code = code or "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED"
                 message = "the final implementation authorization is consumed and cannot be dispatched again"
-            else:
+            elif invocation_status != "READY_FOR_VALIDATION":
+                code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_FAILED"
+                message = "the consumed final implementation invocation failed or timed out and cannot be dispatched again"
+            elif authorize_spec148_final_implementation:
                 code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED"
                 message = "the final implementation authorization is consumed and cannot be dispatched again"
-            violation = _violation(code, message, {"authorization_id": str(final_implementation.get("authorizationId", ""))})
-            return PipelineOutcome(
-                str(record.get("status", "IMPLEMENTATION_FAILED")),
-                tuple([*stages, _stage("human_authorized_spec148_final_implementation", "BLOCKED", {"reason": violation.code})]),
-                record,
-                violations=(violation,),
-            )
+            if code:
+                violation = _violation(code, message, {"authorization_id": str(final_implementation.get("authorizationId", ""))})
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("human_authorized_spec148_final_implementation", "BLOCKED", {"reason": violation.code})]),
+                    record,
+                    violations=(violation,),
+                )
         if (
             isinstance(substantial_rework, dict)
             and substantial_rework.get("status") == "CONSUMED"
@@ -7519,6 +7525,8 @@ def human_authorized_spec148_final_implementation_evidence(
         assignment.get("reviewerId") != profile["pinnedReviewerId"],
         assignment.get("reviewerCommand") != profile["pinnedReviewerCommand"],
         _positive_int_from_mapping(assignment, "sequence") != profile["assignmentSequence"],
+        record.get("implementer") != profile["pinnedImplementerCommand"],
+        record.get("reviewer") != profile["pinnedReviewerCommand"],
     )):
         reject("SPEC148_FINAL_IMPLEMENTATION_ASSIGNMENT_MISMATCH", "pinned roles, candidate ownership, or assignment sequence changed")
 

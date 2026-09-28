@@ -5234,6 +5234,24 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(before["agentAssignment"], final["agentAssignment"])
         self.assertEqual(state["prior_rework"], final["humanAuthorizedSubstantialRework"])
 
+    def test_spec148_final_implementation_success_does_not_block_ordinary_publication_resume(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final publication resume")
+            counter = fixture.root / "final-publication-resume-count.txt"
+            (fixture.root / "implementer.py").write_text(f"from pathlib import Path\nPath(r'{counter}').write_text('1')\nPath('material.txt').write_text('work', encoding='utf-8')\n", encoding="utf-8")
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo, ready_failure_once=True))
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                interrupted = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                resumed = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234)
+            invocation_count = counter.read_text()
+        self.assertEqual("PUBLICATION_BLOCKED", interrupted.status)
+        self.assertIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertNotIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in resumed.violations})
+        self.assertEqual("COMPLETE", resumed.status, resumed.to_dict())
+        self.assertEqual("1", invocation_count)
+
     def test_spec148_final_implementation_noop_blocks_before_candidate_and_cannot_repeat(self):
         with self.project(implementer_mode="count") as fixture:
             state = self.create_spec148_final_implementation_run(fixture, "Final no-op")
