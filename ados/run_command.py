@@ -19,7 +19,7 @@ from .primary_repository_guardian import PrimaryRepositoryGuardian
 from .project_config import ProjectConfig, ProjectConfigError, load_project_config
 from .requirements_source import RequirementsSource, RequirementsViolation, read_requirements_file, requested_requirements_compatible, verify_durable_requirements, write_requirements_artifacts
 from .repository_provider import RepositoryProviderError
-from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, dirty_timeout_salvage_evidence, failed_review_routing_state_restoration_evidence, human_authorized_post_review_fix_evidence, human_authorized_substantial_completion_evidence, human_authorized_substantial_rework_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
+from .run_pipeline import PIPELINE_READY_STATUSES, PipelineOutcome, RunPipeline, dirty_timeout_salvage_evidence, failed_review_routing_state_restoration_evidence, human_authorized_post_review_fix_evidence, human_authorized_spec148_final_implementation_evidence, human_authorized_substantial_completion_evidence, human_authorized_substantial_rework_evidence, pinned_implementer_retry_evidence, review_changes_requested_evidence, review_convergence_reopen_evidence, review_runtime_unavailable_evidence, review_side_effect_recovery_evidence, review_side_effect_recovery_reopen_evidence, transient_review_blocked_evidence, validation_failed_evidence
 from .status import StatusRequest, StatusService
 from .worktree_lifecycle import WorktreeLifecycleEngine, WorktreeRequest, WorktreeLifecycleResult
 from .worktree_provider import GitWorktreeProvider, WorktreeRecord
@@ -48,6 +48,7 @@ class RunRequest:
     authorize_substantial_completion: bool = False
     authorize_post_review_fix: bool = False
     authorize_substantial_rework: bool = False
+    authorize_spec148_final_implementation: bool = False
     prefer_implementer: str | None = None
     prepare_only: bool = False
     external_origin: dict[str, Any] | None = None
@@ -190,7 +191,7 @@ class RunService:
     def run(self, request: RunRequest) -> RunResult:
         if not request.feature_description.strip():
             return _invalid("FEATURE_DESCRIPTION_MISSING", "feature description is required", {})
-        if request.authorize_substantial_rework and any(
+        if (request.authorize_substantial_rework or request.authorize_spec148_final_implementation) and any(
             (
                 request.reopen_implementation_recovery,
                 request.reopen_validation_recovery,
@@ -202,11 +203,12 @@ class RunService:
                 request.continue_dirty_timeout_salvage,
                 request.authorize_substantial_completion,
                 request.authorize_post_review_fix,
+                request.authorize_substantial_rework and request.authorize_spec148_final_implementation,
             )
         ):
             return _invalid(
-                "SUBSTANTIAL_REWORK_FLAG_CONFLICT",
-                "--authorize-substantial-rework cannot be combined with recovery, reopen, or another exceptional continuation",
+                "SPEC148_FINAL_IMPLEMENTATION_FLAG_CONFLICT" if request.authorize_spec148_final_implementation else "SUBSTANTIAL_REWORK_FLAG_CONFLICT",
+                "an exceptional implementation authorization cannot be combined with recovery, reopen, or another exceptional continuation",
                 {},
             )
 
@@ -263,6 +265,7 @@ class RunService:
             reopen_review_side_effect_recovery=request.reopen_review_side_effect_recovery,
             reopen_review_convergence=request.reopen_review_convergence,
             authorize_substantial_rework=request.authorize_substantial_rework,
+            authorize_spec148_final_implementation=request.authorize_spec148_final_implementation,
         )
         if resume is not None:
             requirements_violations = _requirements_resume_violations(resume.record_path, resume.record.to_dict(), requirements)
@@ -327,6 +330,7 @@ class RunService:
             authorize_substantial_completion=request.authorize_substantial_completion,
             authorize_post_review_fix=request.authorize_post_review_fix,
             authorize_substantial_rework=request.authorize_substantial_rework,
+            authorize_spec148_final_implementation=request.authorize_spec148_final_implementation,
         )
         if adoption is not None and adoption.status == "REFUSED":
             eligibility = RunEligibility("BLOCKED", tuple([*eligibility.violations, *adoption.violations]), eligibility.warnings)
@@ -355,6 +359,7 @@ class RunService:
                 authorize_substantial_completion=request.authorize_substantial_completion,
                 authorize_post_review_fix=request.authorize_post_review_fix,
                 authorize_substantial_rework=request.authorize_substantial_rework,
+                authorize_spec148_final_implementation=request.authorize_spec148_final_implementation,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else resume.record
             return RunResult(pipeline_result.status, eligibility, plan, updated_record, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result, resumed=True)
@@ -376,6 +381,7 @@ class RunService:
                 authorize_substantial_completion=request.authorize_substantial_completion,
                 authorize_post_review_fix=request.authorize_post_review_fix,
                 authorize_substantial_rework=request.authorize_substantial_rework,
+                authorize_spec148_final_implementation=request.authorize_spec148_final_implementation,
             )
             updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else adoption.record
             return RunResult(
@@ -425,6 +431,7 @@ class RunService:
             authorize_substantial_completion=request.authorize_substantial_completion,
             authorize_post_review_fix=request.authorize_post_review_fix,
             authorize_substantial_rework=request.authorize_substantial_rework,
+            authorize_spec148_final_implementation=request.authorize_spec148_final_implementation,
         )
         updated_record = _record_from_mapping(pipeline_result.run_record) if pipeline_result.run_record else record
         return RunResult(pipeline_result.status, eligibility, plan, updated_record, created, implementer_result=pipeline_result.implementer_result, pipeline_result=pipeline_result)
@@ -496,6 +503,7 @@ class RunService:
         authorize_substantial_completion: bool = False,
         authorize_post_review_fix: bool = False,
         authorize_substantial_rework: bool = False,
+        authorize_spec148_final_implementation: bool = False,
     ) -> RunEligibility:
         violations: list[RunViolation] = []
         warnings: list[RunViolation] = []
@@ -635,6 +643,22 @@ class RunService:
             and resume is not None
             and set(blocking_recovery) == {"HUMAN_AUTHORIZED_POST_REVIEW_FIX_REVIEW_CHANGES_REQUESTED"}
             and not human_authorized_substantial_rework_evidence(
+                self.git,
+                config,
+                resume.record_path,
+                _read_mapping(resume.record_path),
+                _read_mapping(resume.record_path.with_name("candidate.json")),
+                _read_mapping(resume.record_path.with_name("validation-runtime.json")),
+                _read_mapping(resume.record_path.with_name("review-runtime.json")),
+                _read_mapping(resume.record_path.with_name("implementer-runtime.json")),
+            )
+        ):
+            blocking_recovery = ()
+        if (
+            authorize_spec148_final_implementation
+            and resume is not None
+            and set(blocking_recovery) == {"HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED"}
+            and not human_authorized_spec148_final_implementation_evidence(
                 self.git,
                 config,
                 resume.record_path,
@@ -924,6 +948,7 @@ class RunService:
         reopen_review_side_effect_recovery: bool = False,
         reopen_review_convergence: bool = False,
         authorize_substantial_rework: bool = False,
+        authorize_spec148_final_implementation: bool = False,
     ) -> "_ResumeCandidate | None":
         candidates: list[_ResumeCandidate] = []
         primary_runs = project_path / ".agent-workflow" / "runs"
@@ -938,6 +963,7 @@ class RunService:
                 reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
                 reopen_review_convergence=reopen_review_convergence,
                 authorize_substantial_rework=authorize_substantial_rework,
+                authorize_spec148_final_implementation=authorize_spec148_final_implementation,
             )
         )
         for record in self.worktrees.list_worktrees(project_path):
@@ -953,6 +979,7 @@ class RunService:
                     reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
                     reopen_review_convergence=reopen_review_convergence,
                     authorize_substantial_rework=authorize_substantial_rework,
+                    authorize_spec148_final_implementation=authorize_spec148_final_implementation,
                 )
             )
         deduped: dict[tuple[str, str], _ResumeCandidate] = {}
@@ -1003,6 +1030,7 @@ class RunService:
         reopen_review_side_effect_recovery: bool = False,
         reopen_review_convergence: bool = False,
         authorize_substantial_rework: bool = False,
+        authorize_spec148_final_implementation: bool = False,
     ) -> list["_ResumeCandidate"]:
         candidates: list[_ResumeCandidate] = []
         if not runs.is_dir():
@@ -1022,6 +1050,7 @@ class RunService:
                 reopen_review_side_effect_recovery=reopen_review_side_effect_recovery,
                 reopen_review_convergence=reopen_review_convergence,
                 authorize_substantial_rework=authorize_substantial_rework,
+                authorize_spec148_final_implementation=authorize_spec148_final_implementation,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -1040,6 +1069,7 @@ class RunService:
         reopen_review_side_effect_recovery: bool = False,
         reopen_review_convergence: bool = False,
         authorize_substantial_rework: bool = False,
+        authorize_spec148_final_implementation: bool = False,
     ) -> "_ResumeCandidate | None":
         try:
             record = _record_from_mapping(raw)
@@ -1054,6 +1084,7 @@ class RunService:
             and not (reopen_review_side_effect_recovery and _review_side_effect_reopen_candidate(record_path))
             and not (reopen_review_convergence and _review_convergence_reopen_candidate(record_path))
             and not authorize_substantial_rework
+            and not authorize_spec148_final_implementation
         ):
             return None
         validation_resume_blocked = record.status == "VALIDATION_FAILED" and validation_failed_evidence(
