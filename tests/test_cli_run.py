@@ -5252,6 +5252,26 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual("COMPLETE", resumed.status, resumed.to_dict())
         self.assertEqual("1", invocation_count)
 
+    def test_spec148_final_implementation_does_not_capture_unrelated_review_block(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final unrelated review block")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            record["humanAuthorizedSpec148FinalImplementation"] = {
+                "authorizationId": "consumed-final-implementation",
+                "status": "CONSUMED",
+                "invocationStatus": "READY_FOR_VALIDATION",
+            }
+            record["humanAuthorizedSpec148FinalImplementations"] = [record["humanAuthorizedSpec148FinalImplementation"]]
+            record["reviewBlock"]["reasonCode"] = "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"
+            record["reviewBlock"]["reasonCodes"] = ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"]
+            record["reviewBlock"]["blockCause"] = "review_side_effect_recovery"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234
+            )
+        self.assertNotIn("human_authorized_spec148_final_implementation", [stage.id for stage in result.stages])
+        self.assertNotIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in result.violations})
+
     def test_spec148_final_implementation_noop_blocks_before_candidate_and_cannot_repeat(self):
         with self.project(implementer_mode="count") as fixture:
             state = self.create_spec148_final_implementation_run(fixture, "Final no-op")

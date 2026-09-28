@@ -661,7 +661,12 @@ class RunPipeline:
                 code = str(gate.get("reasonCode", "")) if isinstance(gate, dict) else ""
                 code = code or "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_NO_MATERIAL_CANDIDATE"
                 message = "the consumed final implementation invocation did not produce a safe material candidate"
-            elif record.get("status") == "REVIEW_BLOCKED":
+            elif (
+                record.get("status") == "REVIEW_BLOCKED"
+                and isinstance(record.get("reviewBlock"), dict)
+                and record["reviewBlock"].get("reasonCode")
+                == "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_REVIEW_CHANGES_REQUESTED"
+            ):
                 block = record.get("reviewBlock")
                 code = str(block.get("reasonCode", "")) if isinstance(block, dict) else ""
                 code = code or "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED"
