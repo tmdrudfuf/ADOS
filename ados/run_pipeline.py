@@ -248,6 +248,57 @@ HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_PROFILES: dict[str, dict[str, Any]] = {
         ],
     }
 }
+SPEC148_FINAL_IMPLEMENTATION_TIMEOUT_MS = 3_600_000
+HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES: dict[str, dict[str, Any]] = {
+    "cc6ed14815c049ed1b97ce1c": {
+        "projectId": "AIverse",
+        "specNumber": "148",
+        "featureSlug": "autonomous-company-operations-end-to-end",
+        "featureBranch": "codex/148-autonomous-company-operations-end-to-end",
+        "featureWorktree": r"C:\Users\tmdru\Desktop\Ky-Project\AIverse-autonomous-company-operations-end-to-end",
+        "authoritativeBaseSha": "bbbb0318704f612be8ec54523e59b8d7e4fda204",
+        "candidateSha": "217358561e62f694aebe6a8d7c8911bfb65db4cf",
+        "requirementsSha": "b0de9423d7b882ae695a41103c7609a5484645cf2c6bf766a85c358f8ba3a47c",
+        "sourceStatus": "REVIEW_BLOCKED",
+        "sourceNextStage": "recovery",
+        "sourceBlockReason": "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED",
+        "sourceBlockCause": "human_authorized_substantial_rework_changes_requested",
+        "sourceEpoch": 3,
+        "sourceAttemptUsage": 3,
+        "sourceImplementationReopens": 2,
+        "sourceReviewConvergenceReopens": 1,
+        "pinnedImplementerId": "claude",
+        "pinnedImplementerCommand": "claude -p",
+        "pinnedReviewerId": "codex",
+        "pinnedReviewerCommand": "codex exec -",
+        "assignmentSequence": 1,
+        "substantialCompletionAuthorizationId": "human-substantial-completion-cc6ed14815c049ed1b97ce1c-6f393974caf7",
+        "postReviewFixAuthorizationId": "human-post-review-fix-cc6ed14815c049ed1b97ce1c-c07d80bf33b9",
+        "substantialReworkAuthorizationId": "human-substantial-rework-cc6ed14815c049ed1b97ce1c-b8354cebfe78",
+        "substantialReworkRuntimeId": "9c25578bf3441b198bd8cc7f",
+        "artifactSha256": {
+            "ados-run.json": "a3ac06b4e383e47dbdf8b71d7729b84f2c633d586656e09b8255f1df2b4abf67",
+            "candidate.json": "421dba32c04b6a2fdbea67affee7d3e6b8441599b65bf884f929b4e22e417274",
+            "validation-runtime.json": "25eaa0a1a48e36bf13ee3b31a1d9428a20cfe9cf8ceb634e3cee69cc6dbe69f6",
+            "review-runtime.json": "e7b4e1c6203d5b53259ba334320ae4c752d72d3cb2878d53d8642acc0979cb17",
+            "implementer-runtime.json": "46cb9fbe3f3127d5fdeb88c4f335f31acd53754f78fc29341656516c34465bcf",
+            "substantialReworkAuthorization": "760de53a080ccf8a1260a58fdfa695da32fb7c0210204f097069c315cf920078",
+        },
+        "stateFingerprint": "226c3e64bfba2bf07a0374d82ef639002e6bac78ae39bcce5c72082b7dcdd842",
+        "humanDecisions": {
+            "verificationRepository": "FRESH_MINIMAL_DISPOSABLE_LOCAL_REPOSITORY",
+            "forbiddenRepositories": ["dailyProof", "REAL_USER_PROJECT"],
+            "executeLiveChildRun": True,
+            "childProtocol": ["external-run prepare", "external-run continue", "external-run inspect"],
+            "childRunIdAuthority": "ADOS",
+            "localBareOriginAllowed": True,
+            "parentRepositoryIsolationRequired": True,
+            "technicalReadinessTarget": "READY_FOR_PUBLICATION",
+            "remotePublicationState": "NOT_REQUESTED",
+            "remotePublicationAuthority": "HUMAN_REQUIRED",
+        },
+    }
+}
 PR_REFRESH_ATTEMPTS = 3
 
 
@@ -504,6 +555,7 @@ class RunPipeline:
         authorize_substantial_completion: bool = False,
         authorize_post_review_fix: bool = False,
         authorize_substantial_rework: bool = False,
+        authorize_spec148_final_implementation: bool = False,
     ) -> PipelineOutcome:
         stages: list[PipelineStage] = []
         record = _read_json(run_record_path)
@@ -515,7 +567,7 @@ class RunPipeline:
         if isinstance(record.get("requirements"), dict):
             stages.append(_stage("requirements", "PASS", {"sha256": str(record["requirements"].get("sha256", ""))}))
 
-        if authorize_substantial_rework and any(
+        if (authorize_substantial_rework or authorize_spec148_final_implementation) and any(
             (
                 reopen_implementation_recovery,
                 reopen_validation_recovery,
@@ -527,16 +579,17 @@ class RunPipeline:
                 continue_dirty_timeout_salvage,
                 authorize_substantial_completion,
                 authorize_post_review_fix,
+                authorize_substantial_rework and authorize_spec148_final_implementation,
             )
         ):
             violation = _violation(
-                "SUBSTANTIAL_REWORK_FLAG_CONFLICT",
-                "substantial rework cannot be combined with recovery, reopen, or another exceptional continuation",
+                "SPEC148_FINAL_IMPLEMENTATION_FLAG_CONFLICT" if authorize_spec148_final_implementation else "SUBSTANTIAL_REWORK_FLAG_CONFLICT",
+                "an exceptional implementation authorization cannot be combined with recovery, reopen, or another exceptional continuation",
                 {},
             )
             return PipelineOutcome(
                 str(record.get("status", "BLOCKED")),
-                tuple([*stages, _stage("human_authorized_substantial_rework", "BLOCKED", {"reason": violation.code})]),
+                tuple([*stages, _stage("human_authorized_implementation", "BLOCKED", {"reason": violation.code})]),
                 record,
                 violations=(violation,),
             )
@@ -594,6 +647,44 @@ class RunPipeline:
                 record,
                 violations=(violation,),
             )
+
+        final_implementation = record.get("humanAuthorizedSpec148FinalImplementation")
+        if isinstance(final_implementation, dict) and final_implementation.get("status") == "CONSUMED":
+            invocation_status = str(final_implementation.get("invocationStatus", ""))
+            code = ""
+            message = ""
+            if invocation_status == "PENDING":
+                code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_INVOCATION_UNRESOLVED"
+                message = "the consumed final implementation invocation has no durable result; it may not be dispatched again"
+            elif invocation_status in {"NO_MATERIAL_CANDIDATE", "MATERIAL_CANDIDATE_BLOCKED"}:
+                gate = final_implementation.get("materialCandidateGate")
+                code = str(gate.get("reasonCode", "")) if isinstance(gate, dict) else ""
+                code = code or "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_NO_MATERIAL_CANDIDATE"
+                message = "the consumed final implementation invocation did not produce a safe material candidate"
+            elif (
+                record.get("status") == "REVIEW_BLOCKED"
+                and isinstance(record.get("reviewBlock"), dict)
+                and record["reviewBlock"].get("reasonCode")
+                == "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_REVIEW_CHANGES_REQUESTED"
+            ):
+                block = record.get("reviewBlock")
+                code = str(block.get("reasonCode", "")) if isinstance(block, dict) else ""
+                code = code or "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED"
+                message = "the final implementation authorization is consumed and cannot be dispatched again"
+            elif invocation_status != "READY_FOR_VALIDATION":
+                code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_FAILED"
+                message = "the consumed final implementation invocation failed or timed out and cannot be dispatched again"
+            elif authorize_spec148_final_implementation:
+                code = "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED"
+                message = "the final implementation authorization is consumed and cannot be dispatched again"
+            if code:
+                violation = _violation(code, message, {"authorization_id": str(final_implementation.get("authorizationId", ""))})
+                return PipelineOutcome(
+                    str(record.get("status", "IMPLEMENTATION_FAILED")),
+                    tuple([*stages, _stage("human_authorized_spec148_final_implementation", "BLOCKED", {"reason": violation.code})]),
+                    record,
+                    violations=(violation,),
+                )
         if (
             isinstance(substantial_rework, dict)
             and substantial_rework.get("status") == "CONSUMED"
@@ -624,6 +715,7 @@ class RunPipeline:
             isinstance(substantial_rework, dict)
             and substantial_rework.get("status") == "CONSUMED"
             and substantial_rework.get("invocationStatus") != "PENDING"
+            and not authorize_spec148_final_implementation
             and record.get("status") == "REVIEW_BLOCKED"
             and isinstance(rework_review_block, dict)
             and rework_review_block.get("reasonCode") == "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED"
@@ -757,6 +849,25 @@ class RunPipeline:
                     violations=violations,
                 )
 
+        if authorize_spec148_final_implementation:
+            violations = human_authorized_spec148_final_implementation_evidence(
+                self.git,
+                config,
+                run_record_path,
+                record,
+                _read_run_artifact(run_record_path, record, "candidate.json"),
+                _read_run_artifact(run_record_path, record, "validation-runtime.json"),
+                _read_run_artifact(run_record_path, record, "review-runtime.json"),
+                _read_run_artifact(run_record_path, record, "implementer-runtime.json"),
+            )
+            if violations:
+                return PipelineOutcome(
+                    str(record.get("status", "REVIEW_BLOCKED")),
+                    tuple([*stages, _stage("human_authorized_spec148_final_implementation", "BLOCKED", {})]),
+                    record,
+                    violations=violations,
+                )
+
         orphaned_adoption = record.get("orphanedCandidateAdoption")
         if (
             record.get("status") == "READY_FOR_VALIDATION"
@@ -796,7 +907,7 @@ class RunPipeline:
             record = reopened
             review_convergence_reopened = True
             stages.append(_stage("review_convergence_reopen", "PASS", {"reopen": str(_review_convergence_reopen_count(record)), "candidate_sha": str(record.get("reviewConvergenceReopen", {}).get("candidateSha", ""))}))
-        if record.get("status") == "REVIEW_BLOCKED" and not authorize_substantial_rework:
+        if record.get("status") == "REVIEW_BLOCKED" and not authorize_substantial_rework and not authorize_spec148_final_implementation:
             return self._resume_review(config, run_record_path, record, stages, timeout_ms)
         if record.get("status") == "READY_FOR_REVIEW":
             continuation_violations = failed_review_side_effect_reopen_continuation_evidence(
@@ -854,7 +965,12 @@ class RunPipeline:
             return PipelineOutcome("BOOTSTRAP_FAILED", tuple(stages), record, bootstrap=bootstrap, violations=(_violation("BOOTSTRAP_FAILED", "bootstrap command failed", {}),))
 
         implementation_recovery_reopened = review_convergence_reopened
-        if authorize_substantial_rework:
+        if authorize_spec148_final_implementation:
+            completed = self._authorize_spec148_final_implementation(config, run_record_path, record, stages, bootstrap)
+            if isinstance(completed, PipelineOutcome):
+                return completed
+            implementer_result, record = completed
+        elif authorize_substantial_rework:
             completed = self._authorize_substantial_rework(config, run_record_path, record, stages, bootstrap)
             if isinstance(completed, PipelineOutcome):
                 return completed
@@ -929,13 +1045,22 @@ class RunPipeline:
             stages.append(_stage("candidate", candidate_result.status, {"candidate_sha": candidate_result.candidate_sha, "round": str(round_number)}))
             if candidate_result.status == "BLOCKED":
                 return PipelineOutcome("CANDIDATE_BLOCKED", tuple(stages), record, bootstrap=bootstrap, implementer_result=implementer_result, candidate=candidate_result, violations=candidate_result.violations)
-            if authorize_substantial_rework:
-                authorization = record.get("humanAuthorizedSubstantialRework")
+            if authorize_substantial_rework or authorize_spec148_final_implementation:
+                authorization = record.get(
+                    "humanAuthorizedSpec148FinalImplementation"
+                    if authorize_spec148_final_implementation
+                    else "humanAuthorizedSubstantialRework"
+                )
                 admitted_candidate_sha = str(authorization.get("admittedCandidateSha", "")) if isinstance(authorization, dict) else ""
                 material_violation = self._substantial_rework_pre_validation_violation(
                     Path(str(record["featureWorktree"])),
                     admitted_candidate_sha,
                     candidate_result.candidate_sha,
+                    reason_prefix=(
+                        "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION"
+                        if authorize_spec148_final_implementation
+                        else "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK"
+                    ),
                 )
                 if material_violation is not None:
                     return self._block_substantial_rework_material_candidate(
@@ -946,6 +1071,21 @@ class RunPipeline:
                         implementer_result,
                         material_violation,
                         candidate_result,
+                        authorization_field=(
+                            "humanAuthorizedSpec148FinalImplementation"
+                            if authorize_spec148_final_implementation
+                            else "humanAuthorizedSubstantialRework"
+                        ),
+                        authorization_history_field=(
+                            "humanAuthorizedSpec148FinalImplementations"
+                            if authorize_spec148_final_implementation
+                            else "humanAuthorizedSubstantialReworks"
+                        ),
+                        stage_id=(
+                            "human_authorized_spec148_final_implementation_material_candidate"
+                            if authorize_spec148_final_implementation
+                            else "human_authorized_substantial_rework_material_candidate"
+                        ),
                     )
             if candidate_result.status == "NO_CHANGES":
                 adjudication = self._adjudicate_no_changes(config, run_record_path, record, stages, bootstrap, implementer_result, candidate_result, timeout_ms)
@@ -1060,6 +1200,32 @@ class RunPipeline:
                     validation_result,
                     block_violations=(violation,),
                     block_cause="human_authorized_substantial_rework_changes_requested",
+                )
+                return PipelineOutcome(
+                    "REVIEW_BLOCKED",
+                    tuple(stages),
+                    _read_json(run_record_path),
+                    bootstrap=bootstrap,
+                    implementer_result=implementer_result,
+                    candidate=candidate_result,
+                    validation=validation_result,
+                    review=review_result,
+                    violations=(violation,),
+                )
+            if authorize_spec148_final_implementation:
+                violation = _violation(
+                    "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_REVIEW_CHANGES_REQUESTED",
+                    "the final authorized implementation produced a proven new candidate that still has Changes Requested; no further implementation dispatch is authorized",
+                    {"candidate_sha": candidate_result.candidate_sha},
+                )
+                _write_review_block_status(
+                    run_record_path,
+                    record,
+                    review_result,
+                    candidate_result,
+                    validation_result,
+                    block_violations=(violation,),
+                    block_cause="human_authorized_spec148_final_implementation_changes_requested",
                 )
                 return PipelineOutcome(
                     "REVIEW_BLOCKED",
@@ -2119,17 +2285,169 @@ class RunPipeline:
             violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
         )
 
+    def _authorize_spec148_final_implementation(
+        self,
+        config: ProjectConfig,
+        run_record_path: Path,
+        record: dict[str, Any],
+        stages: list[PipelineStage],
+        bootstrap: tuple[BootstrapCommandResult, ...],
+    ) -> tuple[ImplementerRuntimeOutcome, dict[str, Any]] | PipelineOutcome:
+        """Consume the final state-bound Spec 148 implementation decision."""
+
+        candidate = _read_run_artifact(run_record_path, record, "candidate.json")
+        validation = _read_run_artifact(run_record_path, record, "validation-runtime.json")
+        review = _read_run_artifact(run_record_path, record, "review-runtime.json")
+        implementer = _read_run_artifact(run_record_path, record, "implementer-runtime.json")
+        violations = human_authorized_spec148_final_implementation_evidence(
+            self.git, config, run_record_path, record, candidate, validation, review, implementer
+        )
+        if violations:
+            return PipelineOutcome(
+                str(record.get("status", "REVIEW_BLOCKED")),
+                tuple([*stages, _stage("human_authorized_spec148_final_implementation", "BLOCKED", {})]),
+                record,
+                bootstrap=bootstrap,
+                violations=violations,
+            )
+
+        profile = HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES[str(record["runId"])]
+        assignment = record["agentAssignment"]
+        worktree = Path(str(record["featureWorktree"]))
+        fingerprint, fingerprint_evidence = _spec148_final_implementation_state_fingerprint(run_record_path, record)
+        candidate_sha = str(candidate["candidate_sha"])
+        authorization_id = f"human-spec148-final-implementation-{record['runId']}-{fingerprint[:12]}"
+        artifact_name = f"human-authorized-spec148-final-implementation-{fingerprint[:12]}.json"
+        primary_audit_path = Path(str(record["primaryRepository"])) / ".agent-workflow" / "runs" / f"{record['specNumber']}-{record['featureSlug']}" / artifact_name
+        now = _utc_now()
+        prior_rework = record["humanAuthorizedSubstantialRework"]
+        authorization = {
+            "authorizationId": authorization_id,
+            "authorizationType": "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION",
+            "authorizationProvenance": "EXPLICIT_OPERATOR_CLI_FLAG",
+            "status": "CONSUMED",
+            "authorizedAt": now,
+            "consumedAt": now,
+            "runId": str(record["runId"]),
+            "projectId": str(record["projectId"]),
+            "featureBranch": str(record["featureBranch"]),
+            "featureWorktree": str(record["featureWorktree"]),
+            "sourceStatus": str(record["status"]),
+            "sourceNextStage": str(record["nextStage"]),
+            "sourceReviewBlock": record["reviewBlock"],
+            "admittedCandidateSha": candidate_sha,
+            "admittedValidatedSha": str(validation["head_after"]),
+            "admittedReviewedSha": str(review["reviewed_sha"]),
+            "admittedDurableStateFingerprintSha256": fingerprint,
+            "admittedDurableStateEvidence": fingerprint_evidence,
+            "priorSubstantialReworkAuthorizationId": str(prior_rework["authorizationId"]),
+            "priorSubstantialReworkRuntimeId": str(prior_rework["resultingRuntimeId"]),
+            "priorSubstantialReworkProducedImplementation": False,
+            "priorSubstantialReworkHeadBefore": str(prior_rework["headBeforeImplementation"]),
+            "priorSubstantialReworkHeadAfter": str(prior_rework["headAfterImplementation"]),
+            "explicitHumanDecisions": profile["humanDecisions"],
+            "sourceImplementationRecoveryEpoch": _implementation_recovery_epoch(record),
+            "sourceImplementationRecoveryUsage": _implementation_recovery_attempt_count(record),
+            "sourceImplementationRecoveryLimit": config.execution_policy.implementation.max_recovery_rounds,
+            "sourceImplementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+            "sourceReviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+            "startingHead": self.git.current_head(worktree),
+            "requirementsSha": str(record["requirements"]["sha256"]),
+            "assignmentSequence": assignment["sequence"],
+            "implementerId": assignment["implementerId"],
+            "implementerCommand": assignment["implementerCommand"],
+            "reviewerId": assignment["reviewerId"],
+            "reviewerCommand": assignment["reviewerCommand"],
+            "candidateOwnerId": assignment["candidateOwnerId"],
+            "pinnedAgentAssignment": assignment,
+            "reason": "The operator resolved the prior clarification-only no-op and authorized one final implementation of the reviewed child-run architecture.",
+            "ordinaryRecoveryCapacityGranted": 0,
+            "invocationOrdinal": 1,
+            "invocationTimeoutMs": SPEC148_FINAL_IMPLEMENTATION_TIMEOUT_MS,
+            "resultingRuntimeId": "",
+            "headBeforeImplementation": candidate_sha,
+            "headAfterImplementation": "",
+            "result": "PENDING",
+            "invocationStatus": "PENDING",
+            "artifact": str(primary_audit_path),
+        }
+        updated = dict(record)
+        updated["humanAuthorizedSpec148FinalImplementation"] = authorization
+        updated["humanAuthorizedSpec148FinalImplementations"] = [authorization]
+        updated["status"] = "READY_FOR_IMPLEMENTATION"
+        updated["nextStage"] = "human_authorized_spec148_final_implementation_handoff"
+        local_audit_path = run_record_path.with_name(artifact_name)
+        _write_json(local_audit_path, authorization)
+        _write_json(primary_audit_path, authorization)
+        _write_json(run_record_path, updated)
+        stages.append(_stage("human_authorized_spec148_final_implementation", "PASS", {"authorization_id": authorization_id, "state_fingerprint_sha256": fingerprint, "implementer": str(assignment["implementerId"]), "timeout_ms": str(SPEC148_FINAL_IMPLEMENTATION_TIMEOUT_MS)}))
+
+        result = self.implementer.run(config=config, run_record_path=run_record_path, timeout_ms=SPEC148_FINAL_IMPLEMENTATION_TIMEOUT_MS)
+        runtime = result.result
+        completed_authorization = {
+            **authorization,
+            "resultingRuntimeId": runtime.runtime_id if runtime is not None else "",
+            "headBeforeImplementation": runtime.head_before if runtime is not None else candidate_sha,
+            "headAfterImplementation": runtime.head_after if runtime is not None else "",
+            "result": result.status,
+            "invocationStatus": result.status,
+        }
+        next_record = dict(_read_json(run_record_path) or result.run_record or updated)
+        next_record["humanAuthorizedSpec148FinalImplementation"] = completed_authorization
+        next_record["humanAuthorizedSpec148FinalImplementations"] = [completed_authorization]
+        _write_json(local_audit_path, completed_authorization)
+        _write_json(primary_audit_path, completed_authorization)
+        _write_json(run_record_path, next_record)
+        stages.append(_stage("human_authorized_spec148_final_implementation_implementer", result.status, {"authorization_id": authorization_id, "runtime_id": completed_authorization["resultingRuntimeId"]}))
+        if result.status == "READY_FOR_VALIDATION":
+            material_violation = self._substantial_rework_material_candidate_violation(
+                worktree,
+                candidate_sha,
+                runtime,
+                reason_prefix="HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION",
+            )
+            if material_violation is not None:
+                return self._block_substantial_rework_material_candidate(
+                    run_record_path,
+                    next_record,
+                    stages,
+                    bootstrap,
+                    result,
+                    material_violation,
+                    authorization_field="humanAuthorizedSpec148FinalImplementation",
+                    authorization_history_field="humanAuthorizedSpec148FinalImplementations",
+                    stage_id="human_authorized_spec148_final_implementation_material_candidate",
+                )
+            return result, next_record
+
+        violation = _violation(
+            "HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_FAILED",
+            "the one final human-authorized implementation invocation failed or timed out; no further dispatch is authorized",
+            {"authorization_id": authorization_id, "status": result.status},
+        )
+        _write_implementation_recovery_block_status(run_record_path, next_record, violation, status="IMPLEMENTATION_FAILED")
+        return PipelineOutcome(
+            "IMPLEMENTATION_FAILED",
+            tuple(stages),
+            _read_json(run_record_path),
+            bootstrap=bootstrap,
+            implementer_result=result,
+            violations=tuple([*(_from_implementer(item) for item in result.violations), violation]),
+        )
+
     def _substantial_rework_material_candidate_violation(
         self,
         worktree: Path,
         admitted_candidate_sha: str,
         runtime: ImplementerRuntimeResult | None,
+        *,
+        reason_prefix: str = "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK",
     ) -> PipelineViolation | None:
         """Require material work relative to the candidate admitted by the authorization."""
 
         if runtime is None:
             return _violation(
-                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_RUNTIME_EVIDENCE_MISSING",
+                f"{reason_prefix}_RUNTIME_EVIDENCE_MISSING",
                 "substantial-rework success requires durable implementer runtime evidence",
                 {"admitted_candidate_sha": admitted_candidate_sha},
             )
@@ -2147,13 +2465,13 @@ class RunPipeline:
         }
         if runtime.head_after != actual_head:
             return _violation(
-                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_HEAD_EVIDENCE_MISMATCH",
+                f"{reason_prefix}_HEAD_EVIDENCE_MISMATCH",
                 "substantial-rework runtime HEAD evidence does not match the actual worktree HEAD",
                 evidence,
             )
         if actual_head == admitted_candidate_sha and not changed_files:
             return _violation(
-                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+                f"{reason_prefix}_NO_MATERIAL_CANDIDATE",
                 "the authorized substantial-rework implementer exited successfully but produced no material work relative to the admitted candidate",
                 evidence,
             )
@@ -2161,7 +2479,7 @@ class RunPipeline:
             try:
                 if not self.git.is_ancestor(worktree, admitted_candidate_sha, actual_head):
                     return _violation(
-                        "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_NOT_DESCENDANT",
+                        f"{reason_prefix}_CANDIDATE_NOT_DESCENDANT",
                         "the substantial-rework HEAD must descend from the admitted candidate",
                         evidence,
                     )
@@ -2174,6 +2492,8 @@ class RunPipeline:
         worktree: Path,
         admitted_candidate_sha: str,
         candidate_sha: str,
+        *,
+        reason_prefix: str = "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK",
     ) -> PipelineViolation | None:
         evidence = {
             "admitted_candidate_sha": admitted_candidate_sha,
@@ -2181,7 +2501,7 @@ class RunPipeline:
         }
         if not admitted_candidate_sha or candidate_sha == admitted_candidate_sha:
             return _violation(
-                "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE",
+                f"{reason_prefix}_NO_MATERIAL_CANDIDATE",
                 "substantial-rework candidate preparation did not produce a candidate distinct from the admitted candidate",
                 evidence,
             )
@@ -2190,13 +2510,13 @@ class RunPipeline:
             evidence["actual_head"] = actual_head
             if actual_head != candidate_sha:
                 return _violation(
-                    "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_HEAD_MISMATCH",
+                    f"{reason_prefix}_CANDIDATE_HEAD_MISMATCH",
                     "the prepared substantial-rework candidate must match the actual worktree HEAD",
                     evidence,
                 )
             if not self.git.is_ancestor(worktree, admitted_candidate_sha, candidate_sha):
                 return _violation(
-                    "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_CANDIDATE_NOT_DESCENDANT",
+                    f"{reason_prefix}_CANDIDATE_NOT_DESCENDANT",
                     "the prepared substantial-rework candidate must descend from the admitted candidate",
                     evidence,
                 )
@@ -2213,12 +2533,16 @@ class RunPipeline:
         implementer_result: ImplementerRuntimeOutcome | None,
         violation: PipelineViolation,
         candidate: CandidatePreparationResult | None = None,
+        *,
+        authorization_field: str = "humanAuthorizedSubstantialRework",
+        authorization_history_field: str = "humanAuthorizedSubstantialReworks",
+        stage_id: str = "human_authorized_substantial_rework_material_candidate",
     ) -> PipelineOutcome:
-        authorization = record.get("humanAuthorizedSubstantialRework")
+        authorization = record.get(authorization_field)
         authorization = authorization if isinstance(authorization, dict) else {}
         invocation_status = (
             "NO_MATERIAL_CANDIDATE"
-            if violation.code == "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_NO_MATERIAL_CANDIDATE"
+            if violation.code.endswith("_NO_MATERIAL_CANDIDATE")
             else "MATERIAL_CANDIDATE_BLOCKED"
         )
         blocked_authorization = {
@@ -2234,15 +2558,15 @@ class RunPipeline:
             },
         }
         updated = dict(record)
-        updated["humanAuthorizedSubstantialRework"] = blocked_authorization
-        updated["humanAuthorizedSubstantialReworks"] = [blocked_authorization]
+        updated[authorization_field] = blocked_authorization
+        updated[authorization_history_field] = [blocked_authorization]
         artifact_path = Path(str(blocked_authorization.get("artifact", "")))
         if artifact_path.name:
             _write_json(run_record_path.with_name(artifact_path.name), blocked_authorization)
             _write_json(artifact_path, blocked_authorization)
         _write_json(run_record_path, updated)
         _write_implementation_recovery_block_status(run_record_path, updated, violation, status="IMPLEMENTATION_FAILED")
-        stages.append(_stage("human_authorized_substantial_rework_material_candidate", "BLOCKED", {"reason": violation.code}))
+        stages.append(_stage(stage_id, "BLOCKED", {"reason": violation.code}))
         return PipelineOutcome(
             "IMPLEMENTATION_FAILED",
             tuple(stages),
@@ -7104,6 +7428,202 @@ def human_authorized_substantial_rework_evidence(
     primary_artifact = Path(str(record.get("primaryRepository", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / artifact_name
     if run_record_path.with_name(artifact_name).exists() or primary_artifact.exists():
         reject("SUBSTANTIAL_REWORK_ALREADY_USED", "substantial-rework audit already exists")
+    return tuple(violations)
+
+
+def _spec148_final_implementation_state_fingerprint(
+    run_record_path: Path,
+    record: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Bind the final decision to current state and the immutable prior no-op audit."""
+
+    names = ("ados-run.json", "candidate.json", "validation-runtime.json", "review-runtime.json", "implementer-runtime.json")
+    artifact_hashes: dict[str, str] = {}
+    for name in names:
+        path = run_record_path if name == "ados-run.json" else run_record_path.with_name(name)
+        try:
+            artifact_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            artifact_hashes[name] = ""
+    prior = record.get("humanAuthorizedSubstantialRework")
+    authorization_hashes = {"localSha256": "", "primarySha256": ""}
+    if isinstance(prior, dict):
+        primary_path = Path(str(prior.get("artifact", "")))
+        local_path = run_record_path.with_name(primary_path.name) if primary_path.name else run_record_path.with_name("missing-authorization")
+        for label, path in (("localSha256", local_path), ("primarySha256", primary_path)):
+            try:
+                authorization_hashes[label] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                pass
+    evidence: dict[str, Any] = {
+        "schemaVersion": 1,
+        "runId": str(record.get("runId", "")),
+        "identity": {key: record.get(key) for key in ("projectId", "specNumber", "featureSlug", "featureBranch", "featureWorktree", "authoritativeBaseSha")},
+        "requirementsSha256": str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else "",
+        "status": str(record.get("status", "")),
+        "nextStage": str(record.get("nextStage", "")),
+        "reviewBlock": record.get("reviewBlock"),
+        "agentAssignment": record.get("agentAssignment"),
+        "implementationRecoveryEpoch": _implementation_recovery_epoch(record),
+        "implementationRecoveryUsage": _implementation_recovery_attempt_count(record),
+        "implementationRecoveryReopenCount": _implementation_recovery_reopen_count(record),
+        "reviewConvergenceReopenCount": _review_convergence_reopen_count(record),
+        "priorSubstantialRework": prior,
+        "artifactSha256": artifact_hashes,
+        "priorSubstantialReworkArtifactSha256": authorization_hashes,
+    }
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest(), evidence
+
+
+def human_authorized_spec148_final_implementation_evidence(
+    git: GitRepositoryProvider,
+    config: ProjectConfig,
+    run_record_path: Path,
+    record: Any,
+    candidate: Any,
+    validation: Any,
+    review: Any,
+    implementer: Any,
+) -> tuple[PipelineViolation, ...]:
+    """Fail closed unless the exact reviewed clarification-only no-op state remains intact."""
+
+    violations: list[PipelineViolation] = []
+    def reject(code: str, message: str, evidence: dict[str, str] | None = None) -> None:
+        violations.append(_violation(code, message, evidence or {}))
+    if not isinstance(record, dict):
+        return (_violation("SPEC148_FINAL_IMPLEMENTATION_RECORD_INVALID", "authorization requires a durable run record", {}),)
+    profile = HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES.get(str(record.get("runId", "")))
+    if not isinstance(profile, dict):
+        return (_violation("SPEC148_FINAL_IMPLEMENTATION_PROFILE_MISSING", "this exact run has no audited final implementation decision", {}),)
+
+    if record.get("status") != "REVIEW_BLOCKED" or record.get("status") != profile["sourceStatus"]:
+        reject("SPEC148_FINAL_IMPLEMENTATION_STATUS_INVALID", "authorization requires the exact REVIEW_BLOCKED state")
+    if record.get("nextStage") != "recovery" or record.get("nextStage") != profile["sourceNextStage"]:
+        reject("SPEC148_FINAL_IMPLEMENTATION_NEXT_STAGE_INVALID", "authorization requires the exact recovery stage")
+    block = record.get("reviewBlock")
+    if not isinstance(block, dict) or any((
+        str(block.get("reasonCode", "")) != profile["sourceBlockReason"],
+        block.get("reasonCodes") != [profile["sourceBlockReason"]],
+        str(block.get("blockCause", "")) != profile["sourceBlockCause"],
+        str(block.get("status", "")) != "PASS",
+        str(block.get("decision", "")) != "Changes Requested",
+        block.get("timedOut") is not False,
+        block.get("exitCode") != 0,
+    )):
+        reject("SPEC148_FINAL_IMPLEMENTATION_BLOCK_INVALID", "authorization requires the exact substantial-rework Changes Requested block")
+    for key in ("projectId", "specNumber", "featureSlug", "featureBranch", "authoritativeBaseSha"):
+        if str(record.get(key, "")) != str(profile[key]):
+            reject("SPEC148_FINAL_IMPLEMENTATION_IDENTITY_MISMATCH", "run identity differs from the audited state", {"field": key})
+    worktree = Path(str(record.get("featureWorktree", "")))
+    if worktree.resolve() != Path(profile["featureWorktree"]).resolve():
+        reject("SPEC148_FINAL_IMPLEMENTATION_WORKTREE_MISMATCH", "feature worktree differs from the audited state")
+    requirements_sha = str(record.get("requirements", {}).get("sha256", "")) if isinstance(record.get("requirements"), dict) else ""
+    if requirements_sha != profile["requirementsSha"]:
+        reject("SPEC148_FINAL_IMPLEMENTATION_REQUIREMENTS_MISMATCH", "requirements identity changed")
+
+    assignment = record.get("agentAssignment")
+    if not isinstance(assignment, dict) or any((
+        assignment.get("implementerId") != profile["pinnedImplementerId"],
+        assignment.get("implementerCommand") != profile["pinnedImplementerCommand"],
+        assignment.get("candidateOwnerId") != profile["pinnedImplementerId"],
+        assignment.get("reviewerId") != profile["pinnedReviewerId"],
+        assignment.get("reviewerCommand") != profile["pinnedReviewerCommand"],
+        _positive_int_from_mapping(assignment, "sequence") != profile["assignmentSequence"],
+        record.get("implementer") != profile["pinnedImplementerCommand"],
+        record.get("reviewer") != profile["pinnedReviewerCommand"],
+    )):
+        reject("SPEC148_FINAL_IMPLEMENTATION_ASSIGNMENT_MISMATCH", "pinned roles, candidate ownership, or assignment sequence changed")
+
+    cand = _candidate_from_mapping(candidate)
+    try:
+        val = _validation_from_mapping(validation) if isinstance(validation, dict) else None
+        rev = _review_from_mapping(review) if isinstance(review, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        val = rev = None
+    exact = cand.candidate_sha if cand else ""
+    if cand is None or cand.status != "COMMITTED" or exact != profile["candidateSha"]:
+        reject("SPEC148_FINAL_IMPLEMENTATION_CANDIDATE_INVALID", "candidate is not the exact admitted candidate")
+    if val is None or val.status != "PASS" or val.head_before != exact or val.head_after != exact:
+        reject("SPEC148_FINAL_IMPLEMENTATION_VALIDATION_INVALID", "PASS validation must belong to the exact candidate")
+    if rev is None or rev.status != "PASS" or rev.decision != "Changes Requested" or rev.reviewed_sha != exact:
+        reject("SPEC148_FINAL_IMPLEMENTATION_REVIEW_INVALID", "Changes Requested review must belong to the exact candidate")
+    if isinstance(block, dict) and any(str(block.get(key, "")) != exact for key in ("candidateSha", "validatedSha", "reviewedSha")):
+        reject("SPEC148_FINAL_IMPLEMENTATION_BLOCK_SHA_MISMATCH", "review block SHA evidence changed")
+
+    if _implementation_recovery_epoch(record) != profile["sourceEpoch"] or _implementation_recovery_attempt_count(record) != profile["sourceAttemptUsage"] or _implementation_recovery_attempt_count(record) != config.execution_policy.implementation.max_recovery_rounds:
+        reject("SPEC148_FINAL_IMPLEMENTATION_RECOVERY_CAPACITY_INVALID", "ordinary implementation recovery must remain exhausted")
+    if _implementation_recovery_reopen_count(record) != profile["sourceImplementationReopens"] or _implementation_recovery_reopen_count(record) != config.execution_policy.implementation.max_recovery_reopens:
+        reject("SPEC148_FINAL_IMPLEMENTATION_IMPLEMENTATION_REOPENS_INVALID", "implementation reopens must remain exhausted")
+    if _review_convergence_reopen_count(record) != profile["sourceReviewConvergenceReopens"] or _review_convergence_reopen_count(record) != config.execution_policy.review.max_convergence_reopens:
+        reject("SPEC148_FINAL_IMPLEMENTATION_CONVERGENCE_REOPENS_INVALID", "review convergence reopens must remain exhausted")
+
+    for key, history, expected in (
+        ("humanAuthorizedSubstantialCompletion", "humanAuthorizedSubstantialCompletions", profile["substantialCompletionAuthorizationId"]),
+        ("humanAuthorizedPostReviewFix", "humanAuthorizedPostReviewFixes", profile["postReviewFixAuthorizationId"]),
+    ):
+        auth = record.get(key)
+        if not isinstance(auth, dict) or auth.get("status") != "CONSUMED" or auth.get("ordinaryRecoveryCapacityGranted") != 0 or auth.get("authorizationId") != expected or record.get(history) != [auth]:
+            reject("SPEC148_FINAL_IMPLEMENTATION_PRIOR_AUTHORIZATION_INVALID", "a prior exceptional authorization changed", {"authorization": key})
+    prior = record.get("humanAuthorizedSubstantialRework")
+    if not isinstance(prior, dict) or any((
+        prior.get("authorizationId") != profile["substantialReworkAuthorizationId"],
+        prior.get("status") != "CONSUMED",
+        prior.get("ordinaryRecoveryCapacityGranted") != 0,
+        prior.get("resultingRuntimeId") != profile["substantialReworkRuntimeId"],
+        prior.get("headBeforeImplementation") != exact,
+        prior.get("headAfterImplementation") != exact,
+        record.get("humanAuthorizedSubstantialReworks") != [prior],
+    )):
+        reject("SPEC148_FINAL_IMPLEMENTATION_PRIOR_REWORK_INVALID", "the consumed clarification-only substantial-rework authorization changed")
+    runtime_result = implementer.get("result") if isinstance(implementer, dict) else None
+    if not isinstance(runtime_result, dict) or any((
+        runtime_result.get("runtimeId") != profile["substantialReworkRuntimeId"],
+        runtime_result.get("runId") != record.get("runId"),
+        runtime_result.get("status") != "READY_FOR_VALIDATION",
+        runtime_result.get("timedOut") is not False,
+        runtime_result.get("exitCode") != 0,
+        runtime_result.get("headBefore") != exact,
+        runtime_result.get("headAfter") != exact,
+        runtime_result.get("changedFiles") != [],
+    )):
+        reject("SPEC148_FINAL_IMPLEMENTATION_PRIOR_NOOP_INVALID", "the prior implementer runtime must prove exit zero with unchanged HEAD and no files")
+    if "humanAuthorizedSpec148FinalImplementation" in record or "humanAuthorizedSpec148FinalImplementations" in record:
+        reject("SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", "the final implementation authorization is one-shot")
+
+    try:
+        status = git.status(worktree)
+        head = git.current_head(worktree)
+        branch = git.current_branch(worktree)
+    except RepositoryProviderError as exc:
+        reject(exc.code, exc.message)
+    else:
+        if status.root != worktree.resolve() or branch != profile["featureBranch"]:
+            reject("SPEC148_FINAL_IMPLEMENTATION_WORKTREE_MISMATCH", "worktree root or branch changed")
+        if head != exact:
+            reject("SPEC148_FINAL_IMPLEMENTATION_HEAD_MISMATCH", "HEAD changed from the admitted candidate")
+        if status.dirty_tracked or status.staged or status.untracked:
+            reject("SPEC148_FINAL_IMPLEMENTATION_WORKTREE_NOT_CLEAN", "the final implementation must start from a clean worktree")
+    for args, code in ((('diff', '--check'), "SPEC148_FINAL_IMPLEMENTATION_DIFF_CHECK_FAILED"), (('diff', '--cached', '--check'), "SPEC148_FINAL_IMPLEMENTATION_CACHED_DIFF_CHECK_FAILED")):
+        checked = subprocess.run(("git", *args), cwd=worktree, shell=False, capture_output=True)
+        if checked.returncode != 0:
+            reject(code, "worktree failed git diff --check")
+
+    fingerprint, evidence = _spec148_final_implementation_state_fingerprint(run_record_path, record)
+    actual_hashes = evidence["artifactSha256"]
+    for name, expected in profile["artifactSha256"].items():
+        if name == "substantialReworkAuthorization":
+            hashes = evidence["priorSubstantialReworkArtifactSha256"]
+            if hashes.get("localSha256") != expected or hashes.get("primarySha256") != expected:
+                reject("SPEC148_FINAL_IMPLEMENTATION_PRIOR_AUDIT_MISMATCH", "prior substantial-rework audit copies changed")
+        elif actual_hashes.get(name) != expected:
+            reject("SPEC148_FINAL_IMPLEMENTATION_ARTIFACT_MISMATCH", "a state-bound durable artifact changed", {"artifact": name})
+    if fingerprint != profile["stateFingerprint"]:
+        reject("SPEC148_FINAL_IMPLEMENTATION_STATE_FINGERPRINT_MISMATCH", "the exact admitted state fingerprint changed", {"expected": profile["stateFingerprint"], "actual": fingerprint})
+    artifact_name = f"human-authorized-spec148-final-implementation-{fingerprint[:12]}.json"
+    primary_artifact = Path(str(record.get("primaryRepository", ""))) / ".agent-workflow" / "runs" / f"{record.get('specNumber', '')}-{record.get('featureSlug', '')}" / artifact_name
+    if run_record_path.with_name(artifact_name).exists() or primary_artifact.exists():
+        reject("SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", "final implementation audit already exists")
     return tuple(violations)
 
 

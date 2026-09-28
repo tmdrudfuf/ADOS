@@ -524,6 +524,31 @@ def _handoff(config: ProjectConfig, record: dict[str, Any]) -> str:
                 if isinstance(finding, dict):
                     lines.append(f"- Finding {finding.get('finding', '')}: {finding.get('title', '')}")
                     lines.append(f"  Required: {finding.get('required', '')}")
+    final_implementation = record.get("humanAuthorizedSpec148FinalImplementation")
+    if (
+        isinstance(final_implementation, dict)
+        and final_implementation.get("status") == "CONSUMED"
+        and final_implementation.get("invocationStatus") == "PENDING"
+    ):
+        lines.extend(
+            [
+                "",
+                "FINAL explicit human-authorized Spec 148 implementation:",
+                f"Authorization ID: {final_implementation.get('authorizationId', '')}",
+                f"Exact admitted candidate: {final_implementation.get('admittedCandidateSha', '')}",
+                f"Prior clarification-only authorization: {final_implementation.get('priorSubstantialReworkAuthorizationId', '')}",
+                "DO NOT STOP TO ASK THE OPERATOR WHICH CHILD PROJECT TO USE. Use a fresh minimal disposable local verification repository. Do not use dailyProof or another real user project.",
+                "DO NOT STOP TO ASK WHETHER TO RUN THE CHILD. Execute a real live ADOS child cycle through external-run prepare -> external-run continue -> external-run inspect.",
+                "ADOS must generate the child run ID. Never inject or reuse the parent Spec 148 run ID.",
+                "The disposable repository must be isolated from the parent AIverse repository and may use a local bare Git origin. It exists solely for controlled real ADOS lifecycle evidence.",
+                "Implement the actual production architecture: Project A backlog task -> development request -> trusted external ADOS gateway -> disposable repository -> prepare -> ADOS-generated child ID -> exact continue -> candidate -> validation PASS -> independent Approved review -> exact HEAD -> technical READY_FOR_PUBLICATION -> exact inspect -> trusted evidence verifier -> execution-bound completion coordinator -> completed Project A task.",
+                "Deterministic child executables may simulate Claude/Codex process boundaries, but they must operate through the real ADOS child-run protocol and must not fabricate ADOS durable artifacts.",
+                "AIverse production code must not treat direct subprocess exit as ADOS lifecycle success. Remove caller-controlled publication-readiness truth and derive task completion from verified durable evidence bound to the exact execution and child run.",
+                "Reconcile Spec 148 Spec Kit and runtime evidence truthfully. The authoritative successful cycle must end with Project A completed; blocked/error scenarios remain separate negative paths.",
+                "Technical readiness does not authorize remote publication. Preserve remotePublicationState=NOT_REQUESTED and remotePublicationAuthority=HUMAN_REQUIRED. Do not push, create/ready a PR, merge, deploy, or otherwise publish remotely.",
+                "This is exactly one implementation dispatch. It grants no recovery capacity and does not approve validation, review, convergence, publication, or merge.",
+            ]
+        )
     no_change_recovery = record.get("noChangeRecovery")
     if isinstance(no_change_recovery, dict):
         lines.extend(

@@ -93,6 +93,11 @@ class CliApplication:
             action="store_true",
             help="authorize one exact human-reviewed substantial architectural rework invocation outside exhausted recovery",
         )
+        run.add_argument(
+            "--authorize-spec148-final-implementation",
+            action="store_true",
+            help="authorize the one final exact-state Spec 148 implementation after the clarification-only no-op",
+        )
         run.add_argument("--prefer-implementer", help="temporarily prefer this agent-role id as implementer (requires execution_policy.agent_roles)")
         run.add_argument("--json", action="store_true")
 
@@ -231,6 +236,7 @@ class CliApplication:
                     authorize_substantial_completion=args.authorize_substantial_completion,
                     authorize_post_review_fix=args.authorize_post_review_fix,
                     authorize_substantial_rework=args.authorize_substantial_rework,
+                    authorize_spec148_final_implementation=args.authorize_spec148_final_implementation,
                     prefer_implementer=args.prefer_implementer,
                 )
             )

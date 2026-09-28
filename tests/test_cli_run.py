@@ -5192,6 +5192,201 @@ class CliRunTests(unittest.TestCase):
                     )
                 self.assertIn(expected, {item.code for item in violations})
 
+    def test_spec148_final_implementation_consumes_before_one_claude_and_returns_to_normal_gates(self):
+        parsed = CliApplication().build_parser().parse_args(["run", "--project", "project", "--feature", "feature", "--authorize-spec148-final-implementation"])
+        self.assertTrue(parsed.authorize_spec148_final_implementation)
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final authorized implementation")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "final-implementation-count.txt"
+            relative_record = state["record_path"].relative_to(state["worktree"]).as_posix()
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nimport json, sys\n"
+                "prompt = sys.stdin.read()\n"
+                "assert 'DO NOT STOP TO ASK THE OPERATOR WHICH CHILD PROJECT TO USE' in prompt\n"
+                "assert 'fresh minimal disposable local verification repository' in prompt\n"
+                "assert 'external-run prepare -> external-run continue -> external-run inspect' in prompt\n"
+                "assert 'ADOS must generate the child run ID' in prompt\n"
+                f"record=json.loads(Path(r'{relative_record}').read_text(encoding='utf-8'))\n"
+                "auth=record['humanAuthorizedSpec148FinalImplementation']\n"
+                "assert auth['status']=='CONSUMED' and auth['invocationStatus']=='PENDING'\n"
+                "assert auth['invocationTimeoutMs']==3600000 and auth['ordinaryRecoveryCapacityGranted']==0\n"
+                "assert auth['priorSubstantialReworkProducedImplementation'] is False\n"
+                f"counter=Path(r'{counter}')\n"
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1')\n"
+                "Path('final-implementation.txt').write_text('real architecture', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+            final = result.run_record
+            invocation_count = counter.read_text()
+        self.assertEqual("COMPLETE", result.status, result.to_dict())
+        self.assertEqual("1", invocation_count)
+        self.assertNotEqual(state["candidate_sha"], result.candidate.candidate_sha)
+        self.assertEqual(result.candidate.candidate_sha, result.validation.head_after)
+        self.assertEqual(result.candidate.candidate_sha, result.review.reviewed_sha)
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertEqual(before["agentAssignment"], final["agentAssignment"])
+        self.assertEqual(state["prior_rework"], final["humanAuthorizedSubstantialRework"])
+
+    def test_spec148_final_implementation_success_does_not_block_ordinary_publication_resume(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final publication resume")
+            counter = fixture.root / "final-publication-resume-count.txt"
+            (fixture.root / "implementer.py").write_text(f"from pathlib import Path\nPath(r'{counter}').write_text('1')\nPath('material.txt').write_text('work', encoding='utf-8')\n", encoding="utf-8")
+            state["reviewer"].write_text("print('Approved')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo, ready_failure_once=True))
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                interrupted = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                resumed = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234)
+            invocation_count = counter.read_text()
+        self.assertEqual("PUBLICATION_BLOCKED", interrupted.status)
+        self.assertIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in repeated.violations})
+        self.assertNotIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in resumed.violations})
+        self.assertEqual("COMPLETE", resumed.status, resumed.to_dict())
+        self.assertEqual("1", invocation_count)
+
+    def test_spec148_final_implementation_does_not_capture_unrelated_review_block(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final unrelated review block")
+            record = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            record["humanAuthorizedSpec148FinalImplementation"] = {
+                "authorizationId": "consumed-final-implementation",
+                "status": "CONSUMED",
+                "invocationStatus": "READY_FOR_VALIDATION",
+            }
+            record["humanAuthorizedSpec148FinalImplementations"] = [record["humanAuthorizedSpec148FinalImplementation"]]
+            record["reviewBlock"]["reasonCode"] = "REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"
+            record["reviewBlock"]["reasonCodes"] = ["REVIEW_SIDE_EFFECT_RECOVERY_MAX_ROUNDS_EXCEEDED"]
+            record["reviewBlock"]["blockCause"] = "review_side_effect_recovery"
+            state["record_path"].write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(
+                config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234
+            )
+        self.assertNotIn("human_authorized_spec148_final_implementation", [stage.id for stage in result.stages])
+        self.assertNotIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", {item.code for item in result.violations})
+
+    def test_spec148_final_implementation_noop_blocks_before_candidate_and_cannot_repeat(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final no-op")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            counter = fixture.root / "final-noop-count.txt"
+            (fixture.root / "implementer.py").write_text(f"from pathlib import Path\nPath(r'{counter}').write_text('1')\nprint('clarification')\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(pipeline, "_prepare_candidate", wraps=pipeline._prepare_candidate) as prepare,
+                mock.patch.object(pipeline.validation, "run", wraps=pipeline.validation.run) as validation,
+                mock.patch.object(pipeline.review, "run", wraps=pipeline.review.run) as review,
+            ):
+                result = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("CONSUMED", final["humanAuthorizedSpec148FinalImplementation"]["status"])
+        self.assertEqual("NO_MATERIAL_CANDIDATE", final["humanAuthorizedSpec148FinalImplementation"]["invocationStatus"])
+        self.assertEqual("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_NO_MATERIAL_CANDIDATE", final["implementationRecoveryBlock"]["reasonCode"])
+        prepare.assert_not_called(); validation.assert_not_called(); review.assert_not_called()
+        self.assertIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_NO_MATERIAL_CANDIDATE", {item.code for item in repeated.violations})
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+
+    def test_spec148_final_implementation_new_commit_and_changes_requested_stops(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final review blocked")
+            counter = fixture.root / "final-review-count.txt"
+            (fixture.root / "implementer.py").write_text(
+                "from pathlib import Path\nimport subprocess\n"
+                f"Path(r'{counter}').write_text('1')\n"
+                "Path('final-commit.txt').write_text('implemented', encoding='utf-8')\n"
+                "subprocess.run(['git','add','final-commit.txt'], check=True)\n"
+                "subprocess.run(['git','commit','-m','final implementation'], check=True)\n",
+                encoding="utf-8",
+            )
+            state["reviewer"].write_text("print('Changes Requested')\n", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+                result = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+                repeated = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234)
+            invocation_count = counter.read_text()
+        self.assertEqual("REVIEW_BLOCKED", result.status)
+        self.assertNotEqual(state["candidate_sha"], result.candidate.candidate_sha)
+        self.assertIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_REVIEW_CHANGES_REQUESTED", {item.code for item in result.violations})
+        self.assertIn("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_REVIEW_CHANGES_REQUESTED", {item.code for item in repeated.violations})
+        self.assertEqual("1", invocation_count)
+
+    def test_spec148_final_implementation_failure_is_one_shot_and_accounting_neutral(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final failure")
+            before = json.loads(state["record_path"].read_text(encoding="utf-8"))
+            (fixture.root / "implementer.py").write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                result = RunPipeline(publisher=FakePublisher(fixture.repo)).run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+        self.assertEqual("CONSUMED", final["humanAuthorizedSpec148FinalImplementation"]["status"])
+        self.assertEqual(before["implementationRecoveryAttempts"], final["implementationRecoveryAttempts"])
+        self.assertEqual(before["implementationRecoveryReopens"], final["implementationRecoveryReopens"])
+        self.assertEqual(before["reviewConvergenceReopens"], final["reviewConvergenceReopens"])
+        self.assertEqual(before["agentAssignment"], final["agentAssignment"])
+
+    def test_spec148_final_implementation_timeout_is_bounded_and_dry_run_is_read_only(self):
+        with self.project(implementer_mode="count") as fixture:
+            state = self.create_spec148_final_implementation_run(fixture, "Final timeout")
+            before = state["record_path"].read_bytes()
+            with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False):
+                planned = RunService().run(RunRequest(fixture.repo, "Final timeout", 1, fixture.config, requirements_file=state["requirements"], dry_run=True, authorize_spec148_final_implementation=True))
+            self.assertEqual("PLANNED", planned.status, planned.to_dict())
+            self.assertEqual("ELIGIBLE", planned.eligibility.status, planned.to_dict())
+            self.assertEqual(before, state["record_path"].read_bytes())
+            (fixture.root / "implementer.py").write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+            pipeline = RunPipeline(publisher=FakePublisher(fixture.repo))
+            with (
+                mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: state["profile"]}, clear=False),
+                mock.patch.object(run_pipeline, "SPEC148_FINAL_IMPLEMENTATION_TIMEOUT_MS", 100),
+            ):
+                result = pipeline.run(config=load_project_config(fixture.config), run_record_path=state["record_path"], timeout_ms=1234, authorize_spec148_final_implementation=True)
+            final = json.loads(state["record_path"].read_text(encoding="utf-8"))
+        self.assertEqual("IMPLEMENTATION_FAILED", result.status)
+        self.assertEqual("CONSUMED", final["humanAuthorizedSpec148FinalImplementation"]["status"])
+        self.assertEqual(100, final["humanAuthorizedSpec148FinalImplementation"]["invocationTimeoutMs"])
+        self.assertEqual("IMPLEMENTATION_TIMED_OUT", final["humanAuthorizedSpec148FinalImplementation"]["invocationStatus"])
+        self.assertEqual("HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_FAILED", final["implementationRecoveryBlock"]["reasonCode"])
+
+    def test_spec148_final_implementation_admission_rejects_exact_state_drift(self):
+        cases = {
+            "run": "SPEC148_FINAL_IMPLEMENTATION_PROFILE_MISSING", "status": "SPEC148_FINAL_IMPLEMENTATION_STATUS_INVALID",
+            "block": "SPEC148_FINAL_IMPLEMENTATION_BLOCK_INVALID", "candidate": "SPEC148_FINAL_IMPLEMENTATION_CANDIDATE_INVALID",
+            "roles": "SPEC148_FINAL_IMPLEMENTATION_ASSIGNMENT_MISMATCH", "capacity": "SPEC148_FINAL_IMPLEMENTATION_RECOVERY_CAPACITY_INVALID",
+            "prior": "SPEC148_FINAL_IMPLEMENTATION_PRIOR_REWORK_INVALID", "noop": "SPEC148_FINAL_IMPLEMENTATION_PRIOR_NOOP_INVALID",
+            "used": "SPEC148_FINAL_IMPLEMENTATION_ALREADY_USED", "fingerprint": "SPEC148_FINAL_IMPLEMENTATION_STATE_FINGERPRINT_MISMATCH",
+        }
+        for mutation, expected in cases.items():
+            with self.subTest(mutation=mutation), self.project(implementer_mode="count") as fixture:
+                state = self.create_spec148_final_implementation_run(fixture, f"Final drift {mutation}")
+                p = state["record_path"]; record=json.loads(p.read_text(encoding="utf-8")); candidate=json.loads(p.with_name("candidate.json").read_text()); validation=json.loads(p.with_name("validation-runtime.json").read_text()); review=json.loads(p.with_name("review-runtime.json").read_text()); implementer=json.loads(p.with_name("implementer-runtime.json").read_text()); profile=dict(state["profile"])
+                if mutation == "run": record["runId"]="other"
+                elif mutation == "status": record["status"]="READY_FOR_IMPLEMENTATION"
+                elif mutation == "block": record["reviewBlock"]["reasonCode"]="OTHER"
+                elif mutation == "candidate": candidate["candidate_sha"]="f"*40
+                elif mutation == "roles": record["agentAssignment"]["candidateOwnerId"]="codex"
+                elif mutation == "capacity": record["implementationRecoveryAttempts"].pop()
+                elif mutation == "prior": record["humanAuthorizedSubstantialRework"]["headAfterImplementation"]="f"*40
+                elif mutation == "noop": implementer["result"]["changedFiles"]=["file.txt"]
+                elif mutation == "used": record["humanAuthorizedSpec148FinalImplementation"]={"status":"CONSUMED"}
+                elif mutation == "fingerprint": profile["stateFingerprint"]="f"*64
+                with mock.patch.dict(run_pipeline.HUMAN_AUTHORIZED_SPEC148_FINAL_IMPLEMENTATION_PROFILES, {state["run_id"]: profile}, clear=False):
+                    violations=run_pipeline.human_authorized_spec148_final_implementation_evidence(run_pipeline.GitRepositoryProvider(), load_project_config(fixture.config), p, record, candidate, validation, review, implementer)
+                self.assertIn(expected, {item.code for item in violations})
+
     def test_human_authorized_substantial_rework_consumes_before_one_claude_and_returns_to_normal_gates(self):
         with self.project(implementer_mode="count") as fixture:
             state = self.create_substantial_rework_run(fixture, "Authorized substantial rework success")
@@ -7202,6 +7397,85 @@ class CliRunTests(unittest.TestCase):
             ],
         }
         return {**state, "profile": profile, "post_review": post_review, "candidate_sha": exact}
+
+    def create_spec148_final_implementation_run(self, fixture, feature):
+        state = self.create_substantial_rework_run(fixture, feature)
+        record_path = state["record_path"]
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        exact = state["candidate_sha"]
+        assignment = record["agentAssignment"]
+        primary_run_dir = fixture.repo / ".agent-workflow" / "runs" / record_path.parent.name
+        name = "human-authorized-substantial-rework-test.json"
+        primary_path = primary_run_dir / name
+        prior = {
+            "authorizationId": f"human-substantial-rework-{state['run_id']}-test",
+            "authorizationType": "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK",
+            "status": "CONSUMED",
+            "runId": state["run_id"],
+            "invocationStatus": "READY_FOR_VALIDATION",
+            "invocationTimeoutMs": 3_600_000,
+            "ordinaryRecoveryCapacityGranted": 0,
+            "resultingRuntimeId": "test-clarification-only-runtime",
+            "headBeforeImplementation": exact,
+            "headAfterImplementation": exact,
+            "pinnedAgentAssignment": assignment,
+            "artifact": str(primary_path),
+        }
+        prior_bytes = json.dumps(prior, indent=2, sort_keys=True).encode("utf-8")
+        primary_path.write_bytes(prior_bytes)
+        record_path.with_name(name).write_bytes(prior_bytes)
+        record["humanAuthorizedSubstantialRework"] = prior
+        record["humanAuthorizedSubstantialReworks"] = [prior]
+        record["status"] = "REVIEW_BLOCKED"
+        record["nextStage"] = "recovery"
+        record["reviewBlock"] = {
+            "baseSha": record["authoritativeBaseSha"],
+            "blockCause": "human_authorized_substantial_rework_changes_requested",
+            "candidateSha": exact,
+            "decision": "Changes Requested",
+            "exitCode": 0,
+            "reasonCode": "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED",
+            "reasonCodes": ["HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED"],
+            "resumeStage": "",
+            "reviewedSha": exact,
+            "reviewer": assignment["reviewerCommand"],
+            "runtimeCategory": "",
+            "status": "PASS",
+            "timedOut": False,
+            "transient": False,
+            "validatedSha": exact,
+        }
+        candidate = {"status": "COMMITTED", "candidate_sha": exact, "changed_files": ["post-review-fix.txt"]}
+        validation = {"status": "PASS", "head_before": exact, "head_after": exact, "commands": [], "violations": []}
+        review = {"status": "PASS", "decision": "Changes Requested", "reviewed_sha": exact, "exit_code": 0, "stdout": "architecture remains incomplete", "stderr": "", "violations": []}
+        implementer = {
+            "status": "READY_FOR_VALIDATION",
+            "runtime": {"runtimeId": prior["resultingRuntimeId"], "runId": state["run_id"], "status": "READY_FOR_VALIDATION", "command": {"adapter": assignment["implementerCommand"], "timeoutMs": 3_600_000}},
+            "result": {"runtimeId": prior["resultingRuntimeId"], "runId": state["run_id"], "status": "READY_FOR_VALIDATION", "exitCode": 0, "timedOut": False, "stdout": "Which repository? Run live?", "stderr": "", "headBefore": exact, "headAfter": exact, "changedFiles": [], "runtimeFailureCategory": "NONE", "violations": []},
+            "runRecord": record,
+            "violations": [],
+        }
+        artifacts = {"candidate.json": candidate, "validation-runtime.json": validation, "review-runtime.json": review, "implementer-runtime.json": implementer}
+        record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        for artifact_name, payload in artifacts.items():
+            record_path.with_name(artifact_name).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        fingerprint, _ = run_pipeline._spec148_final_implementation_state_fingerprint(record_path, record)
+        profile = {
+            "projectId": record["projectId"], "specNumber": record["specNumber"], "featureSlug": record["featureSlug"],
+            "featureBranch": record["featureBranch"], "featureWorktree": record["featureWorktree"], "authoritativeBaseSha": record["authoritativeBaseSha"],
+            "candidateSha": exact, "requirementsSha": record["requirements"]["sha256"], "sourceStatus": "REVIEW_BLOCKED", "sourceNextStage": "recovery",
+            "sourceBlockReason": "HUMAN_AUTHORIZED_SUBSTANTIAL_REWORK_REVIEW_CHANGES_REQUESTED", "sourceBlockCause": "human_authorized_substantial_rework_changes_requested",
+            "sourceEpoch": 3, "sourceAttemptUsage": 3, "sourceImplementationReopens": 2, "sourceReviewConvergenceReopens": 1,
+            "pinnedImplementerId": assignment["implementerId"], "pinnedImplementerCommand": assignment["implementerCommand"],
+            "pinnedReviewerId": assignment["reviewerId"], "pinnedReviewerCommand": assignment["reviewerCommand"], "assignmentSequence": assignment["sequence"],
+            "substantialCompletionAuthorizationId": record["humanAuthorizedSubstantialCompletion"]["authorizationId"],
+            "postReviewFixAuthorizationId": record["humanAuthorizedPostReviewFix"]["authorizationId"],
+            "substantialReworkAuthorizationId": prior["authorizationId"], "substantialReworkRuntimeId": prior["resultingRuntimeId"],
+            "artifactSha256": {"ados-run.json": hashlib.sha256(record_path.read_bytes()).hexdigest(), **{artifact_name: hashlib.sha256(record_path.with_name(artifact_name).read_bytes()).hexdigest() for artifact_name in artifacts}, "substantialReworkAuthorization": hashlib.sha256(prior_bytes).hexdigest()},
+            "stateFingerprint": fingerprint,
+            "humanDecisions": {"verificationRepository": "FRESH_MINIMAL_DISPOSABLE_LOCAL_REPOSITORY", "forbiddenRepositories": ["dailyProof", "REAL_USER_PROJECT"], "executeLiveChildRun": True, "childProtocol": ["external-run prepare", "external-run continue", "external-run inspect"], "childRunIdAuthority": "ADOS", "localBareOriginAllowed": True, "parentRepositoryIsolationRequired": True, "technicalReadinessTarget": "READY_FOR_PUBLICATION", "remotePublicationState": "NOT_REQUESTED", "remotePublicationAuthority": "HUMAN_REQUIRED"},
+        }
+        return {**state, "profile": profile, "prior_rework": prior, "candidate_sha": exact}
 
     def create_review_approved_run(self, fixture, feature, spec):
         record_path, record = self.create_durable_run(fixture, feature, spec, "REVIEW_APPROVED")
